@@ -1,9 +1,12 @@
 import os
 import json
+import re
 import pandas as pd
+import numpy as np
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from typing import List, Optional
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_pinecone import PineconeVectorStore
 from langchain_core.prompts import ChatPromptTemplate
@@ -13,68 +16,48 @@ from upstash_redis import Redis
 # --- CONFIGURACIÓN DE ENTORNO ---
 PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "que-morfamos-nqn")
 ARCHIVO_DATASET = "dataset_reviews.parquet"
-
-# Variables de Upstash (Configuralas en Render)
 UPSTASH_REDIS_REST_URL = os.getenv("UPSTASH_REDIS_REST_URL")
 UPSTASH_REDIS_REST_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN")
 
-# --- CLASE GESTORA DE REDIS (VERSIÓN UPSTASH HTTP) ---
+# --- GESTOR DE CACHÉ (REDIS) ---
 class RedisCacheManager:
     def __init__(self, url, token):
         self.client = None
         if url and token:
             try:
-                # Conexión vía HTTP (Ideal para Serverless/Render)
                 self.client = Redis(url=url, token=token)
-                print("✅ Cliente Upstash Redis configurado.")
+                print("✅ Redis (Upstash) conectado.")
             except Exception as e:
-                print(f"⚠️ Error configurando Upstash: {e}")
-                self.client = None
+                print(f"⚠️ Error Redis: {e}")
         else:
-            print("⚠️ Faltan credenciales de Upstash (URL o TOKEN). Cache desactivada.")
+            print("⚠️ Faltan credenciales Redis.")
 
     def _sanitize_key(self, key):
-        """Limpia la clave"""
         return key.lower().strip().replace(" ", "_")
 
     def get_json(self, prefix, key):
-        """Recupera un diccionario JSON desde Redis"""
         if not self.client: return None
-        
         full_key = f"{prefix}:{self._sanitize_key(key)}"
         try:
-            # Upstash devuelve el string directamente o None
             data = self.client.get(full_key)
             if data:
-                print(f"⚡ Cache Hit (Redis): {full_key}")
-                # Upstash a veces devuelve dict si ya es JSON válido, o string
-                if isinstance(data, dict):
-                    return data
+                if isinstance(data, dict): return data
                 return json.loads(data)
             return None
-        except Exception as e:
-            print(f"Error leyendo caché: {e}")
-            return None
+        except: return None
 
-    def set_json(self, prefix, key, value_dict, expire_seconds=604800):
-        """Guarda un diccionario como JSON string. Expira en 1 semana."""
+    def set_json(self, prefix, key, value_dict, expire=604800):
         if not self.client: return
-        
         full_key = f"{prefix}:{self._sanitize_key(key)}"
         try:
-            # Serializamos a string para asegurar formato
             json_str = json.dumps(value_dict, ensure_ascii=False)
-            # Upstash usa 'ex' para segundos de expiración
-            self.client.set(full_key, json_str, ex=expire_seconds)
-            print(f"💾 Guardado en Redis: {full_key}")
-        except Exception as e:
-            print(f"Error escribiendo caché: {e}")
+            self.client.set(full_key, json_str, ex=expire)
+        except Exception as e: print(f"Error escritura caché: {e}")
 
-# Instancia global usando las variables nuevas
 cache = RedisCacheManager(UPSTASH_REDIS_REST_URL, UPSTASH_REDIS_REST_TOKEN)
 
 # --- INICIALIZACIÓN APP ---
-app = FastAPI(title="Restaurant Chatbot API (Upstash Edition)", version="2.3.0")
+app = FastAPI(title="Que Morfamos API (Cloud)", version="3.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -89,7 +72,38 @@ df = None
 vectorstore = None
 llm = None
 
-# --- MODELOS PYDANTIC ---
+# --- MODELOS PYDANTIC (Restaurados del original) ---
+class RestaurantCard(BaseModel):
+    nombre: str
+    rating: float = 0
+    total_reviews: int = 0
+    direccion: str = ""
+    barrio: str = ""
+    zona: str = ""
+    descripcion: str = ""
+    frase_destacada: str = ""
+    autor_reseña: str = ""
+
+class ReviewDetail(BaseModel):
+    autor: str
+    rating: int
+    texto: str
+    fecha: str
+
+class RestaurantDetail(BaseModel):
+    nombre: str
+    rating: float
+    total_reviews: int
+    direccion: str
+    barrio: str
+    zona: str
+    lat: float = 0
+    lng: float = 0
+    resumen_general: str
+    aspectos_positivos: List[str] = []
+    aspectos_negativos: List[str] = []
+    reviews: List[ReviewDetail] = []
+
 class QueryRequest(BaseModel):
     query: str
     conversation_context: dict = {}
@@ -99,46 +113,73 @@ class QueryResponse(BaseModel):
     mode: str
     conversation_context: dict = {}
     locations: list = []
-    restaurant_cards: list = []
+    restaurant_cards: List[RestaurantCard] = []
     detail_content: str = ""
 
 # --- STARTUP ---
 @app.on_event("startup")
 async def startup_event():
     global df, vectorstore, llm
-    print("☁️ Inicializando Backend...")
+    print("☁️ Iniciando servidor...")
     
-    # 1. Cargar Pandas (PARQUET)
     if os.path.exists(ARCHIVO_DATASET):
         try:
             df = pd.read_parquet(ARCHIVO_DATASET)
-            # Limpieza básica
             if 'restaurante' in df.columns:
                 df['restaurante'] = df['restaurante'].str.strip()
-            print(f"✅ DataFrame cargado: {len(df)} reseñas.")
+            print(f"✅ DataFrame cargado: {len(df)} filas.")
         except Exception as e:
             print(f"❌ Error leyendo Parquet: {e}")
             df = pd.DataFrame()
     else:
-        print("⚠️ Parquet no encontrado. Modo fallback.")
+        print("⚠️ No se encontró dataset.")
         df = pd.DataFrame()
 
-    # 2. Pinecone & OpenAI
     try:
         embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
         vectorstore = PineconeVectorStore.from_existing_index(
             index_name=PINECONE_INDEX_NAME, embedding=embeddings
         )
         llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
-        print("✅ IA conectada (Pinecone + OpenAI).")
+        print("✅ IA (OpenAI + Pinecone) lista.")
     except Exception as e:
-        print(f"❌ Error crítico IA: {e}")
+        print(f"❌ Error IA: {e}")
 
-# --- HELPERS ---
+# --- HELPERS DE LIMPIEZA (ANTI-CRASH) ---
+def safe_str(val):
+    if pd.isna(val) or val is None: return ""
+    return str(val).strip()
+
+def safe_float(val):
+    if pd.isna(val) or val is None: return 0.0
+    try: return float(val)
+    except: return 0.0
+
+def safe_int(val):
+    if pd.isna(val) or val is None: return 0
+    try: return int(float(val))
+    except: return 0
+
 def formatear_autor(nombre):
-    if pd.isna(nombre) or not nombre: return "Anónimo"
-    partes = str(nombre).strip().split()
+    nombre = safe_str(nombre)
+    if not nombre: return "Anónimo"
+    partes = nombre.split()
     return f"{partes[0]} {partes[1][0]}." if len(partes) > 1 else partes[0]
+
+def fecha_a_orden(fecha_str):
+    """Convierte fechas relativas de Google a número para ordenar"""
+    fecha_str = safe_str(fecha_str).lower()
+    if not fecha_str: return 9999
+    
+    numeros = re.findall(r'\d+', fecha_str)
+    num = int(numeros[0]) if numeros else 1
+    
+    if 'hora' in fecha_str or 'hour' in fecha_str: return num
+    if 'día' in fecha_str or 'dia' in fecha_str or 'day' in fecha_str: return num * 24
+    if 'semana' in fecha_str or 'week' in fecha_str: return num * 168
+    if 'mes' in fecha_str or 'month' in fecha_str: return num * 720
+    if 'año' in fecha_str or 'year' in fecha_str: return num * 8760
+    return 5000
 
 def obtener_coordenadas(nombres, df):
     locs = []
@@ -146,18 +187,20 @@ def obtener_coordenadas(nombres, df):
         mask = df['restaurante'].str.lower() == nom.lower()
         if mask.any():
             r = df[mask].iloc[0]
-            if pd.notna(r.get('latitud')):
+            lat = safe_float(r.get('latitud'))
+            lng = safe_float(r.get('longitud'))
+            if lat != 0 and lng != 0:
                 locs.append({
-                    "nombre": r['restaurante'],
-                    "lat": float(r['latitud']),
-                    "lng": float(r['longitud']),
-                    "direccion": str(r.get('direccion','')),
-                    "rating": float(r.get('rating_gral',0)),
-                    "total_reviews": int(r.get('total_reviews_google',0))
+                    "nombre": safe_str(r['restaurante']),
+                    "lat": lat, 
+                    "lng": lng,
+                    "direccion": safe_str(r.get('direccion')),
+                    "rating": safe_float(r.get('rating_gral')),
+                    "total_reviews": safe_int(r.get('total_reviews_google'))
                 })
     return locs
 
-# --- GENERACIÓN DE TARJETAS (CON REDIS) ---
+# --- GENERACIÓN DE TARJETAS ---
 def obtener_restaurant_cards(nombres_restaurantes, df, llm):
     cards = []
     for nombre in nombres_restaurantes:
@@ -165,164 +208,186 @@ def obtener_restaurant_cards(nombres_restaurantes, df, llm):
         if mask.any():
             rest_df = df[mask]
             row = rest_df.iloc[0]
-            nombre_real = row['restaurante']
+            nombre_real = safe_str(row['restaurante'])
 
-            # 1. Frase destacada (Rápido, desde Pandas)
-            frase_destacada = ""
-            autor_reseña = ""
+            frase = ""
+            autor = ""
+            # Buscamos reseña con texto válido
             reseñas_validas = rest_df[rest_df['texto'].notna() & (rest_df['texto'].str.len() > 50)]
             if len(reseñas_validas) > 0:
-                # Intentamos agarrar una mediana para que no sea ni muy corta ni muy larga
-                r = reseñas_validas.iloc[0] 
-                frase_destacada = r['texto'][:120] + "..."
-                autor_reseña = formatear_autor(r.get('autor'))
+                r = reseñas_validas.iloc[0]
+                frase = safe_str(r['texto'])[:120] + "..."
+                autor = formatear_autor(r.get('autor'))
 
-            # 2. Descripción Inteligente (CACHEADA EN REDIS)
-            descripcion = cache.get_json("desc", nombre_real)
-            
-            if not descripcion:
-                # Generar si no existe
-                # print(f"🤖 Generando descripción nueva para {nombre_real}")
-                reviews_txt = " ".join([str(t) for t in rest_df['texto'].head(5).tolist()])[:800]
+            # Descripción (Cacheada)
+            desc = cache.get_json("desc", nombre_real)
+            if not desc:
+                sample = " ".join([safe_str(t) for t in rest_df['texto'].head(5)])[:800]
                 try:
-                    prompt = f"Describe '{nombre_real}' en máx 12 palabras atractivas basado en: {reviews_txt}"
-                    desc_str = llm.invoke(prompt).content.strip().replace('"','')
-                    descripcion = desc_str
-                    cache.set_json("desc", nombre_real, descripcion)
-                except:
-                    descripcion = "Restaurante popular en Neuquén."
+                    res = llm.invoke(f"Describe '{nombre_real}' en máx 12 palabras atractivas basado en: {sample}")
+                    desc = res.content.strip().replace('"','')
+                    cache.set_json("desc", nombre_real, desc)
+                except: desc = "Restaurante popular en Neuquén."
 
-            cards.append({
-                "nombre": nombre_real,
-                "rating": float(row.get('rating_gral', 0)),
-                "total_reviews": int(row.get('total_reviews_google', 0)),
-                "direccion": str(row.get('direccion', '')),
-                "barrio": str(row.get('barrio', '')),
-                "zona": str(row.get('zona', '')),
-                "descripcion": descripcion, 
-                "frase_destacada": frase_destacada,
-                "autor_reseña": autor_reseña
-            })
+            cards.append(RestaurantCard(
+                nombre=nombre_real,
+                rating=safe_float(row.get('rating_gral')),
+                total_reviews=safe_int(row.get('total_reviews_google')),
+                direccion=safe_str(row.get('direccion')),
+                barrio=safe_str(row.get('barrio')),
+                zona=safe_str(row.get('zona')),
+                descripcion=safe_str(desc),
+                frase_destacada=safe_str(frase),
+                autor_reseña=safe_str(autor)
+            ))
     return cards
 
-# --- RESUMEN DETALLADO (CON REDIS) ---
+# --- LÓGICA DE RESUMEN ---
 def resumir_opiniones_local(query_str, df, llm):
     mask = df['restaurante'].str.lower().str.contains(query_str.lower(), na=False)
     encontrados = df[mask]['restaurante'].unique()
     
     if len(encontrados) == 0: return f"No encontré '{query_str}'.", None, ""
     if len(encontrados) > 1:
-        lista = "\n".join([f"   {i+1}. {r}" for i, r in enumerate(encontrados)])
+        lista = "\n".join([f" {i+1}. {r}" for i, r in enumerate(encontrados)])
         return f"Encontré varias opciones:\n\n{lista}\n\n¿Cuál querés?", None, ""
     
     restaurante = encontrados[0]
     
-    # 1. BUSCAR EN REDIS
-    cache_data = cache.get_json("resumen", restaurante)
-    if cache_data:
-        return f"¡De una! Acá tenés la data de **{restaurante}**.", restaurante, cache_data
+    # Cache
+    cached = cache.get_json("resumen_texto", restaurante)
+    if cached: return f"¡Dale! Info de **{restaurante}**:", restaurante, cached
 
-    # 2. GENERAR SI NO EXISTE
-    print(f"🤖 Generando resumen detallado para {restaurante}...")
+    # Generar
     reviews_df = df[df['restaurante'] == restaurante]
-    reviews_text = "\n- ".join([f"{str(r.get('texto',''))[:200]}" for _, r in reviews_df.head(10).iterrows()])
+    reviews_txt = "\n".join([safe_str(r.get('texto'))[:200] for _, r in reviews_df.head(10).iterrows()])
     
-    template = """
-    Analiza: {restaurante}. Rating: {rating}
-    Reseñas: {reviews}
+    tpl = """Analiza: {rest}. Rating: {rat}. Reviews: {revs}
+    Generá resumen Markdown (Argentino):
+    ## 📊 La onda
+    ## 👍 Lo bueno
+    ## 💡 A mejorar
+    ## 🎯 Veredicto"""
     
-    Generá un resumen Markdown (Español Argentino):
-    ## 📊 La onda del lugar
-    ## 👍 Lo mejor
-    ## 💡 A tener en cuenta
-    ## 🎯 Veredicto
-    """
-    prompt = ChatPromptTemplate.from_template(template)
+    prompt = ChatPromptTemplate.from_template(tpl)
     chain = prompt | llm | StrOutputParser()
-    
-    resumen_generado = chain.invoke({
-        "restaurante": restaurante,
-        "rating": reviews_df.iloc[0].get('rating_gral', 'N/A'),
-        "reviews": reviews_text
+    res = chain.invoke({
+        "rest": restaurante, 
+        "rat": safe_float(reviews_df.iloc[0].get('rating_gral')),
+        "revs": reviews_txt
     })
     
-    # 3. GUARDAR EN REDIS
-    cache.set_json("resumen", restaurante, resumen_generado)
-    
-    return f"¡De una! Acá tenés la data de **{restaurante}**.", restaurante, resumen_generado
+    cache.set_json("resumen_texto", restaurante, res)
+    return f"¡Dale! Info de **{restaurante}**:", restaurante, res
 
-# --- ROUTER ---
-def procesar_consulta(query, df, vectorstore, llm, ctx=None):
-    q_low = query.lower()
-    
-    # Opciones numéricas
-    if ctx and 'pending_options' in ctx and query.strip().isdigit():
-        num = int(query.strip())
-        opts = ctx['pending_options']
-        if 1 <= num <= len(opts):
-            sel = opts[num-1]
-            resp, nom, det = resumir_opiniones_local(sel, df, llm)
-            nombre = nom or sel
-            cards = obtener_restaurant_cards([nombre], df, llm)
-            return resp, "resumen", None, obtener_coordenadas([nombre], df), cards, det
-        return f"Elegí entre 1 y {len(opts)}", "resumen", opts, [], [], ""
+# --- ENDPOINTS ---
 
-    # Stats
+@app.get("/")
+def read_root():
+    return {"status": "online", "msg": "API Que Morfamos OK"}
+
+@app.get("/health")
+def health_check():
+    return {"status": "healthy", "df_size": len(df) if df is not None else 0}
+
+@app.get("/restaurant/{nombre}", response_model=RestaurantDetail)
+async def get_restaurant_detail(nombre: str):
+    """Endpoint para la vista detallada (El que se rompió antes)"""
+    global df, llm
+    
+    # 1. Buscar restaurante
+    mask = df['restaurante'].str.lower() == nombre.lower()
+    if not mask.any():
+        raise HTTPException(status_code=404, detail="No encontrado")
+    
+    rest_df = df[mask]
+    row = rest_df.iloc[0]
+    nombre_real = safe_str(row['restaurante'])
+    
+    # 2. Reseñas (Ordenadas por fecha)
+    reviews_list = []
+    con_texto = rest_df[rest_df['texto'].notna() & (rest_df['texto'].str.len() > 10)].copy()
+    con_texto['orden'] = con_texto['fecha'].apply(fecha_a_orden)
+    con_texto = con_texto.sort_values('orden') # Menor es más reciente
+    
+    for _, r in con_texto.head(8).iterrows():
+        reviews_list.append(ReviewDetail(
+            autor=formatear_autor(r.get('autor')),
+            rating=safe_int(r.get('rating_user')),
+            texto=safe_str(r.get('texto'))[:300],
+            fecha=safe_str(r.get('fecha'))
+        ))
+
+    # 3. Análisis LLM (Con Caché JSON)
+    analisis = cache.get_json("json_detail", nombre_real)
+    
+    if not analisis:
+        # Generar si no existe
+        sample = " | ".join([r.texto[:150] for r in reviews_list[:5]])
+        prompt_txt = f"""Analiza "{nombre_real}" y responde SOLO JSON válido:
+        {{"resumen": "2 oraciones descripción", "positivos": ["item1", "item2", "item3"], "negativos": ["item1", "item2"]}}
+        Reseñas: {sample}"""
+        
+        try:
+            res = llm.invoke(prompt_txt).content.strip().replace("```json","").replace("```","")
+            analisis = json.loads(res)
+            cache.set_json("json_detail", nombre_real, analisis)
+        except:
+            analisis = {"resumen": "Info no disponible momentáneamente.", "positivos": [], "negativos": []}
+
+    return RestaurantDetail(
+        nombre=nombre_real,
+        rating=safe_float(row.get('rating_gral')),
+        total_reviews=safe_int(row.get('total_reviews_google')),
+        direccion=safe_str(row.get('direccion')),
+        barrio=safe_str(row.get('barrio')),
+        zona=safe_str(row.get('zona')),
+        lat=safe_float(row.get('latitud')),
+        lng=safe_float(row.get('longitud')),
+        resumen_general=safe_str(analisis.get("resumen")),
+        aspectos_positivos=analisis.get("positivos", []),
+        aspectos_negativos=analisis.get("negativos", []),
+        reviews=reviews_list
+    )
+
+@app.post("/chat", response_model=QueryResponse)
+def chat(req: QueryRequest):
+    # Lógica simplificada de Router
+    q_low = req.query.lower()
+    
+    # 1. Stats
     if any(p in q_low for p in ["cuantos", "cantidad", "total"]):
         total = df['restaurante'].nunique()
-        return f"Tengo {total} locales registrados.", "estadisticas", None, [], [], ""
+        return QueryResponse(response=f"Hay {total} locales.", mode="estadisticas")
 
-    # Resumen directo
-    if any(k in q_low for k in ["opiniones", "info", "que onda"]):
+    # 2. Resumen específico
+    if "opiniones de" in q_low or "que onda" in q_low:
         for prep in [" de ", " sobre "]:
             if prep in q_low:
                 target = q_low.split(prep, 1)[1].strip()
                 resp, nom, det = resumir_opiniones_local(target, df, llm)
                 if nom:
                     cards = obtener_restaurant_cards([nom], df, llm)
-                    return resp, "resumen", None, obtener_coordenadas([nom], df), cards, det
+                    locs = obtener_coordenadas([nom], df)
+                    return QueryResponse(response=resp, mode="resumen", locations=locs, restaurant_cards=cards, detail_content=det)
 
-    # RAG Default
-    docs = vectorstore.similarity_search(query, k=15)
-    locales = list(set([d.metadata.get('nombre') for d in docs]))[:5]
-    
-    rag_resp = "Acá tenés las mejores opciones que encontré según las reseñas." 
-    
-    cards = obtener_restaurant_cards(locales, df, llm)
-    locs = obtener_coordenadas(locales, df)
-    
-    return rag_resp, "rag", None, locs, cards, ""
-
-# --- ENDPOINTS ---
-
-@app.get("/")
-def read_root():
-    return {"status": "online", "message": "Backend funcionando OK 🚀"}
-
-@app.get("/health")
-def health_check():
-    return {
-        "status": "healthy", 
-        "df_size": len(df) if df is not None else 0
-    }
-
-@app.post("/chat", response_model=QueryResponse)
-def chat(req: QueryRequest):
+    # 3. RAG Default
     try:
-        resp, mode, pend, locs, cards, det = procesar_consulta(
-            req.query, df, vectorstore, llm, req.conversation_context
-        )
-        new_ctx = req.conversation_context.copy()
-        if pend: new_ctx['pending_options'] = pend
-        elif 'pending_options' in new_ctx: del new_ctx['pending_options']
+        docs = vectorstore.similarity_search(req.query, k=15)
+        locales = list(set([d.metadata.get('nombre') for d in docs]))[:5]
+        
+        cards = obtener_restaurant_cards(locales, df, llm)
+        locs = obtener_coordenadas(locales, df)
         
         return QueryResponse(
-            response=resp, mode=mode, conversation_context=new_ctx,
-            locations=locs, restaurant_cards=cards, detail_content=det
+            response="Acá tenés las mejores opciones que encontré:",
+            mode="rag",
+            locations=locs,
+            restaurant_cards=cards
         )
     except Exception as e:
-        print(f"Error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"Error chat: {e}")
+        raise HTTPException(status_code=500, detail="Error procesando chat")
 
 if __name__ == "__main__":
     import uvicorn
