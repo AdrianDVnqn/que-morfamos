@@ -59,7 +59,7 @@ class RedisCacheManager:
 cache = RedisCacheManager(UPSTASH_REDIS_REST_URL, UPSTASH_REDIS_REST_TOKEN)
 
 # --- INICIALIZACIÓN APP ---
-app = FastAPI(title="Que Morfamos API (Safe Mode)", version="3.6.0")
+app = FastAPI(title="Que Morfamos API (Strict Mode)", version="3.7.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -119,7 +119,7 @@ class QueryResponse(BaseModel):
     detail_content: str = ""
 
 # ==========================================
-# 2. STARTUP & LIMPIEZA DE DATOS
+# 2. STARTUP
 # ==========================================
 @app.on_event("startup")
 async def startup_event():
@@ -129,18 +129,12 @@ async def startup_event():
     if os.path.exists(ARCHIVO_DATASET):
         try:
             df = pd.read_parquet(ARCHIVO_DATASET)
-            
-            # --- LIMPIEZA CRÍTICA PARA EVITAR 'NoneType' ERROR ---
-            # Forzamos que estas columnas sean strings vacíos en lugar de None/NaN
             cols_to_fix = ['restaurante', 'texto', 'direccion', 'barrio', 'zona', 'autor', 'fecha']
             for col in cols_to_fix:
                 if col in df.columns:
                     df[col] = df[col].fillna("").astype(str).str.strip()
-            
-            # Rellenamos numéricos
             df['rating_gral'] = pd.to_numeric(df['rating_gral'], errors='coerce').fillna(0.0)
-            
-            print(f"✅ DataFrame cargado y sanitizado: {len(df)} filas.")
+            print(f"✅ DataFrame cargado: {len(df)} filas.")
         except Exception as e:
             print(f"❌ Error leyendo Parquet: {e}")
             df = pd.DataFrame()
@@ -183,7 +177,7 @@ def fecha_a_orden(fecha_str):
     numeros = re.findall(r'\d+', fecha_str)
     num = int(numeros[0]) if numeros else 1
     if 'hora' in fecha_str: return num
-    if 'día' in fecha_str or 'dia' in fecha_str: return num * 24
+    if 'día' in fecha_str: return num * 24
     if 'semana' in fecha_str: return num * 168
     if 'mes' in fecha_str: return num * 720
     if 'año' in fecha_str: return num * 8760
@@ -192,7 +186,7 @@ def fecha_a_orden(fecha_str):
 def obtener_coordenadas(nombres, df):
     locs = []
     for nom in nombres:
-        if not nom: continue # Saltamos nombres vacíos
+        if not nom: continue
         mask = df['restaurante'].str.lower() == nom.lower()
         if mask.any():
             r = df[mask].iloc[0]
@@ -230,8 +224,7 @@ def obtener_restaurant_cards_simple(nombres_restaurantes, df):
 def obtener_restaurant_cards(nombres_restaurantes, df, llm):
     cards = []
     for nombre in nombres_restaurantes:
-        if not nombre: continue # Protección Anti-Crash
-        
+        if not nombre: continue
         mask = df['restaurante'].str.lower() == nombre.lower()
         if mask.any():
             rest_df = df[mask]
@@ -272,8 +265,8 @@ def clasificar_intencion(query, llm):
     template = """
     Clasifica la intención. QUERY: "{query}"
     OPCIONES:
-    1. "STATS": Cantidades, totales, cuantos hay (ej: "cuantas pizzerias", "total locales").
-    2. "SPECIFIC_INFO": Lugar específico (ej: "opiniones de Atu", "info de Antares").
+    1. "STATS": Cantidades, totales, cuantos hay.
+    2. "SPECIFIC_INFO": Lugar específico (ej: "opiniones de Atu", "info de Antares", "que opinan de santino").
     3. "RECOMMENDATION": Sugerencias generales.
     
     Responde JSON: {{"intent": "...", "entity": "..."}} (Entity null si no aplica)
@@ -289,23 +282,18 @@ def consultar_estadisticas(query, df, llm):
     try:
         prompt = f"Extrae palabra clave para filtrar (ej: 'pizzerias' -> 'pizza'). Query: {query}. Solo la palabra."
         keyword = llm.invoke(prompt).content.strip().lower()
-        
-        # Eliminar puntuación por seguridad
         keyword = re.sub(r'[^\w\s]', '', keyword)
         
         total = df['restaurante'].nunique()
         if "total" in keyword or len(keyword) < 2:
             return f"Tengo registrados **{total}** restaurantes.", []
         
-        # Búsqueda segura (ya sanitizamos el DF al inicio)
         mask = (df['restaurante'].str.lower().str.contains(keyword, na=False) | 
                 df['texto'].str.lower().str.contains(keyword, na=False))
         
         locales_filtrados = df[mask]['restaurante'].unique().tolist()
         return f"Encontré **{len(locales_filtrados)}** lugares relacionados con '{keyword}'.", locales_filtrados
-    except Exception as e:
-        print(f"Error Stats: {e}")
-        return "No pude calcular esa estadística.", []
+    except: return "No pude calcular esa estadística.", []
 
 def resumir_opiniones_local(query_str, df, llm):
     if not query_str: return "Nombre vacío.", None, "", None
@@ -313,8 +301,9 @@ def resumir_opiniones_local(query_str, df, llm):
     mask = df['restaurante'].str.lower().str.contains(query_str.lower(), na=False)
     encontrados = df[mask]['restaurante'].unique()
     
+    # --- AQUÍ ESTÁ EL CAMBIO CLAVE ---
     if len(encontrados) == 0: 
-        return f"No encontré nada con '{query_str}'.", None, "", None
+        return "No conozco ese lugar che, disculpá.", None, "", None
     
     if len(encontrados) > 1:
         lista_txt = "\n".join([f" {i+1}. {r}" for i, r in enumerate(encontrados)])
@@ -384,6 +373,7 @@ def procesar_consulta(query, df, vectorstore, llm, ctx=None):
 
         if target:
             resp, nombre_real, det, opciones = resumir_opiniones_local(target, df, llm)
+            
             if opciones: return resp, "resumen", opciones, [], [], ""
             
             if nombre_real:
@@ -391,11 +381,13 @@ def procesar_consulta(query, df, vectorstore, llm, ctx=None):
                 cards = obtener_restaurant_cards([nombre_real], df, llm)
                 locs = obtener_coordenadas([nombre_real], df)
                 return resp, "resumen", None, locs, cards, det
+            
+            # --- BLOQUEO DE RAG: Si no encontró, devolvemos el error aquí ---
+            return resp, "resumen", None, [], [], ""
 
     # 5. RAG (RECOMENDACIÓN)
     try:
         docs = vectorstore.similarity_search(query, k=15)
-        # Filtrar duplicados y Nones
         seen = set()
         locales = []
         for d in docs:
@@ -485,6 +477,7 @@ def chat(req: QueryRequest):
         resp, mode, pend, locs, cards, det = procesar_consulta(
             req.query, df, vectorstore, llm, req.conversation_context
         )
+        
         new_ctx = req.conversation_context.copy()
         if pend: new_ctx['pending_options'] = pend
         elif 'pending_options' in new_ctx: del new_ctx['pending_options']
