@@ -14,14 +14,14 @@ from langchain_core.output_parsers import StrOutputParser
 from upstash_redis import Redis
 
 # ==========================================
-# 1. CONFIGURACIÓN E INFRAESTRUCTURA
+# 1. CONFIGURACIÓN
 # ==========================================
 PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "que-morfamos-nqn")
 ARCHIVO_DATASET = "dataset_reviews.parquet"
 UPSTASH_REDIS_REST_URL = os.getenv("UPSTASH_REDIS_REST_URL")
 UPSTASH_REDIS_REST_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN")
 
-# --- GESTOR DE CACHÉ (REDIS) ---
+# --- GESTOR DE CACHÉ ---
 class RedisCacheManager:
     def __init__(self, url, token):
         self.client = None
@@ -35,7 +35,8 @@ class RedisCacheManager:
             print("⚠️ Faltan credenciales Redis.")
 
     def _sanitize_key(self, key):
-        return key.lower().strip().replace(" ", "_")
+        if not key: return "unknown"
+        return str(key).lower().strip().replace(" ", "_")
 
     def get_json(self, prefix, key):
         if not self.client: return None
@@ -43,8 +44,7 @@ class RedisCacheManager:
         try:
             data = self.client.get(full_key)
             if data:
-                if isinstance(data, dict): return data
-                return json.loads(data)
+                return data if isinstance(data, dict) else json.loads(data)
             return None
         except: return None
 
@@ -54,12 +54,12 @@ class RedisCacheManager:
         try:
             json_str = json.dumps(value_dict, ensure_ascii=False)
             self.client.set(full_key, json_str, ex=expire)
-        except Exception as e: print(f"Error escritura caché: {e}")
+        except: pass
 
 cache = RedisCacheManager(UPSTASH_REDIS_REST_URL, UPSTASH_REDIS_REST_TOKEN)
 
 # --- INICIALIZACIÓN APP ---
-app = FastAPI(title="Que Morfamos API (Final)", version="3.5.0")
+app = FastAPI(title="Que Morfamos API (Safe Mode)", version="3.6.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -74,9 +74,7 @@ df = None
 vectorstore = None
 llm = None
 
-# ==========================================
-# 2. MODELOS DE DATOS (PYDANTIC)
-# ==========================================
+# --- MODELOS PYDANTIC ---
 class RestaurantCard(BaseModel):
     nombre: str
     rating: float = 0
@@ -121,7 +119,7 @@ class QueryResponse(BaseModel):
     detail_content: str = ""
 
 # ==========================================
-# 3. HELPERS Y CARGA DE DATOS
+# 2. STARTUP & LIMPIEZA DE DATOS
 # ==========================================
 @app.on_event("startup")
 async def startup_event():
@@ -131,9 +129,18 @@ async def startup_event():
     if os.path.exists(ARCHIVO_DATASET):
         try:
             df = pd.read_parquet(ARCHIVO_DATASET)
-            if 'restaurante' in df.columns:
-                df['restaurante'] = df['restaurante'].str.strip()
-            print(f"✅ DataFrame cargado: {len(df)} filas.")
+            
+            # --- LIMPIEZA CRÍTICA PARA EVITAR 'NoneType' ERROR ---
+            # Forzamos que estas columnas sean strings vacíos en lugar de None/NaN
+            cols_to_fix = ['restaurante', 'texto', 'direccion', 'barrio', 'zona', 'autor', 'fecha']
+            for col in cols_to_fix:
+                if col in df.columns:
+                    df[col] = df[col].fillna("").astype(str).str.strip()
+            
+            # Rellenamos numéricos
+            df['rating_gral'] = pd.to_numeric(df['rating_gral'], errors='coerce').fillna(0.0)
+            
+            print(f"✅ DataFrame cargado y sanitizado: {len(df)} filas.")
         except Exception as e:
             print(f"❌ Error leyendo Parquet: {e}")
             df = pd.DataFrame()
@@ -151,24 +158,22 @@ async def startup_event():
     except Exception as e:
         print(f"❌ Error IA: {e}")
 
-# --- LIMPIEZA DE DATOS (ANTI-CRASH) ---
+# --- HELPERS SAFE ---
 def safe_str(val):
     if pd.isna(val) or val is None: return ""
     return str(val).strip()
 
 def safe_float(val):
-    if pd.isna(val) or val is None: return 0.0
-    try: return float(val)
+    try: return float(val) if pd.notna(val) else 0.0
     except: return 0.0
 
 def safe_int(val):
-    if pd.isna(val) or val is None: return 0
-    try: return int(float(val))
+    try: return int(float(val)) if pd.notna(val) else 0
     except: return 0
 
 def formatear_autor(nombre):
     nombre = safe_str(nombre)
-    if not nombre: return "Anónimo"
+    if not nombre or nombre.lower() == "nan": return "Anónimo"
     partes = nombre.split()
     return f"{partes[0]} {partes[1][0]}." if len(partes) > 1 else partes[0]
 
@@ -187,6 +192,7 @@ def fecha_a_orden(fecha_str):
 def obtener_coordenadas(nombres, df):
     locs = []
     for nom in nombres:
+        if not nom: continue # Saltamos nombres vacíos
         mask = df['restaurante'].str.lower() == nom.lower()
         if mask.any():
             r = df[mask].iloc[0]
@@ -203,13 +209,13 @@ def obtener_coordenadas(nombres, df):
     return locs
 
 # ==========================================
-# 4. LÓGICA DE NEGOCIO (CARDS, RESUMEN, CLASIFICACIÓN)
+# 3. LÓGICA DE NEGOCIO
 # ==========================================
 
 def obtener_restaurant_cards_simple(nombres_restaurantes, df):
-    """Versión rápida para estadísticas"""
     cards = []
     for nombre in nombres_restaurantes:
+        if not nombre: continue
         mask = df['restaurante'].str.lower() == nombre.lower()
         if mask.any():
             row = df[mask].iloc[0]
@@ -222,9 +228,10 @@ def obtener_restaurant_cards_simple(nombres_restaurantes, df):
     return cards
 
 def obtener_restaurant_cards(nombres_restaurantes, df, llm):
-    """Versión completa con descripciones generadas y cacheadas"""
     cards = []
     for nombre in nombres_restaurantes:
+        if not nombre: continue # Protección Anti-Crash
+        
         mask = df['restaurante'].str.lower() == nombre.lower()
         if mask.any():
             rest_df = df[mask]
@@ -233,13 +240,12 @@ def obtener_restaurant_cards(nombres_restaurantes, df, llm):
 
             frase = ""
             autor = ""
-            reseñas_validas = rest_df[rest_df['texto'].notna() & (rest_df['texto'].str.len() > 50)]
-            if len(reseñas_validas) > 0:
+            reseñas_validas = rest_df[rest_df['texto'].str.len() > 50]
+            if not reseñas_validas.empty:
                 r = reseñas_validas.iloc[0]
                 frase = safe_str(r['texto'])[:120] + "..."
                 autor = formatear_autor(r.get('autor'))
 
-            # Descripción (Cacheada)
             desc = cache.get_json("desc", nombre_real)
             if not desc:
                 sample = " ".join([safe_str(t) for t in rest_df['texto'].head(5)])[:800]
@@ -263,17 +269,14 @@ def obtener_restaurant_cards(nombres_restaurantes, df, llm):
     return cards
 
 def clasificar_intencion(query, llm):
-    """Traffic Cop: Decide qué quiere el usuario usando LLM"""
     template = """
-    Clasifica la intención del usuario.
-    QUERY: "{query}"
-    
+    Clasifica la intención. QUERY: "{query}"
     OPCIONES:
-    1. "STATS": Preguntas de cantidad, totales (ej: "cuántas pizzerías", "total locales").
-    2. "SPECIFIC_INFO": Pregunta sobre un lugar específico (ej: "opiniones de Atu", "qué onda el Club 5").
-    3. "RECOMMENDATION": Sugerencias generales (ej: "dónde comer pasta", "lugar romántico").
+    1. "STATS": Cantidades, totales, cuantos hay (ej: "cuantas pizzerias", "total locales").
+    2. "SPECIFIC_INFO": Lugar específico (ej: "opiniones de Atu", "info de Antares").
+    3. "RECOMMENDATION": Sugerencias generales.
     
-    Responde JSON: {{"intent": "...", "entity": "..."}} (Entity es el nombre del lugar si aplica, sino null)
+    Responde JSON: {{"intent": "...", "entity": "..."}} (Entity null si no aplica)
     """
     try:
         chain = ChatPromptTemplate.from_template(template) | llm | StrOutputParser()
@@ -283,40 +286,45 @@ def clasificar_intencion(query, llm):
         return {"intent": "RECOMMENDATION", "entity": None}
 
 def consultar_estadisticas(query, df, llm):
-    # Extraer keyword para filtrar
-    prompt = f"Extrae palabra clave para filtrar (ej: 'pizzerias' -> 'pizza'). Query: {query}. Solo la palabra."
-    keyword = llm.invoke(prompt).content.strip().lower()
-    
-    total = df['restaurante'].nunique()
-    if "total" in keyword or len(keyword) < 2:
-        return f"Tengo registrados **{total}** restaurantes.", []
-    
-    mask = (df['restaurante'].str.lower().str.contains(keyword, na=False) | 
-            df['texto'].str.lower().str.contains(keyword, na=False))
-    locales_filtrados = df[mask]['restaurante'].unique().tolist()
-    
-    return f"Encontré **{len(locales_filtrados)}** lugares relacionados con '{keyword}'.", locales_filtrados
+    try:
+        prompt = f"Extrae palabra clave para filtrar (ej: 'pizzerias' -> 'pizza'). Query: {query}. Solo la palabra."
+        keyword = llm.invoke(prompt).content.strip().lower()
+        
+        # Eliminar puntuación por seguridad
+        keyword = re.sub(r'[^\w\s]', '', keyword)
+        
+        total = df['restaurante'].nunique()
+        if "total" in keyword or len(keyword) < 2:
+            return f"Tengo registrados **{total}** restaurantes.", []
+        
+        # Búsqueda segura (ya sanitizamos el DF al inicio)
+        mask = (df['restaurante'].str.lower().str.contains(keyword, na=False) | 
+                df['texto'].str.lower().str.contains(keyword, na=False))
+        
+        locales_filtrados = df[mask]['restaurante'].unique().tolist()
+        return f"Encontré **{len(locales_filtrados)}** lugares relacionados con '{keyword}'.", locales_filtrados
+    except Exception as e:
+        print(f"Error Stats: {e}")
+        return "No pude calcular esa estadística.", []
 
 def resumir_opiniones_local(query_str, df, llm):
-    """Genera resumen específico para el chat"""
+    if not query_str: return "Nombre vacío.", None, "", None
+    
     mask = df['restaurante'].str.lower().str.contains(query_str.lower(), na=False)
     encontrados = df[mask]['restaurante'].unique()
     
-    if len(encontrados) == 0: return f"No encontré nada con '{query_str}'.", None, "", None
+    if len(encontrados) == 0: 
+        return f"No encontré nada con '{query_str}'.", None, "", None
     
-    # Ambigüedad
     if len(encontrados) > 1:
         lista_txt = "\n".join([f" {i+1}. {r}" for i, r in enumerate(encontrados)])
-        return f"Encontré varias opciones:\n\n{lista_txt}\n\n¿Cuál decís? (Tirame el número)", None, "", list(encontrados)
+        return f"Encontré varias opciones:\n\n{lista_txt}\n\n¿A cuál te referís? (Escribí el número)", None, "", list(encontrados)
     
     restaurante = encontrados[0]
-    
-    # Cache
     cached_text = cache.get_json("resumen_texto", restaurante)
     if cached_text:
         return f"¡Dale! Acá la data de **{restaurante}**:", restaurante, cached_text, None
 
-    # Generar
     reviews_df = df[df['restaurante'] == restaurante]
     reviews_txt = "\n".join([safe_str(r.get('texto'))[:200] for _, r in reviews_df.head(10).iterrows()])
     
@@ -337,66 +345,57 @@ def resumir_opiniones_local(query_str, df, llm):
     return f"¡Dale! Acá la data de **{restaurante}**:", restaurante, res, None
 
 # ==========================================
-# 5. ROUTER PRINCIPAL (CEREBRO)
+# 4. ROUTER PRINCIPAL
 # ==========================================
 def procesar_consulta(query, df, vectorstore, llm, ctx=None):
     if ctx is None: ctx = {}
     
-    # 1. FLUJO FORZADO: CONTEXTO NUMÉRICO
+    # 1. CONTEXTO NUMÉRICO
     if 'pending_options' in ctx and query.strip().isdigit():
         num = int(query.strip())
         opciones = ctx['pending_options']
         if 1 <= num <= len(opciones):
             seleccion = opciones[num - 1]
-            # Guardamos foco
             ctx['last_entity'] = seleccion
-            
             resp, nombre_real, det, _ = resumir_opiniones_local(seleccion, df, llm)
             cards = obtener_restaurant_cards([nombre_real], df, llm)
             locs = obtener_coordenadas([nombre_real], df)
             return resp, "resumen", None, locs, cards, det
-        else:
-            return f"Elegí entre 1 y {len(opciones)}", "resumen", opciones, [], [], ""
+        return f"Elegí entre 1 y {len(opciones)}", "resumen", opciones, [], [], ""
 
-    # 2. CLASIFICACIÓN INTELIGENTE
+    # 2. CLASIFICACIÓN
     clasificacion = clasificar_intencion(query, llm)
     intent = clasificacion.get("intent")
     entity = clasificacion.get("entity")
     
     print(f"🧠 Router: {intent} | Entity: {entity}")
 
-    # 3. MODO ESTADÍSTICAS
+    # 3. STATS
     if intent == "STATS":
         resp, locales = consultar_estadisticas(query, df, llm)
         cards = obtener_restaurant_cards_simple(locales, df)
         locs = obtener_coordenadas(locales, df)
         return resp, "estadisticas", None, locs, cards, ""
 
-    # 4. MODO INFORMACIÓN ESPECÍFICA
+    # 4. INFO ESPECÍFICA
     if intent == "SPECIFIC_INFO":
         target = entity
-        
-        # Seguimiento de conversación (Ej: "y es caro?")
-        if not target and ctx.get('last_entity'):
-            target = ctx['last_entity']
-            print(f"🔄 Usando contexto: {target}")
+        if not target and ctx.get('last_entity'): target = ctx['last_entity']
 
         if target:
             resp, nombre_real, det, opciones = resumir_opiniones_local(target, df, llm)
+            if opciones: return resp, "resumen", opciones, [], [], ""
             
-            if opciones: # Múltiples
-                return resp, "resumen", opciones, [], [], ""
-            
-            if nombre_real: # Encontrado único
-                ctx['last_entity'] = nombre_real # Actualizar foco
+            if nombre_real:
+                ctx['last_entity'] = nombre_real
                 cards = obtener_restaurant_cards([nombre_real], df, llm)
                 locs = obtener_coordenadas([nombre_real], df)
                 return resp, "resumen", None, locs, cards, det
 
-    # 5. MODO RAG (RECOMENDACIÓN) - Default
+    # 5. RAG (RECOMENDACIÓN)
     try:
         docs = vectorstore.similarity_search(query, k=15)
-        # Extraer nombres únicos preservando orden
+        # Filtrar duplicados y Nones
         seen = set()
         locales = []
         for d in docs:
@@ -404,13 +403,12 @@ def procesar_consulta(query, df, vectorstore, llm, ctx=None):
             if nom and nom not in seen:
                 seen.add(nom)
                 locales.append(nom)
-        locales = locales[:5] # Top 5
+        locales = locales[:5]
         
         cards = obtener_restaurant_cards(locales, df, llm)
         locs = obtener_coordenadas(locales, df)
         
-        # Generar respuesta amigable con el LLM
-        prompt_rag = f"Usuario busca: '{query}'. Encontré estos lugares: {', '.join(locales)}. Recomendalos en 1 frase corta argentina."
+        prompt_rag = f"Usuario busca: '{query}'. Encontré: {', '.join(locales)}. Recomendalos en 1 frase corta argentina."
         rag_resp = llm.invoke(prompt_rag).content
         
         return rag_resp, "rag", None, locs, cards, ""
@@ -420,23 +418,20 @@ def procesar_consulta(query, df, vectorstore, llm, ctx=None):
         return "Tuve un problema buscando eso. ¿Probamos de nuevo?", "rag", None, [], [], ""
 
 # ==========================================
-# 6. ENDPOINTS API
+# 5. ENDPOINTS
 # ==========================================
 
 @app.get("/")
-def read_root():
-    return {"status": "online", "message": "Backend funcionando OK 🚀"}
+def read_root(): return {"status": "online", "message": "API OK"}
 
 @app.get("/health")
-def health_check():
-    return {"status": "healthy", "df_size": len(df) if df is not None else 0}
+def health_check(): return {"status": "healthy", "df_size": len(df) if df is not None else 0}
 
 @app.get("/restaurant/{nombre}", response_model=RestaurantDetail)
 async def get_restaurant_detail(nombre: str):
-    """Endpoint para modal/panel lateral"""
     global df, llm
+    if not nombre: raise HTTPException(status_code=404)
     
-    # 1. Buscar
     mask = df['restaurante'].str.lower() == nombre.lower()
     if not mask.any(): raise HTTPException(status_code=404, detail="No encontrado")
     
@@ -444,9 +439,8 @@ async def get_restaurant_detail(nombre: str):
     row = rest_df.iloc[0]
     nombre_real = safe_str(row['restaurante'])
     
-    # 2. Reseñas
     reviews_list = []
-    con_texto = rest_df[rest_df['texto'].notna() & (rest_df['texto'].str.len() > 10)].copy()
+    con_texto = rest_df[rest_df['texto'].str.len() > 10].copy()
     con_texto['orden'] = con_texto['fecha'].apply(fecha_a_orden)
     con_texto = con_texto.sort_values('orden')
     
@@ -458,13 +452,12 @@ async def get_restaurant_detail(nombre: str):
             fecha=safe_str(r.get('fecha'))
         ))
 
-    # 3. Análisis JSON (Cacheado)
     analisis = cache.get_json("json_detail", nombre_real)
     if not analisis:
         sample = " | ".join([r.texto[:150] for r in reviews_list[:5]])
-        prompt_txt = f"""Analiza "{nombre_real}" y responde SOLO JSON válido:
+        prompt_txt = f"""Analiza "{nombre_real}" y responde SOLO JSON:
         {{"resumen": "descripción", "positivos": ["p1", "p2"], "negativos": ["n1"]}}
-        Reseñas: {sample}"""
+        Reviews: {sample}"""
         try:
             res = llm.invoke(prompt_txt).content.strip().replace("```json","").replace("```","")
             analisis = json.loads(res)
@@ -492,13 +485,10 @@ def chat(req: QueryRequest):
         resp, mode, pend, locs, cards, det = procesar_consulta(
             req.query, df, vectorstore, llm, req.conversation_context
         )
-        
-        # Gestión de contexto
         new_ctx = req.conversation_context.copy()
         if pend: new_ctx['pending_options'] = pend
         elif 'pending_options' in new_ctx: del new_ctx['pending_options']
         
-        # Persistir la entidad enfocada si existe en el contexto viejo
         if 'last_entity' in req.conversation_context and 'last_entity' not in new_ctx:
              new_ctx['last_entity'] = req.conversation_context['last_entity']
 
