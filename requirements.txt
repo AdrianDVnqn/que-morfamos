@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+pandas
+pydantic
+langchain-openai
+langchain-pinecone
+pinecone-client
+python-dotenv
+upstash-redis
