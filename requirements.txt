@@ -7,3 +7,4 @@ langchain-pinecone
 pinecone-client
 python-dotenv
 upstash-redis
+pyarrow
