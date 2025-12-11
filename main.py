@@ -11,7 +11,7 @@ from langchain_core.output_parsers import StrOutputParser
 from upstash_redis import Redis # <--- IMPORT NUEVO
 
 # --- CONFIGURACIÓN DE ENTORNO ---
-PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "que-morfamos-nqn")
+PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "restaurantes-neuquen-openai")
 ARCHIVO_CSV = "dataset_reviews_neuquen_final.csv"
 
 # Variables de Upstash (Configuralas en Render)
@@ -312,5 +312,4 @@ def chat(req: QueryRequest):
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
-
     uvicorn.run(app, host="0.0.0.0", port=port)
