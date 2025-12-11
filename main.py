@@ -108,11 +108,17 @@ async def startup_event():
     global df, vectorstore, llm
     print("☁️ Inicializando Backend...")
     
-    # 1. Cargar Pandas
+    # 1. Cargar Pandas (PARQUET)
     if os.path.exists(ARCHIVO_DATASET):
-        df = pd.read_parquet(ARCHIVO_DATASET)
-        df['restaurante'] = df['restaurante'].str.strip()
-        print(f"✅ DataFrame cargado: {len(df)} reseñas.")
+        try:
+            df = pd.read_parquet(ARCHIVO_DATASET)
+            # Limpieza básica
+            if 'restaurante' in df.columns:
+                df['restaurante'] = df['restaurante'].str.strip()
+            print(f"✅ DataFrame cargado: {len(df)} reseñas.")
+        except Exception as e:
+            print(f"❌ Error leyendo Parquet: {e}")
+            df = pd.DataFrame()
     else:
         print("⚠️ Parquet no encontrado. Modo fallback.")
         df = pd.DataFrame()
@@ -166,7 +172,6 @@ def obtener_restaurant_cards(nombres_restaurantes, df, llm):
             autor_reseña = ""
             reseñas_validas = rest_df[rest_df['texto'].notna() & (rest_df['texto'].str.len() > 50)]
             if len(reseñas_validas) > 0:
-                # Lógica simple para agarrar una reseña representativa
                 # Intentamos agarrar una mediana para que no sea ni muy corta ni muy larga
                 r = reseñas_validas.iloc[0] 
                 frase_destacada = r['texto'][:120] + "..."
@@ -183,7 +188,6 @@ def obtener_restaurant_cards(nombres_restaurantes, df, llm):
                     prompt = f"Describe '{nombre_real}' en máx 12 palabras atractivas basado en: {reviews_txt}"
                     desc_str = llm.invoke(prompt).content.strip().replace('"','')
                     descripcion = desc_str
-                    # Guardamos string directo, el wrapper lo hace JSON string
                     cache.set_json("desc", nombre_real, descripcion)
                 except:
                     descripcion = "Restaurante popular en Neuquén."
@@ -265,7 +269,6 @@ def procesar_consulta(query, df, vectorstore, llm, ctx=None):
 
     # Stats
     if any(p in q_low for p in ["cuantos", "cantidad", "total"]):
-        # Lógica simplificada de stats
         total = df['restaurante'].nunique()
         return f"Tengo {total} locales registrados.", "estadisticas", None, [], [], ""
 
@@ -291,6 +294,18 @@ def procesar_consulta(query, df, vectorstore, llm, ctx=None):
     return rag_resp, "rag", None, locs, cards, ""
 
 # --- ENDPOINTS ---
+
+@app.get("/")
+def read_root():
+    return {"status": "online", "message": "Backend funcionando OK 🚀"}
+
+@app.get("/health")
+def health_check():
+    return {
+        "status": "healthy", 
+        "df_size": len(df) if df is not None else 0
+    }
+
 @app.post("/chat", response_model=QueryResponse)
 def chat(req: QueryRequest):
     try:
@@ -313,4 +328,3 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
-
