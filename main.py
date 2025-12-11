@@ -8,11 +8,11 @@ from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_pinecone import PineconeVectorStore
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
-from upstash_redis import Redis # <--- IMPORT NUEVO
+from upstash_redis import Redis
 
 # --- CONFIGURACIÓN DE ENTORNO ---
 PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "que-morfamos-nqn")
-ARCHIVO_CSV = "dataset_reviews_neuquen_final.csv"
+ARCHIVO_DATASET = "dataset_reviews.parquet"
 
 # Variables de Upstash (Configuralas en Render)
 UPSTASH_REDIS_REST_URL = os.getenv("UPSTASH_REDIS_REST_URL")
@@ -109,12 +109,12 @@ async def startup_event():
     print("☁️ Inicializando Backend...")
     
     # 1. Cargar Pandas
-    if os.path.exists(ARCHIVO_CSV):
-        df = pd.read_csv(ARCHIVO_CSV, low_memory=False)
+    if os.path.exists(ARCHIVO_DATASET):
+        df = pd.read_parquet(ARCHIVO_DATASET, low_memory=False)
         df['restaurante'] = df['restaurante'].str.strip()
         print(f"✅ DataFrame cargado: {len(df)} reseñas.")
     else:
-        print("⚠️ CSV no encontrado. Modo fallback.")
+        print("⚠️ Parquet no encontrado. Modo fallback.")
         df = pd.DataFrame()
 
     # 2. Pinecone & OpenAI
@@ -312,5 +312,4 @@ def chat(req: QueryRequest):
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
-
     uvicorn.run(app, host="0.0.0.0", port=port)
