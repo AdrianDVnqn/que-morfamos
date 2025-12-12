@@ -441,7 +441,23 @@ async def consultar_estadisticas(query, df, llm):
         mask = (df['restaurante_ascii'].str.contains(keyword_ascii, na=False) | 
                 df['texto_ascii'].str.contains(keyword_ascii, na=False))
         locales_filtrados = df[mask]['restaurante'].unique().tolist()
-        return f"Encontré **{len(locales_filtrados)}** lugares relacionados con '{keyword}'.", locales_filtrados
+        # Build a human-friendly display keyword: prefer full token from the original query
+        try:
+            # Tokens from original query (sanitized)
+            q_tokens = [t for t in re.sub(r'[^\w\s]', '', (keyword_text or query or "")).split() if t]
+            display_keyword = None
+            if klist:
+                stem = klist[0]
+                for t in q_tokens:
+                    if stem in t:
+                        display_keyword = t
+                        break
+            if not display_keyword:
+                # fallback: longest token (likely 'empanadas') or the original keyword_text
+                display_keyword = max(q_tokens, key=len) if q_tokens else (keyword_text or keyword)
+        except Exception:
+            display_keyword = keyword
+        return f"Encontré **{len(locales_filtrados)}** lugares relacionados con '{display_keyword}'.", locales_filtrados
     except Exception as e:
         logger.error(f"Error consultar_estadisticas: {e}")
         return "No pude calcular esa estadística.", []
