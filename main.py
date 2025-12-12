@@ -500,7 +500,9 @@ async def resumir_opiniones_local(query_str, df, llm, topic=None, tone='cordial'
 
             lista_txt = "\n".join([f"{i+1}. {lbl}" for i, lbl in enumerate(labels)])
             prefix = "Encontré varios lugares con ese nombre. ¿A cuál te referís?"
-            if tone == 'sassy': prefix = "Hay varios. ¿Cuál de todos querés?"
+            # Corregir comprobación: usar `in` para chequear múltiples valores
+            if tone in ('sassy', 'soberbio'):
+                prefix = "Hay varios. ¿Cuál de todos querés?"
             
             resp_text = f"{prefix}\n\n{lista_txt}\n\n*(Escribí el número)*"
             return resp_text, None, "", {"options": keys}
@@ -515,7 +517,7 @@ async def resumir_opiniones_local(query_str, df, llm, topic=None, tone='cordial'
     cached_text = cache.get_json("resumen_texto", cache_key)
     
     if cached_text:
-        return f"¡Dale! Acá la data de **{restaurante}**:", restaurante, cached_text, None
+        return f"Acá te paso la data de **{restaurante}**:", restaurante, cached_text, None
 
     sorted_reviews = rankear_reviews_por_topico(df[df['restaurante'] == restaurante], topic)
     reviews_txt = "\n".join([safe_str(r.get('texto'))[:200] for _, r in sorted_reviews.head(10).iterrows()])
