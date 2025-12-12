@@ -63,7 +63,7 @@ class RedisCacheManager:
 
 cache = RedisCacheManager(UPSTASH_REDIS_REST_URL, UPSTASH_REDIS_REST_TOKEN)
 
-app = FastAPI(title="Que Morfamos API (Semantic)", version="5.1.0")
+app = FastAPI(title="Que Morfamos API (Semantic)", version="5.3.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -139,6 +139,7 @@ async def startup_event():
                 if col in df.columns:
                     df[col] = df[col].fillna("").astype(str).str.strip()
             df['rating_gral'] = pd.to_numeric(df['rating_gral'], errors='coerce').fillna(0.0)
+            
             # Normalize ascii columns for search (remove accents/diacritics)
             def _norm(s):
                 if pd.isna(s) or s is None: return ""
@@ -227,55 +228,39 @@ def sanitize_tone(t):
 def tone_system_instruction(tone):
     tone = sanitize_tone(tone)
     if tone == 'cordial':
-        return 'Eres un asistente de buenos aires argentina, cordial, educado y respetuoso. Responde de forma clara y amable.'
+        return 'Sos un asistente de buenos aires, cordial, educado y respetuoso. Responde de forma clara y amable.'
     if tone == 'soberbio':
-        return 'Eres un asistente de buenos aires argentina,  con tono soberbio y  pedante — respuestas seguras, elocuentes y presuntuosas.'
+        return 'Sos un asistente de buenos aires, con tono soberbio y pedante — respuestas seguras, elocuentes y presuntuosas.'
     if tone == 'sassy':
-        return 'Eres un asistente de buenos aires argentina, irónico y con humor mordaz (sassy), con respuestas directas y breves.'
-    return 'Eres un asistente de buenos aires argentina, cordial, educado y respetuoso. Responde de forma clara y amable.'
+        return 'Sos un asistente de buenos aires, irónico y con humor mordaz (sassy), con respuestas directas y breves.'
+    return 'Sos un asistente de buenos aires, cordial, educado y respetuoso. Responde de forma clara y amable.'
 
 # ==========================================
-# 3. LÓGICA DE NEGOCIO (FILTRO TEMÁTICO MEJORADO)
+# 3. LÓGICA DE NEGOCIO (FILTRO TEMÁTICO)
 # ==========================================
 
 def get_keywords_from_topic(topic):
-    """
-    Extrae palabras clave y aplica 'stemming' básico (corta palabras)
-    para que 'vegetarianos' coincida con 'vegetariana'.
-    """
     if not topic: return []
-    
-    # Lista de palabras basura (Stopwords) muy agresiva
     stopwords = {
         "de", "la", "el", "en", "y", "que", "los", "las", "un", "una", "del", "para", "con", 
         "donde", "hay", "lugar", "lugares", "comer", "mejor", "mejores", "neuquen", 
         "opiniones", "info", "sobre", "que", "onda", "tal", "opinas", "tienen", "tiene", "busco",
         "quisiera", "saber", "decime", "conocés", "conoces", "restaurante", "restaurantes"
     }
-    
     words = safe_str(topic).lower().split()
     clean_words = [w for w in words if w not in stopwords and len(w) > 2]
-    
-    # "Stemming" casero: Cortamos las palabras para mejorar coincidencia
-    # Ej: "vegetarianos" -> "vegetari" (coincide con vegetariana, vegetarian, etc)
     stemmed_words = []
     for w in clean_words:
         if len(w) > 5:
-            stemmed_words.append(w[:-2]) # Quitamos las últimas 2 letras aprox
+            stemmed_words.append(w[:-2]) 
         else:
             stemmed_words.append(w)
-            
-    logger.info(f"🔎 Topic: '{topic}' -> Keywords: {clean_words} -> Raíces: {stemmed_words}")
     return stemmed_words
 
 def rankear_reviews_por_topico(df_reviews, topic=None):
-    """
-    Ordena las reseñas. Si hay topic, prioriza las que contienen la RAÍZ de las palabras.
-    """
     df_local = df_reviews.copy()
     df_local['orden_fecha'] = df_local['fecha'].apply(fecha_a_orden)
     
-    # Si no hay topic válido, orden normal por fecha
     if not topic or len(topic) < 3:
         return df_local.sort_values('orden_fecha')
 
@@ -283,30 +268,23 @@ def rankear_reviews_por_topico(df_reviews, topic=None):
     if not keywords:
         return df_local.sort_values('orden_fecha')
 
-    # Función de scoring mejorada
     def calcular_relevancia(texto):
         texto = safe_str(texto).lower()
         score = 0
         for k in keywords:
             if k in texto:
-                score += 100 # Match fuerte
+                score += 100 
         return score
 
     df_local['score_topic'] = df_local['texto'].apply(calcular_relevancia)
-    
-    # Ordenar: Mayor score primero, luego menor antigüedad
-    # Filtramos: Si ninguna tiene score > 0, devolvemos por fecha
     if df_local['score_topic'].max() == 0:
-        logger.info("⚠️ Ninguna reseña coincide con el topic. Devolviendo recientes.")
         return df_local.sort_values('orden_fecha')
         
     return df_local.sort_values(['score_topic', 'orden_fecha'], ascending=[False, True])
 
 def seleccionar_mejor_review(df_local, topic_query=None):
     sorted_df = rankear_reviews_por_topico(df_local, topic_query)
-    # Preferimos reseñas que no sean tweets (más de 30 chars)
     candidatas = sorted_df[sorted_df['texto'].str.len() > 30]
-    
     if not candidatas.empty:
         return candidatas.iloc[0]
     elif not sorted_df.empty:
@@ -337,7 +315,6 @@ async def obtener_restaurant_cards(nombres_restaurantes, df, llm, query_context=
             frase = ""
             autor = ""
             best_review = seleccionar_mejor_review(rest_df, query_context)
-            
             if best_review is not None:
                 frase = safe_str(best_review['texto'])[:350] + "..."
                 autor = formatear_autor(best_review.get('autor'))
@@ -393,15 +370,52 @@ def obtener_restaurant_cards_simple(nombres_restaurantes, df):
     cards.sort(key=lambda x: x.rating, reverse=True)
     return cards
 
-async def clasificar_intencion(query, llm):
-    template = """
-    Clasifica la intención. QUERY: "{query}"
-    OPCIONES:
-    1. "STATS": Cantidades, totales, cuantos hay.
-    2. "SPECIFIC_INFO": Lugar específico (ej: "opiniones de Atu", "info de Antares").
-    3. "RECOMMENDATION": Sugerencias generales.
+# ==========================================
+# 4. INTENCIÓN Y DETECCIÓN (BRAIN)
+# ==========================================
+
+def detectar_mencion_exacta(query, df):
+    """
+    Busca si el query contiene el nombre de algún restaurante existente.
+    Prioriza los nombres más largos (ej: 'Burger King' antes que 'Burger').
+    """
+    if df is None or df.empty: return None
+    q_norm = query.lower().strip()
+    nombres = df['restaurante'].unique().tolist()
+    # Ordenar por largo descendente para evitar parciales incorrectos
+    nombres.sort(key=len, reverse=True)
     
-    Responde JSON: {{"intent": "...", "entity": "..."}} (Entity null si no aplica)
+    for nombre in nombres:
+        nombre_clean = nombre.lower().strip()
+        # Chequeo simple de inclusión
+        if nombre_clean in q_norm:
+            return nombre # Retornamos el nombre real (capitalizado como está en DB)
+    return None
+
+async def clasificar_intencion(query, llm, match_db=None):
+    # Inyectamos pista si Python encontró un nombre real
+    pista_contexto = ""
+    if match_db:
+        pista_contexto = (
+            f"⚠️ NOTA DE BASE DE DATOS: Existe un comercio registrado llamado '{match_db}'. "
+            f"Si el usuario pregunta 'qué tal es {match_db}' o 'opiniones de {match_db}', "
+            f"debes clasificarlo como 'SPECIFIC_INFO' y entity='{match_db}', aunque parezca un alimento."
+        )
+
+    template = f"""
+    Clasifica la intención del usuario. QUERY: "{{query}}"
+    
+    {pista_contexto}
+
+    OPCIONES:
+    1. "STATS": El usuario pide cantidades, números o estadísticas (ej: "cuántos hay", "total de pizzerías").
+    2. "SPECIFIC_INFO": El usuario pregunta por un LUGAR/COMERCIO específico por su NOMBRE PROPIO (ej: "opiniones de Antares", "dónde queda Atu").
+    3. "RECOMMENDATION": El usuario tiene un antojo, busca un PLATO, un TIPO de comida o sugerencias generales (ej: "dónde comer helado", "mejor hamburguesa", "busco pastas").
+    
+    IMPORTANTE: Si el usuario pide un producto (ej: "helado de chocolate") y NO nombra un local, es "RECOMMENDATION".
+    
+    Responde SOLO JSON: {{"intent": "...", "entity": "..."}} 
+    (Entity es el nombre del lugar si es SPECIFIC_INFO, sino null).
     """
     try:
         chain = ChatPromptTemplate.from_template(template) | llm | StrOutputParser()
@@ -415,88 +429,91 @@ async def consultar_estadisticas(query, df, llm):
     try:
         prompt = f"Extrae palabra clave para filtrar (ej: 'pizzerias' -> 'pizza'). Query: {query}. Solo la palabra."
         keyword_raw = await llm.ainvoke(prompt)
-        # Support both str and ChatMessage-like return types
-        try:
-            keyword_text = keyword_raw.content.strip().lower()
-        except Exception:
-            keyword_text = str(keyword_raw).strip().lower()
-        # sanitize
+        keyword_text = str(keyword_raw.content).strip().lower()
         keyword_text = re.sub(r'[^\w\s]', '', keyword_text)
-        # try to extract a stemmed keyword using our helper
+        
         klist = get_keywords_from_topic(keyword_text)
         keyword = klist[0] if klist else (keyword_text.split()[0] if keyword_text else "")
-        # fallback: if keyword is still empty, extract from query
         if not keyword:
             qk = get_keywords_from_topic(query)
             keyword = qk[0] if qk else (query.split()[0] if query else "")
         keyword = keyword.strip()
+        
         total = df['restaurante'].nunique()
         if "total" in keyword or len(keyword) < 2:
             return f"Tengo registrados **{total}** restaurantes.", []
-        # Normalize keyword and match against ascii-normalized columns
+            
         keyword_ascii = unicodedata.normalize('NFD', keyword)
         keyword_ascii = ''.join(ch for ch in keyword_ascii if unicodedata.category(ch) != 'Mn')
         keyword_ascii = re.sub(r'[^\w\s]', '', keyword_ascii)
-        logger.info(f"🔢 Stats: raw_llm='{keyword_raw}' | keyword_text='{keyword_text}' | keyword='{keyword}' | keyword_ascii='{keyword_ascii}'")
+        
         mask = (df['restaurante_ascii'].str.contains(keyword_ascii, na=False) | 
                 df['texto_ascii'].str.contains(keyword_ascii, na=False))
         locales_filtrados = df[mask]['restaurante'].unique().tolist()
-        # Build a human-friendly display keyword: prefer full token from the original query
-        try:
-            # Tokens from original query (sanitized)
-            q_tokens = [t for t in re.sub(r'[^\w\s]', '', (keyword_text or query or "")).split() if t]
-            display_keyword = None
-            if klist:
-                stem = klist[0]
-                for t in q_tokens:
-                    if stem in t:
-                        display_keyword = t
-                        break
-            if not display_keyword:
-                # fallback: longest token (likely 'empanadas') or the original keyword_text
-                display_keyword = max(q_tokens, key=len) if q_tokens else (keyword_text or keyword)
-        except Exception:
-            display_keyword = keyword
-        return f"Encontré **{len(locales_filtrados)}** lugares relacionados con '{display_keyword}'.", locales_filtrados
+        
+        return f"Encontré **{len(locales_filtrados)}** lugares relacionados con '{keyword}'.", locales_filtrados
     except Exception as e:
         logger.error(f"Error consultar_estadisticas: {e}")
         return "No pude calcular esa estadística.", []
 
-async def resumir_opiniones_local(query_str, df, llm, topic=None, tone='cordial'):
+async def resumir_opiniones_local(query_str, df, llm, topic=None, tone='cordial', es_seleccion_directa=False):
+    """
+    Busca un local. 
+    - Si hay variantes (ej. 'Mostaza', 'Mostaza Shopping'), retorna menú de opciones.
+    - Si es_seleccion_directa=True, asume que query_str es el nombre exacto elegido del menú.
+    """
     if not query_str: return "Nombre vacío.", None, "", None
     
     q_clean = query_str.lower().strip()
-    mask_exact = df['restaurante'].str.lower() == q_clean
-    if mask_exact.any():
-        restaurante = df[mask_exact].iloc[0]['restaurante']
-        encontrados = [restaurante]
-    else:
-        mask = df['restaurante'].str.lower().str.contains(q_clean, na=False)
-        encontrados = df[mask]['restaurante'].unique()
     
-    if len(encontrados) == 0: 
+    # Lista de candidatos
+    encontrados = []
+    
+    if es_seleccion_directa:
+        # Si viene de una selección de menú, confiamos en que el nombre es exacto
+        # pero verificamos que exista por las dudas.
+        mask_exact = df['restaurante'].str.lower() == q_clean
+        if mask_exact.any():
+            row = df[mask_exact].iloc[0]
+            encontrados = [row['restaurante']]
+    else:
+        # Búsqueda difusa (.contains)
+        mask = df['restaurante'].str.lower().str.contains(q_clean, na=False, regex=False)
+        candidatos = df[mask]['restaurante'].unique().tolist()
+        
+        if len(candidatos) == 1:
+            encontrados = candidatos
+        elif len(candidatos) > 1:
+            # Hay ambigüedad (Mostaza vs Mostaza Shopping) -> Devolvemos menú
+            encontrados = candidatos
+            encontrados.sort()
+            
+            labels = []
+            keys = []
+            for r in encontrados:
+                keys.append(r)
+                mask_r = df['restaurante'] == r
+                rowr = df[mask_r].iloc[0]
+                ubi = safe_str(rowr.get('zona')) or safe_str(rowr.get('barrio')) or safe_str(rowr.get('direccion'))
+                display = f"**{r}**" + (f" ({ubi})" if ubi else "")
+                labels.append(display)
+
+            lista_txt = "\n".join([f"{i+1}. {lbl}" for i, lbl in enumerate(labels)])
+            prefix = "Encontré varios lugares con ese nombre. ¿A cuál te referís?"
+            if tone == 'sassy': prefix = "Hay varios. ¿Cuál de todos querés?"
+            
+            resp_text = f"{prefix}\n\n{lista_txt}\n\n*(Escribí el número)*"
+            return resp_text, None, "", {"options": keys}
+
+    if not encontrados: 
         return "No conozco ese lugar che, disculpá.", None, "", None
     
-    if len(encontrados) > 1:
-        labels = []
-        keys = []
-        for r in encontrados:
-            keys.append(r)
-            mask_r = df['restaurante'].str.lower() == r.lower()
-            extra = ""
-            if mask_r.any():
-                rowr = df[mask_r].iloc[0]
-                extra = safe_str(rowr.get('direccion')) or safe_str(rowr.get('barrio')) or safe_str(rowr.get('zona'))
-            display = f"{r} ({extra})" if extra else r
-            labels.append(display)
-
-        lista_txt = "\n".join([f" {i+1}. {lbl}" for i, lbl in enumerate(labels)])
-        resp_text = f"Encontré varias opciones:\n\n{lista_txt}\n\n¿A cuál te referís? (Escribí el número)"
-        return resp_text, None, "", {"options": keys}
-    
+    # --- Generación del Resumen (Si ya tenemos 1 solo candidato) ---
     restaurante = encontrados[0]
+    
     cache_key = f"{restaurante}_{topic}_{sanitize_tone(tone)}" if topic else f"{restaurante}__{sanitize_tone(tone)}"
     cached_text = cache.get_json("resumen_texto", cache_key)
+    
     if cached_text:
         return f"¡Dale! Acá la data de **{restaurante}**:", restaurante, cached_text, None
 
@@ -526,13 +543,13 @@ async def resumir_opiniones_local(query_str, df, llm, topic=None, tone='cordial'
     return f"¡Dale! Acá la data de **{restaurante}**:", restaurante, res, None
 
 # ==========================================
-# 4. ROUTER PRINCIPAL
+# 5. ROUTER PRINCIPAL (ROUTER)
 # ==========================================
 async def procesar_consulta(query, df, vectorstore, llm, ctx=None):
     if ctx is None: ctx = {}
     tone = sanitize_tone(ctx.get('tone'))
     
-    # 1. CONTEXTO NUMÉRICO
+    # 1. CONTEXTO NUMÉRICO (Desambiguación)
     if 'pending_options' in ctx and query.strip().isdigit():
         num = int(query.strip())
         pending = ctx['pending_options']
@@ -543,78 +560,120 @@ async def procesar_consulta(query, df, vectorstore, llm, ctx=None):
             ctx['last_entity'] = seleccion
             original_topic = ctx.get('original_query', seleccion) 
             
-            resp, nombre_real, det, _ = await resumir_opiniones_local(seleccion, df, llm, original_topic, tone)
+            # Llamamos con es_seleccion_directa=True para evitar loop de menú
+            resp, nombre_real, det, _ = await resumir_opiniones_local(
+                seleccion, df, llm, original_topic, tone, es_seleccion_directa=True
+            )
             cards = await obtener_restaurant_cards([nombre_real], df, llm, original_topic, tone)
             locs = obtener_coordenadas([nombre_real], df)
             return resp, "resumen", None, locs, cards, det
         return f"Elegí entre 1 y {len(opciones)}", "resumen", pending, [], [], ""
 
-    # 2. CLASIFICACIÓN
-    clasificacion = await clasificar_intencion(query, llm)
+    # 2. PRE-SCAN: "El Chismoso"
+    posible_match = detectar_mencion_exacta(query, df)
+
+    # 3. CLASIFICACIÓN
+    clasificacion = await clasificar_intencion(query, llm, match_db=posible_match)
     intent = clasificacion.get("intent")
     entity = clasificacion.get("entity")
-    logger.info(f"🧠 Router: {intent} | Entity: {entity}")
+    logger.info(f"🧠 Router: {intent} | Entity: {entity} | DB Match: {posible_match}")
+    
+    # 4. OVERRIDE: Si LLM dice Recomendación pero hay match exacto (ej. Frambuesa y Chocolate), forzamos
+    if intent == "RECOMMENDATION" and posible_match:
+        logger.info(f"🔄 Override: LLM dijo Recommendation, pero '{posible_match}' es un local real.")
+        intent = "SPECIFIC_INFO"
+        entity = posible_match
 
-    # 3. STATS
+    # 5. STATS
     if intent == "STATS":
         resp, locales = await consultar_estadisticas(query, df, llm)
         cards = obtener_restaurant_cards_simple(locales, df)
         locs = obtener_coordenadas(locales, df)
         return resp, "estadisticas", None, locs, cards, ""
 
-    # 4. INFO ESPECÍFICA
+    # 6. INFO ESPECÍFICA (CON FAIL-OVER)
     if intent == "SPECIFIC_INFO":
         target = entity
         if not target and ctx.get('last_entity'): target = ctx['last_entity']
 
         if target:
-            ctx['original_query'] = query
-            resp, nombre_real, det, opciones = await resumir_opiniones_local(target, df, llm, query, tone)
+            # Validación: ¿Existe algo parecido en la DB?
+            target_clean = target.lower().strip()
+            match_exists = df['restaurante'].str.lower().str.contains(target_clean, na=False, regex=False).any()
             
-            if opciones: return resp, "resumen", opciones, [], [], ""
-            
-            if nombre_real:
-                ctx['last_entity'] = nombre_real
-                cards = await obtener_restaurant_cards([nombre_real], df, llm, query, tone)
-                locs = obtener_coordenadas([nombre_real], df)
-                return resp, "resumen", None, locs, cards, det
-            
-            return resp, "resumen", None, [], [], ""
+            if not match_exists:
+                # FAIL-OVER: Si no existe, asumimos que el LLM flasheó y es una comida (ej. Helado de Chocolate)
+                logger.info(f"⚠️ Entity '{target}' no existe. Switch a RAG.")
+                intent = "RECOMMENDATION" 
+            else:
+                ctx['original_query'] = query
+                resp, nombre_real, det, opciones = await resumir_opiniones_local(target, df, llm, query, tone)
+                
+                if opciones: return resp, "resumen", opciones, [], [], ""
+                
+                if nombre_real:
+                    ctx['last_entity'] = nombre_real
+                    cards = await obtener_restaurant_cards([nombre_real], df, llm, query, tone)
+                    locs = obtener_coordenadas([nombre_real], df)
+                    return resp, "resumen", None, locs, cards, det
+                
+                # Fallback interno
+                intent = "RECOMMENDATION"
 
-    # 5. RAG (RECOMENDACIÓN)
-    try:
-        docs = vectorstore.similarity_search(query, k=15)
-        seen = set()
-        locales = []
-        for d in docs:
-            nom = d.metadata.get('nombre')
-            if nom and nom not in seen:
-                seen.add(nom)
-                locales.append(nom)
-        locales = locales[:5]
-        
-        # KEY: Pasamos la query para buscar reseñas relevantes
-        cards = await obtener_restaurant_cards(locales, df, llm, query, tone)
-        locs = obtener_coordenadas(locales, df)
-        
-        prefix = tone_system_instruction(tone)
-        prompt_rag = (
-            f"{prefix}\nUsuario busca: '{query}'. Encontré: {', '.join(locales)}. "
-            "Recomendalos en 1 frase corta para Neuquén."
-        )
-        rag_resp = await llm.ainvoke(prompt_rag)
-        
-        return rag_resp.content, "rag", None, locs, cards, ""
-    except Exception as e:
-        logger.error(f"Error RAG: {e}")
-        return "Tuve un problema buscando eso. ¿Probamos de nuevo?", "rag", None, [], [], ""
+    # 7. RAG (RECOMENDACIÓN)
+    if intent == "RECOMMENDATION":
+        try:
+            docs = vectorstore.similarity_search(query, k=20)
+            seen = set()
+            locales_candidatos = []
+            for d in docs:
+                nom = d.metadata.get('nombre')
+                if nom and nom not in seen:
+                    seen.add(nom)
+                    locales_candidatos.append(nom)
+            
+            locales_candidatos = locales_candidatos[:5]
+            
+            if not locales_candidatos:
+                 return "No encontré nada relacionado a eso. ¡Qué hambre!", "rag", None, [], [], ""
+
+            # Generamos cards PRIMERO
+            cards = await obtener_restaurant_cards(locales_candidatos, df, llm, query, tone)
+            
+            # Extraemos SOLO los nombres que se convirtieron en tarjeta exitosamente
+            nombres_finales = [c.nombre for c in cards]
+            
+            if not nombres_finales:
+                 return "Encontré referencias, pero no tengo información detallada de esos lugares. Disculpá.", "rag", None, [], [], ""
+
+            # Obtenemos coordenadas solo de esos
+            locs = obtener_coordenadas(nombres_finales, df)
+            
+            # Prompt al LLM usando SOLO la lista confirmada (Single Source of Truth)
+            prefix = tone_system_instruction(tone)
+            prompt_rag = (
+                f"{prefix}\n"
+                f"Usuario pregunta: '{query}'.\n"
+                f"Tengo información confirmada de estos lugares: {', '.join(nombres_finales)}.\n"
+                "Recomendalos brevemente mencionando por qué coinciden. "
+                "No menciones lugares que no estén en esta lista."
+            )
+            rag_resp = await llm.ainvoke(prompt_rag)
+            
+            return rag_resp.content, "rag", None, locs, cards, ""
+            
+        except Exception as e:
+            logger.error(f"Error RAG: {e}")
+            return "Tuve un problema buscando eso. ¿Probamos de nuevo?", "rag", None, [], [], ""
+            
+    return "No entendí bien qué buscás, ¿podés reformular?", "rag", None, [], [], ""
 
 # ==========================================
-# 5. ENDPOINTS
+# 6. ENDPOINTS
 # ==========================================
 
 @app.get("/")
-def read_root(): return {"status": "online", "message": "API OK"}
+def read_root(): return {"status": "online", "message": "API OK v5.3"}
 
 @app.get("/health")
 def health_check(): return {"status": "healthy", "df_size": len(df) if df is not None else 0}
@@ -631,7 +690,6 @@ async def get_restaurant_detail(nombre: str, topic: Optional[str] = None, tone: 
     row = rest_df.iloc[0]
     nombre_real = safe_str(row['restaurante'])
     
-    # 1. ORDENAR RESEÑAS POR TEMA (USANDO LA FUNCIÓN MEJORADA)
     sorted_reviews = rankear_reviews_por_topico(rest_df, topic)
     
     reviews_list = []
@@ -644,7 +702,6 @@ async def get_restaurant_detail(nombre: str, topic: Optional[str] = None, tone: 
                 fecha=safe_str(r.get('fecha'))
             ))
 
-    # 2. CACHÉ CON TOPIC
     tone = sanitize_tone(tone)
     cache_key = f"{nombre_real}_{topic}_{tone}" if topic else f"{nombre_real}__{tone}"
     analisis = cache.get_json("detail_topic", cache_key)
@@ -685,7 +742,6 @@ async def get_restaurant_detail(nombre: str, topic: Optional[str] = None, tone: 
 @app.post("/chat", response_model=QueryResponse)
 async def chat(req: QueryRequest):
     try:
-        # Normalize tone in conversation context (explicit param overrides)
         ctx = req.conversation_context.copy() if req.conversation_context else {}
         if req.tone:
             ctx['tone'] = sanitize_tone(req.tone)
