@@ -288,14 +288,15 @@ async def obtener_restaurant_cards(nombres_restaurantes, df, llm, query_context=
                 frase = safe_str(best_review['texto'])[:300] + "..."
                 autor = formatear_autor(best_review.get('autor'))
 
-            # Descripción (Cacheada en Redis)
-            desc = cache.get_json("desc", nombre_real)
+            # Descripción (Cacheada en Redis) - la clave incluye el topic/query_context si existe
+            key_desc = f"{nombre_real}_{query_context}" if query_context else nombre_real
+            desc = cache.get_json("desc", key_desc)
             if desc:
-                tasks.append({"type": "cached", "val": desc, "row": row, "frase": frase, "autor": autor, "nombre_real": nombre_real})
+                tasks.append({"type": "cached", "val": desc, "row": row, "frase": frase, "autor": autor, "nombre_real": nombre_real, "cache_key": key_desc})
             else:
                 sample = " ".join([safe_str(t) for t in rest_df['texto'].head(5)])[:800]
                 task_coro = generar_descripcion_async(llm, nombre_real, sample)
-                tasks.append({"type": "generate", "val": task_coro, "row": row, "frase": frase, "autor": autor, "nombre_real": nombre_real})
+                tasks.append({"type": "generate", "val": task_coro, "row": row, "frase": frase, "autor": autor, "nombre_real": nombre_real, "cache_key": key_desc})
 
     generations_needed = [t['val'] for t in tasks if t['type'] == 'generate']
     if generations_needed:
@@ -309,7 +310,8 @@ async def obtener_restaurant_cards(nombres_restaurantes, df, llm, query_context=
         else:
             descripcion = results[gen_idx]
             gen_idx += 1
-            cache.set_json("desc", item['nombre_real'], descripcion)
+            # Guardamos la descripción con la clave que incluye topic si aplica
+            cache.set_json("desc", item.get('cache_key', item['nombre_real']), descripcion)
 
         cards.append(RestaurantCard(
             nombre=item['nombre_real'],
@@ -375,7 +377,7 @@ async def consultar_estadisticas(query, df, llm):
         return f"Encontré **{len(locales_filtrados)}** lugares relacionados con '{keyword}'.", locales_filtrados
     except: return "No pude calcular esa estadística.", []
 
-async def resumir_opiniones_local(query_str, df, llm):
+async def resumir_opiniones_local(query_str, df, llm, topic=None):
     if not query_str: return "Nombre vacío.", None, "", None
     
     q_clean = query_str.lower().strip()
@@ -411,7 +413,8 @@ async def resumir_opiniones_local(query_str, df, llm):
         return resp_text, None, "", {"options": keys}
     
     restaurante = encontrados[0]
-    cached_text = cache.get_json("resumen_texto", restaurante)
+    cache_key = f"{restaurante}_{topic}" if topic else restaurante
+    cached_text = cache.get_json("resumen_texto", cache_key)
     if cached_text:
         return f"¡Dale! Acá la data de **{restaurante}**:", restaurante, cached_text, None
 
@@ -433,7 +436,7 @@ async def resumir_opiniones_local(query_str, df, llm):
         })
     except: res = "No pude generar el resumen."
     
-    cache.set_json("resumen_texto", restaurante, res)
+    cache.set_json("resumen_texto", cache_key, res)
     return f"¡Dale! Acá la data de **{restaurante}**:", restaurante, res, None
 
 # ==========================================
@@ -451,8 +454,8 @@ async def procesar_consulta(query, df, vectorstore, llm, ctx=None):
         if 1 <= num <= len(opciones):
             seleccion = opciones[num - 1]
             ctx['last_entity'] = seleccion
-            resp, nombre_real, det, _ = await resumir_opiniones_local(seleccion, df, llm)
-            cards = await obtener_restaurant_cards([nombre_real], df, llm, seleccion)
+            resp, nombre_real, det, _ = await resumir_opiniones_local(seleccion, df, llm, ctx.get('topic'))
+            cards = await obtener_restaurant_cards([nombre_real], df, llm, ctx.get('topic') or seleccion)
             locs = obtener_coordenadas([nombre_real], df)
             return resp, "resumen", None, locs, cards, det
         return f"Elegí entre 1 y {len(opciones)}", "resumen", pending, [], [], ""
@@ -477,13 +480,13 @@ async def procesar_consulta(query, df, vectorstore, llm, ctx=None):
         if not target and ctx.get('last_entity'): target = ctx['last_entity']
 
         if target:
-            resp, nombre_real, det, opciones = await resumir_opiniones_local(target, df, llm)
+            resp, nombre_real, det, opciones = await resumir_opiniones_local(target, df, llm, ctx.get('topic'))
             
             if opciones: return resp, "resumen", opciones, [], [], ""
             
             if nombre_real:
                 ctx['last_entity'] = nombre_real
-                cards = await obtener_restaurant_cards([nombre_real], df, llm, target)
+                cards = await obtener_restaurant_cards([nombre_real], df, llm, ctx.get('topic') or target)
                 locs = obtener_coordenadas([nombre_real], df)
                 return resp, "resumen", None, locs, cards, det
             
@@ -558,14 +561,9 @@ async def get_restaurant_detail(nombre: str, topic: Optional[str] = None):
             ))
 
     # 2. GENERAR ANÁLISIS LLM (Cacheado por TEMA)
-    # La clave de caché ahora incluye el topic para no mezclar
-    cache_key_suffix = f"json_detail:{nombre_real}"
-    if topic:
-        cache_key_suffix += f":{topic.lower().replace(' ', '_')}"
-        
-    analisis = cache.get_json(cache_key_suffix, "") # Usamos suffix como prefix o key directa
-    # Simplificamos uso de cache wrapper:
-    analisis = cache.get_json("detail_topic", f"{nombre_real}_{topic}" if topic else nombre_real)
+    # La clave de caché incluye el topic para no mezclar
+    key_detail = f"{nombre_real}_{topic}" if topic else nombre_real
+    analisis = cache.get_json("detail_topic", key_detail)
 
     if not analisis:
         # Preparamos prompt temático
@@ -588,9 +586,9 @@ async def get_restaurant_detail(nombre: str, topic: Optional[str] = None):
             res = await llm.ainvoke(prompt_txt)
             clean = res.content.strip().replace("```json","").replace("```","")
             analisis = json.loads(clean)
-            
-            # Guardamos con la clave específica
-            cache.set_json("detail_topic", f"{nombre_real}_{topic}" if topic else nombre_real, analisis)
+
+            # Guardamos con la clave específica (incluye topic si aplica)
+            cache.set_json("detail_topic", key_detail, analisis)
         except: 
             analisis = {"resumen": "Info no disponible momentáneamente.", "positivos": [], "negativos": []}
 
