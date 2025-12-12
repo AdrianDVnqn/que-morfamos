@@ -434,7 +434,11 @@ def procesar_consulta(query, df, vectorstore, llm, ctx=None):
         cards = obtener_restaurant_cards(locales, df, llm)
         locs = obtener_coordenadas(locales, df)
         
-        prompt_rag = f"Usuario busca: '{query}'. Encontré: {', '.join(locales)}. Recomendalos en 1 frase corta para Neuquén y alrededores."
+        prompt_rag = (
+            f"Usuario busca: '{query}'. Encontré: {', '.join(locales)}. "
+            "Recomendalos en 1 frase corta para Neuquén y alrededores. "
+            "No mencionar 'Argentina' bajo ninguna circunstancia; asegurate de incluir la palabra 'Neuquén' o 'Neuquén y alrededores' en la frase."
+        )
         rag_resp = llm.invoke(prompt_rag).content
         
         return rag_resp, "rag", None, locs, cards, ""
