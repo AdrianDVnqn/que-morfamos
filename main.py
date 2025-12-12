@@ -2,6 +2,7 @@ import os
 import json
 import re
 import asyncio
+import logging
 import pandas as pd
 import numpy as np
 from typing import List, Optional
@@ -15,25 +16,28 @@ from langchain_core.output_parsers import StrOutputParser
 from upstash_redis import Redis
 
 # ==========================================
-# 1. CONFIGURACIÓN
+# 0. CONFIGURACIÓN DE LOGS
+# ==========================================
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("QueMorfamos")
+
+# ==========================================
+# 1. CONFIGURACIÓN DE ENTORNO
 # ==========================================
 PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "que-morfamos-nqn")
 ARCHIVO_DATASET = "dataset_reviews.parquet"
 UPSTASH_REDIS_REST_URL = os.getenv("UPSTASH_REDIS_REST_URL")
 UPSTASH_REDIS_REST_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN")
 
-# --- GESTOR DE CACHÉ ---
 class RedisCacheManager:
     def __init__(self, url, token):
         self.client = None
         if url and token:
             try:
                 self.client = Redis(url=url, token=token)
-                print("✅ Redis (Upstash) conectado.")
+                logger.info("✅ Redis conectado.")
             except Exception as e:
-                print(f"⚠️ Error Redis: {e}")
-        else:
-            print("⚠️ Faltan credenciales Redis.")
+                logger.error(f"⚠️ Error Redis: {e}")
 
     def _sanitize_key(self, key):
         if not key: return "unknown"
@@ -44,8 +48,7 @@ class RedisCacheManager:
         full_key = f"{prefix}:{self._sanitize_key(key)}"
         try:
             data = self.client.get(full_key)
-            if data:
-                return data if isinstance(data, dict) else json.loads(data)
+            if data: return data if isinstance(data, dict) else json.loads(data)
             return None
         except: return None
 
@@ -59,8 +62,7 @@ class RedisCacheManager:
 
 cache = RedisCacheManager(UPSTASH_REDIS_REST_URL, UPSTASH_REDIS_REST_TOKEN)
 
-# --- INICIALIZACIÓN APP ---
-app = FastAPI(title="Que Morfamos API (Topic Aware)", version="4.0.0")
+app = FastAPI(title="Que Morfamos API (Semantic)", version="5.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -125,22 +127,21 @@ class QueryResponse(BaseModel):
 @app.on_event("startup")
 async def startup_event():
     global df, vectorstore, llm
-    print("☁️ Iniciando servidor...")
+    logger.info("☁️ Iniciando servidor...")
     
     if os.path.exists(ARCHIVO_DATASET):
         try:
             df = pd.read_parquet(ARCHIVO_DATASET)
-            cols_to_fix = ['restaurante', 'texto', 'direccion', 'barrio', 'zona', 'autor', 'fecha']
-            for col in cols_to_fix:
+            cols = ['restaurante', 'texto', 'direccion', 'barrio', 'zona', 'autor', 'fecha']
+            for col in cols:
                 if col in df.columns:
                     df[col] = df[col].fillna("").astype(str).str.strip()
             df['rating_gral'] = pd.to_numeric(df['rating_gral'], errors='coerce').fillna(0.0)
-            print(f"✅ DataFrame cargado: {len(df)} filas.")
+            logger.info(f"✅ DataFrame cargado: {len(df)} filas.")
         except Exception as e:
-            print(f"❌ Error leyendo Parquet: {e}")
+            logger.error(f"❌ Error Parquet: {e}")
             df = pd.DataFrame()
     else:
-        print("⚠️ No se encontró dataset.")
         df = pd.DataFrame()
 
     try:
@@ -149,9 +150,9 @@ async def startup_event():
             index_name=PINECONE_INDEX_NAME, embedding=embeddings
         )
         llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
-        print("✅ IA (OpenAI + Pinecone) lista.")
+        logger.info("✅ IA lista.")
     except Exception as e:
-        print(f"❌ Error IA: {e}")
+        logger.error(f"❌ Error IA: {e}")
 
 # --- HELPERS SAFE ---
 def safe_str(val):
@@ -204,55 +205,77 @@ def obtener_coordenadas(nombres, df):
     return locs
 
 # ==========================================
-# 3. LÓGICA DE NEGOCIO (FILTRO TEMÁTICO)
+# 3. LÓGICA DE NEGOCIO (FILTRO TEMÁTICO MEJORADO)
 # ==========================================
 
 def get_keywords_from_topic(topic):
-    """Extrae palabras clave de la búsqueda del usuario"""
+    """
+    Extrae palabras clave y aplica 'stemming' básico (corta palabras)
+    para que 'vegetarianos' coincida con 'vegetariana'.
+    """
     if not topic: return []
-    stopwords = {"de", "la", "el", "en", "y", "que", "los", "las", "un", "una", "del", "para", "con", "donde", "hay", "lugar", "lugares", "comer", "mejor", "mejores", "neuquen"}
-    # Limpiamos y separamos
+    
+    # Lista de palabras basura (Stopwords) muy agresiva
+    stopwords = {
+        "de", "la", "el", "en", "y", "que", "los", "las", "un", "una", "del", "para", "con", 
+        "donde", "hay", "lugar", "lugares", "comer", "mejor", "mejores", "neuquen", 
+        "opiniones", "info", "sobre", "que", "onda", "tal", "opinas", "tienen", "tiene", "busco",
+        "quisiera", "saber", "decime", "conocés", "conoces", "restaurante", "restaurantes"
+    }
+    
     words = safe_str(topic).lower().split()
-    return [w for w in words if w not in stopwords and len(w) > 2]
+    clean_words = [w for w in words if w not in stopwords and len(w) > 2]
+    
+    # "Stemming" casero: Cortamos las palabras para mejorar coincidencia
+    # Ej: "vegetarianos" -> "vegetari" (coincide con vegetariana, vegetarian, etc)
+    stemmed_words = []
+    for w in clean_words:
+        if len(w) > 5:
+            stemmed_words.append(w[:-2]) # Quitamos las últimas 2 letras aprox
+        else:
+            stemmed_words.append(w)
+            
+    logger.info(f"🔎 Topic: '{topic}' -> Keywords: {clean_words} -> Raíces: {stemmed_words}")
+    return stemmed_words
 
 def rankear_reviews_por_topico(df_reviews, topic=None):
     """
-    Ordena las reseñas. Si hay topic, prioriza las que hablan de eso.
-    Si no, prioriza fecha.
+    Ordena las reseñas. Si hay topic, prioriza las que contienen la RAÍZ de las palabras.
     """
     df_local = df_reviews.copy()
-    
-    # 1. Calcular Fecha (Base)
     df_local['orden_fecha'] = df_local['fecha'].apply(fecha_a_orden)
     
-    # 2. Si NO hay topic, devolvemos por fecha (reciente primero)
-    if not topic:
+    # Si no hay topic válido, orden normal por fecha
+    if not topic or len(topic) < 3:
         return df_local.sort_values('orden_fecha')
 
-    # 3. Si HAY topic, scoring por palabras clave
     keywords = get_keywords_from_topic(topic)
     if not keywords:
-        return df_local.sort_values('orden_fecha') # Topic irrelevante, fallback
+        return df_local.sort_values('orden_fecha')
 
-    pattern = "|".join(keywords)
-    
-    # Crear Score: 100 puntos si tiene palabra clave, -penalización por antigüedad
-    # (Así priorizamos relevancia semántica sobre fecha, pero fecha desempata)
-    
+    # Función de scoring mejorada
     def calcular_relevancia(texto):
         texto = safe_str(texto).lower()
-        count = sum(1 for k in keywords if k in texto)
-        return count * 100 # 100 puntos por cada palabra clave encontrada
+        score = 0
+        for k in keywords:
+            if k in texto:
+                score += 100 # Match fuerte
+        return score
 
     df_local['score_topic'] = df_local['texto'].apply(calcular_relevancia)
     
     # Ordenar: Mayor score primero, luego menor antigüedad
+    # Filtramos: Si ninguna tiene score > 0, devolvemos por fecha
+    if df_local['score_topic'].max() == 0:
+        logger.info("⚠️ Ninguna reseña coincide con el topic. Devolviendo recientes.")
+        return df_local.sort_values('orden_fecha')
+        
     return df_local.sort_values(['score_topic', 'orden_fecha'], ascending=[False, True])
 
 def seleccionar_mejor_review(df_local, topic_query=None):
-    """Helper para elegir frase destacada en cards"""
     sorted_df = rankear_reviews_por_topico(df_local, topic_query)
-    candidatas = sorted_df[sorted_df['texto'].str.len() > 40]
+    # Preferimos reseñas que no sean tweets (más de 30 chars)
+    candidatas = sorted_df[sorted_df['texto'].str.len() > 30]
     
     if not candidatas.empty:
         return candidatas.iloc[0]
@@ -281,22 +304,19 @@ async def obtener_restaurant_cards(nombres_restaurantes, df, llm, query_context=
 
             frase = ""
             autor = ""
-            # Usamos el ranking inteligente
             best_review = seleccionar_mejor_review(rest_df, query_context)
             
             if best_review is not None:
-                frase = safe_str(best_review['texto'])[:300] + "..."
+                frase = safe_str(best_review['texto'])[:350] + "..."
                 autor = formatear_autor(best_review.get('autor'))
 
-            # Descripción (Cacheada en Redis) - la clave incluye el topic/query_context si existe
-            key_desc = f"{nombre_real}_{query_context}" if query_context else nombre_real
-            desc = cache.get_json("desc", key_desc)
+            desc = cache.get_json("desc", nombre_real)
             if desc:
-                tasks.append({"type": "cached", "val": desc, "row": row, "frase": frase, "autor": autor, "nombre_real": nombre_real, "cache_key": key_desc})
+                tasks.append({"type": "cached", "val": desc, "row": row, "frase": frase, "autor": autor, "nombre_real": nombre_real})
             else:
                 sample = " ".join([safe_str(t) for t in rest_df['texto'].head(5)])[:800]
                 task_coro = generar_descripcion_async(llm, nombre_real, sample)
-                tasks.append({"type": "generate", "val": task_coro, "row": row, "frase": frase, "autor": autor, "nombre_real": nombre_real, "cache_key": key_desc})
+                tasks.append({"type": "generate", "val": task_coro, "row": row, "frase": frase, "autor": autor, "nombre_real": nombre_real})
 
     generations_needed = [t['val'] for t in tasks if t['type'] == 'generate']
     if generations_needed:
@@ -310,8 +330,7 @@ async def obtener_restaurant_cards(nombres_restaurantes, df, llm, query_context=
         else:
             descripcion = results[gen_idx]
             gen_idx += 1
-            # Guardamos la descripción con la clave que incluye topic si aplica
-            cache.set_json("desc", item.get('cache_key', item['nombre_real']), descripcion)
+            cache.set_json("desc", item['nombre_real'], descripcion)
 
         cards.append(RestaurantCard(
             nombre=item['nombre_real'],
@@ -381,14 +400,11 @@ async def resumir_opiniones_local(query_str, df, llm, topic=None):
     if not query_str: return "Nombre vacío.", None, "", None
     
     q_clean = query_str.lower().strip()
-    
-    # 1. Match Exacto
     mask_exact = df['restaurante'].str.lower() == q_clean
     if mask_exact.any():
         restaurante = df[mask_exact].iloc[0]['restaurante']
         encontrados = [restaurante]
     else:
-        # 2. Match Difuso
         mask = df['restaurante'].str.lower().str.contains(q_clean, na=False)
         encontrados = df[mask]['restaurante'].unique()
     
@@ -418,10 +434,13 @@ async def resumir_opiniones_local(query_str, df, llm, topic=None):
     if cached_text:
         return f"¡Dale! Acá la data de **{restaurante}**:", restaurante, cached_text, None
 
-    reviews_df = df[df['restaurante'] == restaurante]
-    reviews_txt = "\n".join([safe_str(r.get('texto'))[:200] for _, r in reviews_df.head(10).iterrows()])
+    sorted_reviews = rankear_reviews_por_topico(df[df['restaurante'] == restaurante], topic)
+    reviews_txt = "\n".join([safe_str(r.get('texto'))[:200] for _, r in sorted_reviews.head(10).iterrows()])
     
-    tpl = """Analiza: {rest}. Rating: {rat}. Reviews: {revs}
+    contexto_tema = f"El usuario pregunta específicamente sobre: '{topic}'. Resalta eso." if topic else ""
+
+    tpl = f"""Analiza: {{rest}}. Rating: {{rat}}. {contexto_tema}
+    Reviews: {{revs}}
     Generá resumen Markdown (Argentino):
     ## 📊 La onda
     ## 👍 Lo bueno
@@ -431,7 +450,7 @@ async def resumir_opiniones_local(query_str, df, llm, topic=None):
     try:
         res = await (ChatPromptTemplate.from_template(tpl) | llm | StrOutputParser()).ainvoke({
             "rest": restaurante, 
-            "rat": safe_float(reviews_df.iloc[0].get('rating_gral')),
+            "rat": safe_float(df[df['restaurante'] == restaurante].iloc[0].get('rating_gral')),
             "revs": reviews_txt
         })
     except: res = "No pude generar el resumen."
@@ -440,7 +459,7 @@ async def resumir_opiniones_local(query_str, df, llm, topic=None):
     return f"¡Dale! Acá la data de **{restaurante}**:", restaurante, res, None
 
 # ==========================================
-# 4. ROUTER PRINCIPAL (ASYNC)
+# 4. ROUTER PRINCIPAL
 # ==========================================
 async def procesar_consulta(query, df, vectorstore, llm, ctx=None):
     if ctx is None: ctx = {}
@@ -454,8 +473,10 @@ async def procesar_consulta(query, df, vectorstore, llm, ctx=None):
         if 1 <= num <= len(opciones):
             seleccion = opciones[num - 1]
             ctx['last_entity'] = seleccion
-            resp, nombre_real, det, _ = await resumir_opiniones_local(seleccion, df, llm, ctx.get('topic'))
-            cards = await obtener_restaurant_cards([nombre_real], df, llm, ctx.get('topic') or seleccion)
+            original_topic = ctx.get('original_query', seleccion) 
+            
+            resp, nombre_real, det, _ = await resumir_opiniones_local(seleccion, df, llm, original_topic)
+            cards = await obtener_restaurant_cards([nombre_real], df, llm, original_topic)
             locs = obtener_coordenadas([nombre_real], df)
             return resp, "resumen", None, locs, cards, det
         return f"Elegí entre 1 y {len(opciones)}", "resumen", pending, [], [], ""
@@ -464,8 +485,7 @@ async def procesar_consulta(query, df, vectorstore, llm, ctx=None):
     clasificacion = await clasificar_intencion(query, llm)
     intent = clasificacion.get("intent")
     entity = clasificacion.get("entity")
-    
-    print(f"🧠 Router: {intent} | Entity: {entity}")
+    logger.info(f"🧠 Router: {intent} | Entity: {entity}")
 
     # 3. STATS
     if intent == "STATS":
@@ -480,13 +500,14 @@ async def procesar_consulta(query, df, vectorstore, llm, ctx=None):
         if not target and ctx.get('last_entity'): target = ctx['last_entity']
 
         if target:
-            resp, nombre_real, det, opciones = await resumir_opiniones_local(target, df, llm, ctx.get('topic'))
+            ctx['original_query'] = query
+            resp, nombre_real, det, opciones = await resumir_opiniones_local(target, df, llm, query)
             
             if opciones: return resp, "resumen", opciones, [], [], ""
             
             if nombre_real:
                 ctx['last_entity'] = nombre_real
-                cards = await obtener_restaurant_cards([nombre_real], df, llm, ctx.get('topic') or target)
+                cards = await obtener_restaurant_cards([nombre_real], df, llm, query)
                 locs = obtener_coordenadas([nombre_real], df)
                 return resp, "resumen", None, locs, cards, det
             
@@ -504,7 +525,7 @@ async def procesar_consulta(query, df, vectorstore, llm, ctx=None):
                 locales.append(nom)
         locales = locales[:5]
         
-        # KEY CHANGE: Pasamos la query para buscar reseñas relevantes
+        # KEY: Pasamos la query para buscar reseñas relevantes
         cards = await obtener_restaurant_cards(locales, df, llm, query)
         locs = obtener_coordenadas(locales, df)
         
@@ -516,7 +537,7 @@ async def procesar_consulta(query, df, vectorstore, llm, ctx=None):
         
         return rag_resp.content, "rag", None, locs, cards, ""
     except Exception as e:
-        print(f"Error RAG: {e}")
+        logger.error(f"Error RAG: {e}")
         return "Tuve un problema buscando eso. ¿Probamos de nuevo?", "rag", None, [], [], ""
 
 # ==========================================
@@ -531,10 +552,6 @@ def health_check(): return {"status": "healthy", "df_size": len(df) if df is not
 
 @app.get("/restaurant/{nombre}", response_model=RestaurantDetail)
 async def get_restaurant_detail(nombre: str, topic: Optional[str] = None):
-    """
-    Endpoint de detalles. 
-    Acepta ?topic=... para filtrar reseñas por tema.
-    """
     global df, llm
     if not nombre: raise HTTPException(status_code=404)
     
@@ -545,14 +562,12 @@ async def get_restaurant_detail(nombre: str, topic: Optional[str] = None):
     row = rest_df.iloc[0]
     nombre_real = safe_str(row['restaurante'])
     
-    # 1. ORDENAR RESEÑAS POR TEMA O FECHA
-    # Usamos la nueva lógica de ranking
+    # 1. ORDENAR RESEÑAS POR TEMA (USANDO LA FUNCIÓN MEJORADA)
     sorted_reviews = rankear_reviews_por_topico(rest_df, topic)
     
-    # Tomamos las top 8
     reviews_list = []
     for _, r in sorted_reviews.head(8).iterrows():
-        if len(safe_str(r.get('texto'))) > 10: # Filtro minimo
+        if len(safe_str(r.get('texto'))) > 10:
             reviews_list.append(ReviewDetail(
                 autor=formatear_autor(r.get('autor')),
                 rating=safe_int(r.get('rating_user')),
@@ -560,35 +575,24 @@ async def get_restaurant_detail(nombre: str, topic: Optional[str] = None):
                 fecha=safe_str(r.get('fecha'))
             ))
 
-    # 2. GENERAR ANÁLISIS LLM (Cacheado por TEMA)
-    # La clave de caché incluye el topic para no mezclar
-    key_detail = f"{nombre_real}_{topic}" if topic else nombre_real
-    analisis = cache.get_json("detail_topic", key_detail)
+    # 2. CACHÉ CON TOPIC
+    cache_key = f"{nombre_real}_{topic}" if topic else nombre_real
+    analisis = cache.get_json("detail_topic", cache_key)
 
     if not analisis:
-        # Preparamos prompt temático
         sample = " | ".join([r.texto[:150] for r in reviews_list[:5]])
+        contexto_tema = f"IMPORTANTE: El usuario busca '{topic}'. Resalta qué dicen las reseñas sobre eso." if topic else ""
         
-        contexto_tema = ""
-        if topic:
-            contexto_tema = f"ENFOCATE ESPECÍFICAMENTE en opiniones sobre: '{topic}'."
-            intro_resumen = f"Sobre {topic}: "
-        else:
-            intro_resumen = ""
-
         prompt_txt = f"""Analiza "{nombre_real}". {contexto_tema}
         Responde SOLO JSON válido:
-        {{"resumen": "{intro_resumen}descripción de 2 oraciones...", "positivos": ["p1", "p2"], "negativos": ["n1"]}}
-        
-        Reviews de usuarios: {sample}"""
+        {{"resumen": "descripción de 2 oraciones...", "positivos": ["p1", "p2"], "negativos": ["n1"]}}
+        Reviews: {sample}"""
         
         try:
             res = await llm.ainvoke(prompt_txt)
             clean = res.content.strip().replace("```json","").replace("```","")
             analisis = json.loads(clean)
-
-            # Guardamos con la clave específica (incluye topic si aplica)
-            cache.set_json("detail_topic", key_detail, analisis)
+            cache.set_json("detail_topic", cache_key, analisis)
         except: 
             analisis = {"resumen": "Info no disponible momentáneamente.", "positivos": [], "negativos": []}
 
@@ -622,13 +626,16 @@ async def chat(req: QueryRequest):
         
         if req.conversation_context and 'last_entity' in req.conversation_context and 'last_entity' not in new_ctx:
              new_ctx['last_entity'] = req.conversation_context['last_entity']
+        
+        if 'original_query' in req.conversation_context and 'original_query' not in new_ctx:
+             new_ctx['original_query'] = req.conversation_context['original_query']
 
         return QueryResponse(
             response=resp, mode=mode, conversation_context=new_ctx,
             locations=locs, restaurant_cards=cards, detail_content=det
         )
     except Exception as e:
-        print(f"Error Chat: {e}")
+        logger.error(f"Error Chat: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
