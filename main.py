@@ -483,18 +483,22 @@ async def procesar_consulta(query, df, vectorstore, llm, ctx=None):
                 locales.append(nom)
         locales = locales[:5]
         
-        # AWAIT AQUÍ ES LA CLAVE DE LA VELOCIDAD
+        # Build cards/locations from available dataframe matches first
         cards = await obtener_restaurant_cards(locales, df, llm)
         locs = obtener_coordenadas(locales, df)
-        
+
+        # Use only the locales we actually have cards for when asking the LLM to avoid mismatches
+        matched_locales = [c.nombre for c in cards]
+        prompt_locales = matched_locales if matched_locales else locales
+
         prompt_rag = (
-            f"Usuario busca: '{query}'. Encontré: {', '.join(locales)}. "
-            "Recomendalos en 1 frase corta para Neuquén."
+            f"Usuario busca: '{query}'. Encontré: {', '.join(prompt_locales)}. "
+            "Recomendalos en 1 frase corta para Neuquén y alrededores. "
+            "No mencionar 'Argentina' bajo ninguna circunstancia; asegurate de incluir la palabra 'Neuquén' o 'Neuquén y alrededores' en la frase."
         )
         rag_resp = await llm.ainvoke(prompt_rag)
-        
+
         return rag_resp.content, "rag", None, locs, cards, ""
-        
     except Exception as e:
         print(f"Error RAG: {e}")
         return "Tuve un problema buscando eso. ¿Probamos de nuevo?", "rag", None, [], [], ""
