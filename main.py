@@ -403,6 +403,10 @@ async def consultar_estadisticas(query, df, llm):
         # try to extract a stemmed keyword using our helper
         klist = get_keywords_from_topic(keyword_text)
         keyword = klist[0] if klist else (keyword_text.split()[0] if keyword_text else "")
+        # fallback: if keyword is still empty, extract from query
+        if not keyword:
+            qk = get_keywords_from_topic(query)
+            keyword = qk[0] if qk else (query.split()[0] if query else "")
         keyword = keyword.strip()
         total = df['restaurante'].nunique()
         if "total" in keyword or len(keyword) < 2:
