@@ -415,6 +415,7 @@ async def consultar_estadisticas(query, df, llm):
         keyword_ascii = unicodedata.normalize('NFD', keyword)
         keyword_ascii = ''.join(ch for ch in keyword_ascii if unicodedata.category(ch) != 'Mn')
         keyword_ascii = re.sub(r'[^\w\s]', '', keyword_ascii)
+        logger.info(f"🔢 Stats: raw_llm='{keyword_raw}' | keyword_text='{keyword_text}' | keyword='{keyword}' | keyword_ascii='{keyword_ascii}'")
         mask = (df['restaurante_ascii'].str.contains(keyword_ascii, na=False) | 
                 df['texto_ascii'].str.contains(keyword_ascii, na=False))
         locales_filtrados = df[mask]['restaurante'].unique().tolist()
