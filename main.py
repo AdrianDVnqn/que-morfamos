@@ -261,25 +261,48 @@ def rankear_reviews_por_topico(df_reviews, topic=None):
     df_local = df_reviews.copy()
     df_local['orden_fecha'] = df_local['fecha'].apply(fecha_a_orden)
     
+    # Aseguramos que rating_user sea int
+    if 'rating_user' in df_local.columns:
+        df_local['rating_user'] = pd.to_numeric(df_local['rating_user'], errors='coerce').fillna(0).astype(int)
+    else:
+        df_local['rating_user'] = 0
+
     if not topic or len(topic) < 3:
-        return df_local.sort_values('orden_fecha')
+        # Si no hay tópico, priorizamos las más recientes que tengan buen rating
+        return df_local.sort_values(['orden_fecha', 'rating_user'], ascending=[True, False])
 
     keywords = get_keywords_from_topic(topic)
     if not keywords:
         return df_local.sort_values('orden_fecha')
 
-    def calcular_relevancia(texto):
-        texto = safe_str(texto).lower()
+    def calcular_relevancia(row):
+        texto = safe_str(row.get('texto')).lower()
+        rating = row.get('rating_user', 0)
         score = 0
+        
+        match_found = False
         for k in keywords:
             if k in texto:
                 score += 100 
+                match_found = True
+        
+        # LÓGICA DE SENTIMIENTO SIMPLE BASADA EN ESTRELLAS
+        if match_found:
+            if rating >= 4:
+                score += 50  # Premiamos si habla del tema y es buena (Total 150)
+            elif rating <= 2:
+                score -= 20  # Penalizamos si habla del tema pero es mala (Total 80)
+                # Sigue siendo > 0 porque es relevante, pero quedará abajo de las buenas.
+        
         return score
 
-    df_local['score_topic'] = df_local['texto'].apply(calcular_relevancia)
+    # Aplicamos la función a toda la fila (axis=1) para tener acceso al rating y al texto a la vez
+    df_local['score_topic'] = df_local.apply(calcular_relevancia, axis=1)
+    
     if df_local['score_topic'].max() == 0:
         return df_local.sort_values('orden_fecha')
         
+    # Ordenamos: Mayor score primero
     return df_local.sort_values(['score_topic', 'orden_fecha'], ascending=[False, True])
 
 def seleccionar_mejor_review(df_local, topic_query=None):
@@ -304,6 +327,7 @@ async def obtener_restaurant_cards(nombres_restaurantes, df, llm, query_context=
     cards = []
     tasks = [] 
     
+    # --- PASO 1: Generación de Cards (Igual que antes) ---
     for nombre in nombres_restaurantes:
         if not nombre: continue
         mask = df['restaurante'].str.lower() == nombre.lower()
@@ -353,8 +377,39 @@ async def obtener_restaurant_cards(nombres_restaurantes, df, llm, query_context=
             frase_destacada=safe_str(item['frase']),
             autor_reseña=safe_str(item['autor'])
         ))
-    return cards
 
+    # --- PASO 2: REORDENAMIENTO INTELIGENTE POR DENSIDAD ---
+    # Si hay un tema de búsqueda (query_context), ordenamos por especialización.
+    if query_context and len(cards) > 1:
+        keywords = get_keywords_from_topic(query_context)
+        
+        if keywords:
+            # Función auxiliar interna para calcular score
+            def calcular_score_especializacion(card):
+                # Filtramos el DF original para este restaurante
+                mask_rest = df['restaurante'] == card.nombre
+                reviews_rest = df[mask_rest]
+                
+                # Contamos cuántas reseñas contienen las palabras clave
+                # Usamos una expresión regular simple con las keywords
+                pattern = '|'.join([re.escape(k) for k in keywords])
+                hits = reviews_rest['texto'].str.lower().str.contains(pattern, na=False).sum()
+                
+                # FÓRMULA DE DENSIDAD CON SUAVIZADO
+                # Score = Hits / (Total + 10)
+                # El +10 penaliza a los que tienen muy pocas reviews totales
+                score = hits / (card.total_reviews + 10)
+                
+                # (Opcional) Bonus si tiene buen rating general
+                if card.rating >= 4.5: score *= 1.1
+                
+                logger.info(f"📊 {card.nombre} -> Hits: {hits}/{card.total_reviews} | Score: {score:.4f}")
+                return score
+
+            # Ordenamos la lista 'cards' in-place usando el score
+            cards.sort(key=calcular_score_especializacion, reverse=True)
+
+    return cards
 def obtener_restaurant_cards_simple(nombres_restaurantes, df):
     cards = []
     for nombre in nombres_restaurantes:
@@ -502,7 +557,7 @@ async def resumir_opiniones_local(query_str, df, llm, topic=None, tone='cordial'
             prefix = "Encontré varios lugares con ese nombre. ¿A cuál te referís?"
             # Corregir comprobación: usar `in` para chequear múltiples valores
             if tone in ('sassy', 'soberbio'):
-                prefix = "Hay varios. ¿Cuál de todos querés?"
+                prefix = "Hay varios. ¿Cuál querés?"
             
             resp_text = f"{prefix}\n\n{lista_txt}\n\n*(Escribí el número)*"
             return resp_text, None, "", {"options": keys}
