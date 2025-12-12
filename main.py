@@ -1,11 +1,11 @@
 import os
 import json
 import re
-import asyncio  # <--- CRÍTICO PARA PARALELISMO
+import asyncio
 import pandas as pd
 import numpy as np
 from typing import List, Optional
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
@@ -60,7 +60,7 @@ class RedisCacheManager:
 cache = RedisCacheManager(UPSTASH_REDIS_REST_URL, UPSTASH_REDIS_REST_TOKEN)
 
 # --- INICIALIZACIÓN APP ---
-app = FastAPI(title="Que Morfamos API (Async)", version="3.8.0")
+app = FastAPI(title="Que Morfamos API (Topic Aware)", version="4.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -148,7 +148,6 @@ async def startup_event():
         vectorstore = PineconeVectorStore.from_existing_index(
             index_name=PINECONE_INDEX_NAME, embedding=embeddings
         )
-        # IMPORTANTE: temperature=0 para consistencia
         llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
         print("✅ IA (OpenAI + Pinecone) lista.")
     except Exception as e:
@@ -205,8 +204,125 @@ def obtener_coordenadas(nombres, df):
     return locs
 
 # ==========================================
-# 3. LÓGICA DE NEGOCIO (ASYNC)
+# 3. LÓGICA DE NEGOCIO (FILTRO TEMÁTICO)
 # ==========================================
+
+def get_keywords_from_topic(topic):
+    """Extrae palabras clave de la búsqueda del usuario"""
+    if not topic: return []
+    stopwords = {"de", "la", "el", "en", "y", "que", "los", "las", "un", "una", "del", "para", "con", "donde", "hay", "lugar", "lugares", "comer", "mejor", "mejores", "neuquen"}
+    # Limpiamos y separamos
+    words = safe_str(topic).lower().split()
+    return [w for w in words if w not in stopwords and len(w) > 2]
+
+def rankear_reviews_por_topico(df_reviews, topic=None):
+    """
+    Ordena las reseñas. Si hay topic, prioriza las que hablan de eso.
+    Si no, prioriza fecha.
+    """
+    df_local = df_reviews.copy()
+    
+    # 1. Calcular Fecha (Base)
+    df_local['orden_fecha'] = df_local['fecha'].apply(fecha_a_orden)
+    
+    # 2. Si NO hay topic, devolvemos por fecha (reciente primero)
+    if not topic:
+        return df_local.sort_values('orden_fecha')
+
+    # 3. Si HAY topic, scoring por palabras clave
+    keywords = get_keywords_from_topic(topic)
+    if not keywords:
+        return df_local.sort_values('orden_fecha') # Topic irrelevante, fallback
+
+    pattern = "|".join(keywords)
+    
+    # Crear Score: 100 puntos si tiene palabra clave, -penalización por antigüedad
+    # (Así priorizamos relevancia semántica sobre fecha, pero fecha desempata)
+    
+    def calcular_relevancia(texto):
+        texto = safe_str(texto).lower()
+        count = sum(1 for k in keywords if k in texto)
+        return count * 100 # 100 puntos por cada palabra clave encontrada
+
+    df_local['score_topic'] = df_local['texto'].apply(calcular_relevancia)
+    
+    # Ordenar: Mayor score primero, luego menor antigüedad
+    return df_local.sort_values(['score_topic', 'orden_fecha'], ascending=[False, True])
+
+def seleccionar_mejor_review(df_local, topic_query=None):
+    """Helper para elegir frase destacada en cards"""
+    sorted_df = rankear_reviews_por_topico(df_local, topic_query)
+    candidatas = sorted_df[sorted_df['texto'].str.len() > 40]
+    
+    if not candidatas.empty:
+        return candidatas.iloc[0]
+    elif not sorted_df.empty:
+        return sorted_df.iloc[0]
+    return None
+
+async def generar_descripcion_async(llm, nombre, sample):
+    try:
+        res = await llm.ainvoke(f"Describe '{nombre}' en máx 12 palabras atractivas basado en: {sample}")
+        return res.content.strip().replace('"','')
+    except:
+        return "Restaurante popular en Neuquén."
+
+async def obtener_restaurant_cards(nombres_restaurantes, df, llm, query_context=None):
+    cards = []
+    tasks = [] 
+    
+    for nombre in nombres_restaurantes:
+        if not nombre: continue
+        mask = df['restaurante'].str.lower() == nombre.lower()
+        if mask.any():
+            rest_df = df[mask]
+            row = rest_df.iloc[0]
+            nombre_real = safe_str(row['restaurante'])
+
+            frase = ""
+            autor = ""
+            # Usamos el ranking inteligente
+            best_review = seleccionar_mejor_review(rest_df, query_context)
+            
+            if best_review is not None:
+                frase = safe_str(best_review['texto'])[:300] + "..."
+                autor = formatear_autor(best_review.get('autor'))
+
+            # Descripción (Cacheada en Redis)
+            desc = cache.get_json("desc", nombre_real)
+            if desc:
+                tasks.append({"type": "cached", "val": desc, "row": row, "frase": frase, "autor": autor, "nombre_real": nombre_real})
+            else:
+                sample = " ".join([safe_str(t) for t in rest_df['texto'].head(5)])[:800]
+                task_coro = generar_descripcion_async(llm, nombre_real, sample)
+                tasks.append({"type": "generate", "val": task_coro, "row": row, "frase": frase, "autor": autor, "nombre_real": nombre_real})
+
+    generations_needed = [t['val'] for t in tasks if t['type'] == 'generate']
+    if generations_needed:
+        results = await asyncio.gather(*generations_needed)
+    
+    gen_idx = 0
+    for item in tasks:
+        descripcion = ""
+        if item['type'] == 'cached':
+            descripcion = item['val']
+        else:
+            descripcion = results[gen_idx]
+            gen_idx += 1
+            cache.set_json("desc", item['nombre_real'], descripcion)
+
+        cards.append(RestaurantCard(
+            nombre=item['nombre_real'],
+            rating=safe_float(item['row'].get('rating_gral')),
+            total_reviews=safe_int(item['row'].get('total_reviews_google')),
+            direccion=safe_str(item['row'].get('direccion')),
+            barrio=safe_str(item['row'].get('barrio')),
+            zona=safe_str(item['row'].get('zona')),
+            descripcion=safe_str(descripcion),
+            frase_destacada=safe_str(item['frase']),
+            autor_reseña=safe_str(item['autor'])
+        ))
+    return cards
 
 def obtener_restaurant_cards_simple(nombres_restaurantes, df):
     cards = []
@@ -223,92 +339,6 @@ def obtener_restaurant_cards_simple(nombres_restaurantes, df):
     cards.sort(key=lambda x: x.rating, reverse=True)
     return cards
 
-# --- FUNCIÓN AUXILIAR PARA PARALELISMO ---
-async def generar_descripcion_async(llm, nombre, sample):
-    """Genera descripción en hilo separado"""
-    try:
-        # ainvoke es la clave para no bloquear
-        res = await llm.ainvoke(f"Describe '{nombre}' en máx 12 palabras atractivas basado en: {sample}")
-        return res.content.strip().replace('"','')
-    except:
-        return "Restaurante popular en Neuquén."
-
-# --- GENERACIÓN DE TARJETAS PARALELIZADA ---
-async def obtener_restaurant_cards(nombres_restaurantes, df, llm):
-    cards = []
-    tasks = [] # Aquí guardaremos las promesas de la IA
-    
-    # 1. Preparar datos y ver qué se necesita generar
-    for nombre in nombres_restaurantes:
-        if not nombre: continue
-        mask = df['restaurante'].str.lower() == nombre.lower()
-        if mask.any():
-            rest_df = df[mask]
-            row = rest_df.iloc[0]
-            nombre_real = safe_str(row['restaurante'])
-
-            frase = ""
-            autor = ""
-            reseñas_validas = rest_df[rest_df['texto'].str.len() > 50]
-            if not reseñas_validas.empty:
-                r = reseñas_validas.iloc[0]
-                frase = safe_str(r['texto'])[:400] + "..."
-                autor = formatear_autor(r.get('autor'))
-
-            # Check Caché
-            desc = cache.get_json("desc", nombre_real)
-            
-            if desc:
-                # Si está en caché, guardamos el valor directo
-                tasks.append({
-                    "type": "cached", 
-                    "val": desc, 
-                    "row": row, "frase": frase, "autor": autor, "nombre_real": nombre_real
-                })
-            else:
-                # Si NO está en caché, creamos una Tarea Async
-                sample = " ".join([safe_str(t) for t in rest_df['texto'].head(5)])[:800]
-                # No hacemos await aquí, solo agendamos
-                task_coro = generar_descripcion_async(llm, nombre_real, sample)
-                tasks.append({
-                    "type": "generate", 
-                    "val": task_coro, 
-                    "row": row, "frase": frase, "autor": autor, "nombre_real": nombre_real
-                })
-
-    # 2. Ejecutar todas las generaciones en paralelo (scatter-gather)
-    generations_needed = [t['val'] for t in tasks if t['type'] == 'generate']
-    
-    if generations_needed:
-        # BOOM: Aquí se ejecutan todas a la vez 🚀
-        results = await asyncio.gather(*generations_needed)
-    
-    # 3. Ensamblar resultados
-    gen_idx = 0
-    for item in tasks:
-        descripcion = ""
-        if item['type'] == 'cached':
-            descripcion = item['val']
-        else:
-            descripcion = results[gen_idx]
-            gen_idx += 1
-            # Guardamos en caché lo nuevo
-            cache.set_json("desc", item['nombre_real'], descripcion)
-
-        cards.append(RestaurantCard(
-            nombre=item['nombre_real'],
-            rating=safe_float(item['row'].get('rating_gral')),
-            total_reviews=safe_int(item['row'].get('total_reviews_google')),
-            direccion=safe_str(item['row'].get('direccion')),
-            barrio=safe_str(item['row'].get('barrio')),
-            zona=safe_str(item['row'].get('zona')),
-            descripcion=safe_str(descripcion),
-            frase_destacada=safe_str(item['frase']),
-            autor_reseña=safe_str(item['autor'])
-        ))
-        
-    return cards
-
 async def clasificar_intencion(query, llm):
     template = """
     Clasifica la intención. QUERY: "{query}"
@@ -321,7 +351,6 @@ async def clasificar_intencion(query, llm):
     """
     try:
         chain = ChatPromptTemplate.from_template(template) | llm | StrOutputParser()
-        # Usamos ainvoke para no bloquear
         res_str = await chain.ainvoke({"query": query})
         clean_json = res_str.strip().replace("```json", "").replace("```", "")
         return json.loads(clean_json)
@@ -331,7 +360,7 @@ async def clasificar_intencion(query, llm):
 async def consultar_estadisticas(query, df, llm):
     try:
         prompt = f"Extrae palabra clave para filtrar (ej: 'pizzerias' -> 'pizza'). Query: {query}. Solo la palabra."
-        keyword = await llm.ainvoke(prompt) # Async
+        keyword = await llm.ainvoke(prompt) 
         keyword = keyword.content.strip().lower()
         keyword = re.sub(r'[^\w\s]', '', keyword)
         
@@ -351,23 +380,19 @@ async def resumir_opiniones_local(query_str, df, llm):
     
     q_clean = query_str.lower().strip()
     
-    # 1. INTENTO DE COINCIDENCIA EXACTA (Prioridad Máxima)
-    # Esto rompe el bucle de "Mostaza" vs "Mostaza Shopping"
+    # 1. Match Exacto
     mask_exact = df['restaurante'].str.lower() == q_clean
     if mask_exact.any():
-        # Si encontramos uno que se llama EXACTAMENTE así, lo usamos.
         restaurante = df[mask_exact].iloc[0]['restaurante']
-        encontrados = [restaurante] # Simulamos que solo encontró uno
+        encontrados = [restaurante]
     else:
-        # 2. BÚSQUEDA DIFUSA (Si no hay exacto, buscamos parecidos)
+        # 2. Match Difuso
         mask = df['restaurante'].str.lower().str.contains(q_clean, na=False)
         encontrados = df[mask]['restaurante'].unique()
     
-    # --- FLUJO NORMAL ---
     if len(encontrados) == 0: 
         return "No conozco ese lugar che, disculpá.", None, "", None
     
-    # Si hay múltiples (y no hubo match exacto antes)
     if len(encontrados) > 1:
         labels = []
         keys = []
@@ -377,9 +402,7 @@ async def resumir_opiniones_local(query_str, df, llm):
             extra = ""
             if mask_r.any():
                 rowr = df[mask_r].iloc[0]
-                # Priorizamos dirección, luego barrio
                 extra = safe_str(rowr.get('direccion')) or safe_str(rowr.get('barrio')) or safe_str(rowr.get('zona'))
-            
             display = f"{r} ({extra})" if extra else r
             labels.append(display)
 
@@ -387,10 +410,7 @@ async def resumir_opiniones_local(query_str, df, llm):
         resp_text = f"Encontré varias opciones:\n\n{lista_txt}\n\n¿A cuál te referís? (Escribí el número)"
         return resp_text, None, "", {"options": keys}
     
-    # Si llegamos acá, tenemos UN solo restaurante elegido
     restaurante = encontrados[0]
-    
-    # ... (Resto de la lógica de caché y generación igual que antes) ...
     cached_text = cache.get_json("resumen_texto", restaurante)
     if cached_text:
         return f"¡Dale! Acá la data de **{restaurante}**:", restaurante, cached_text, None
@@ -411,8 +431,7 @@ async def resumir_opiniones_local(query_str, df, llm):
             "rat": safe_float(reviews_df.iloc[0].get('rating_gral')),
             "revs": reviews_txt
         })
-    except:
-        res = "No pude generar el resumen en este momento."
+    except: res = "No pude generar el resumen."
     
     cache.set_json("resumen_texto", restaurante, res)
     return f"¡Dale! Acá la data de **{restaurante}**:", restaurante, res, None
@@ -433,7 +452,7 @@ async def procesar_consulta(query, df, vectorstore, llm, ctx=None):
             seleccion = opciones[num - 1]
             ctx['last_entity'] = seleccion
             resp, nombre_real, det, _ = await resumir_opiniones_local(seleccion, df, llm)
-            cards = await obtener_restaurant_cards([nombre_real], df, llm)
+            cards = await obtener_restaurant_cards([nombre_real], df, llm, seleccion)
             locs = obtener_coordenadas([nombre_real], df)
             return resp, "resumen", None, locs, cards, det
         return f"Elegí entre 1 y {len(opciones)}", "resumen", pending, [], [], ""
@@ -464,7 +483,7 @@ async def procesar_consulta(query, df, vectorstore, llm, ctx=None):
             
             if nombre_real:
                 ctx['last_entity'] = nombre_real
-                cards = await obtener_restaurant_cards([nombre_real], df, llm)
+                cards = await obtener_restaurant_cards([nombre_real], df, llm, target)
                 locs = obtener_coordenadas([nombre_real], df)
                 return resp, "resumen", None, locs, cards, det
             
@@ -472,7 +491,6 @@ async def procesar_consulta(query, df, vectorstore, llm, ctx=None):
 
     # 5. RAG (RECOMENDACIÓN)
     try:
-        # Pinecone sync client es rápido, pero OpenAI ainvoke es clave
         docs = vectorstore.similarity_search(query, k=15)
         seen = set()
         locales = []
@@ -483,21 +501,16 @@ async def procesar_consulta(query, df, vectorstore, llm, ctx=None):
                 locales.append(nom)
         locales = locales[:5]
         
-        # Build cards/locations from available dataframe matches first
-        cards = await obtener_restaurant_cards(locales, df, llm)
+        # KEY CHANGE: Pasamos la query para buscar reseñas relevantes
+        cards = await obtener_restaurant_cards(locales, df, llm, query)
         locs = obtener_coordenadas(locales, df)
-
-        # Use only the locales we actually have cards for when asking the LLM to avoid mismatches
-        matched_locales = [c.nombre for c in cards]
-        prompt_locales = matched_locales if matched_locales else locales
-
+        
         prompt_rag = (
-            f"Usuario busca: '{query}'. Encontré: {', '.join(prompt_locales)}. "
-            "Recomendalos en 1 frase corta para Neuquén y alrededores. "
-            "No mencionar 'Argentina' bajo ninguna circunstancia; asegurate de incluir la palabra 'Neuquén' o 'Neuquén y alrededores' en la frase."
+            f"Usuario busca: '{query}'. Encontré: {', '.join(locales)}. "
+            "Recomendalos en 1 frase corta para Neuquén."
         )
         rag_resp = await llm.ainvoke(prompt_rag)
-
+        
         return rag_resp.content, "rag", None, locs, cards, ""
     except Exception as e:
         print(f"Error RAG: {e}")
@@ -514,7 +527,11 @@ def read_root(): return {"status": "online", "message": "API OK"}
 def health_check(): return {"status": "healthy", "df_size": len(df) if df is not None else 0}
 
 @app.get("/restaurant/{nombre}", response_model=RestaurantDetail)
-async def get_restaurant_detail(nombre: str):
+async def get_restaurant_detail(nombre: str, topic: Optional[str] = None):
+    """
+    Endpoint de detalles. 
+    Acepta ?topic=... para filtrar reseñas por tema.
+    """
     global df, llm
     if not nombre: raise HTTPException(status_code=404)
     
@@ -525,31 +542,57 @@ async def get_restaurant_detail(nombre: str):
     row = rest_df.iloc[0]
     nombre_real = safe_str(row['restaurante'])
     
-    reviews_list = []
-    con_texto = rest_df[rest_df['texto'].str.len() > 10].copy()
-    con_texto['orden'] = con_texto['fecha'].apply(fecha_a_orden)
-    con_texto = con_texto.sort_values('orden')
+    # 1. ORDENAR RESEÑAS POR TEMA O FECHA
+    # Usamos la nueva lógica de ranking
+    sorted_reviews = rankear_reviews_por_topico(rest_df, topic)
     
-    for _, r in con_texto.head(8).iterrows():
-        reviews_list.append(ReviewDetail(
-            autor=formatear_autor(r.get('autor')),
-            rating=safe_int(r.get('rating_user')),
-            texto=safe_str(r.get('texto'))[:2000],
-            fecha=safe_str(r.get('fecha'))
-        ))
+    # Tomamos las top 8
+    reviews_list = []
+    for _, r in sorted_reviews.head(8).iterrows():
+        if len(safe_str(r.get('texto'))) > 10: # Filtro minimo
+            reviews_list.append(ReviewDetail(
+                autor=formatear_autor(r.get('autor')),
+                rating=safe_int(r.get('rating_user')),
+                texto=safe_str(r.get('texto'))[:2000],
+                fecha=safe_str(r.get('fecha'))
+            ))
 
-    analisis = cache.get_json("json_detail", nombre_real)
+    # 2. GENERAR ANÁLISIS LLM (Cacheado por TEMA)
+    # La clave de caché ahora incluye el topic para no mezclar
+    cache_key_suffix = f"json_detail:{nombre_real}"
+    if topic:
+        cache_key_suffix += f":{topic.lower().replace(' ', '_')}"
+        
+    analisis = cache.get_json(cache_key_suffix, "") # Usamos suffix como prefix o key directa
+    # Simplificamos uso de cache wrapper:
+    analisis = cache.get_json("detail_topic", f"{nombre_real}_{topic}" if topic else nombre_real)
+
     if not analisis:
+        # Preparamos prompt temático
         sample = " | ".join([r.texto[:150] for r in reviews_list[:5]])
-        prompt_txt = f"""Analiza "{nombre_real}" y responde SOLO JSON:
-        {{"resumen": "descripción", "positivos": ["p1", "p2"], "negativos": ["n1"]}}
-        Reviews: {sample}"""
+        
+        contexto_tema = ""
+        if topic:
+            contexto_tema = f"ENFOCATE ESPECÍFICAMENTE en opiniones sobre: '{topic}'."
+            intro_resumen = f"Sobre {topic}: "
+        else:
+            intro_resumen = ""
+
+        prompt_txt = f"""Analiza "{nombre_real}". {contexto_tema}
+        Responde SOLO JSON válido:
+        {{"resumen": "{intro_resumen}descripción de 2 oraciones...", "positivos": ["p1", "p2"], "negativos": ["n1"]}}
+        
+        Reviews de usuarios: {sample}"""
+        
         try:
             res = await llm.ainvoke(prompt_txt)
             clean = res.content.strip().replace("```json","").replace("```","")
             analisis = json.loads(clean)
-            cache.set_json("json_detail", nombre_real, analisis)
-        except: analisis = {"resumen": "Info no disponible", "positivos": [], "negativos": []}
+            
+            # Guardamos con la clave específica
+            cache.set_json("detail_topic", f"{nombre_real}_{topic}" if topic else nombre_real, analisis)
+        except: 
+            analisis = {"resumen": "Info no disponible momentáneamente.", "positivos": [], "negativos": []}
 
     return RestaurantDetail(
         nombre=nombre_real,
