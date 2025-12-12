@@ -306,8 +306,41 @@ def resumir_opiniones_local(query_str, df, llm):
         return "No conozco ese lugar che, disculpá.", None, "", None
     
     if len(encontrados) > 1:
-        lista_txt = "\n".join([f" {i+1}. {r}" for i, r in enumerate(encontrados)])
-        return f"Encontré varias opciones:\n\n{lista_txt}\n\n¿A cuál te referís? (Escribí el número)", None, "", list(encontrados)
+        # Build human-friendly labels including address/barrio to disambiguate
+        labels = []
+        keys = []
+        for i, r in enumerate(encontrados):
+            keys.append(r)
+            # try to find a representative row to extract address/barrio
+            mask_r = df['restaurante'].str.lower() == r.lower()
+            label_extra = ""
+            if mask_r.any():
+                rowr = df[mask_r].iloc[0]
+                addr = safe_str(rowr.get('direccion'))
+                barrio = safe_str(rowr.get('barrio'))
+                zona = safe_str(rowr.get('zona'))
+                if addr:
+                    label_extra = addr
+                elif barrio:
+                    label_extra = barrio
+                elif zona:
+                    label_extra = zona
+
+            display = r
+            if label_extra:
+                display = f"{r} — {label_extra}"
+
+            # mark exact name match to help user
+            if r.strip().lower() == query_str.strip().lower():
+                display = f"{display} (coincide exactamente)"
+
+            labels.append(display)
+
+        lista_txt = "\n".join([f" {i+1}. {lbl}" for i, lbl in enumerate(labels)])
+        resp_text = f"Encontré varias opciones:\n\n{lista_txt}\n\n¿A cuál te referís? (podés escribir el número o el nombre completo)"
+        # Return pending options as structured dict so selection maps unambiguously
+        opciones_struct = {"options": keys, "labels": labels}
+        return resp_text, None, "", opciones_struct
     
     restaurante = encontrados[0]
     cached_text = cache.get_json("resumen_texto", restaurante)
@@ -401,7 +434,7 @@ def procesar_consulta(query, df, vectorstore, llm, ctx=None):
         cards = obtener_restaurant_cards(locales, df, llm)
         locs = obtener_coordenadas(locales, df)
         
-        prompt_rag = f"Usuario busca: '{query}'. Encontré: {', '.join(locales)}. Recomendalos en 1 frase corta argentina."
+        prompt_rag = f"Usuario busca: '{query}'. Encontré: {', '.join(locales)}. Recomendalos en 1 frase corta para Neuquén y alrededores."
         rag_resp = llm.invoke(prompt_rag).content
         
         return rag_resp, "rag", None, locs, cards, ""
