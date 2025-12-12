@@ -3,10 +3,14 @@ import pandas as pd
 from main import consultar_estadisticas
 
 class DummyLLM:
+    def __init__(self, content='heladerias'):
+        self._content = content
     async def ainvoke(self, prompt):
         class Res:
-            content = 'heladerias'
-        return Res()
+            pass
+        r = Res()
+        r.content = self._content
+        return r
 
 async def main():
     df = pd.DataFrame([
@@ -18,9 +22,19 @@ async def main():
         if col not in df.columns:
             df[col] = ''
     # Call function
-    resp, locales = await consultar_estadisticas('cuantas heladerias hay?', df, DummyLLM())
+    resp, locales = await consultar_estadisticas('cuantas heladerias hay?', df, DummyLLM('heladerias'))
     print('Response:', resp)
     print('Locales:', locales)
+
+    # Test case: user asks empanadas but LLM returns truncated 'empana'
+    resp2, locales2 = await consultar_estadisticas('cuantas empanadas hay?', df, DummyLLM('empana'))
+    print('\nResponse2 (empana stub):', resp2)
+    print('Locales2:', locales2)
+
+    # Test case: LLM returns full 'empanadas'
+    resp3, locales3 = await consultar_estadisticas('cuantas empanadas hay?', df, DummyLLM('empanadas'))
+    print('\nResponse3 (empanadas):', resp3)
+    print('Locales3:', locales3)
 
 if __name__ == '__main__':
     asyncio.run(main())
