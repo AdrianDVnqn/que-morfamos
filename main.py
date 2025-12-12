@@ -215,6 +215,24 @@ def obtener_coordenadas(nombres, df):
                 })
     return locs
 
+
+# ===================== TONOS =====================
+ALLOWED_TONES = {'cordial', 'soberbio', 'sassy'}
+def sanitize_tone(t):
+    if not t: return 'cordial'
+    tt = str(t).lower().strip()
+    return tt if tt in ALLOWED_TONES else 'cordial'
+
+def tone_system_instruction(tone):
+    tone = sanitize_tone(tone)
+    if tone == 'cordial':
+        return 'Eres un asistente cordial, educado y respetuoso. Responde de forma clara y amable.'
+    if tone == 'soberbio':
+        return 'Eres un asistente con tono soberbio y un poco pedante — respuestas seguras, elocuentes y un tanto presuntuosas, sin insultar ni usar lenguaje ofensivo.'
+    if tone == 'sassy':
+        return 'Eres un asistente irónico y con humor mordaz, con respuestas directas y breves, sin incurrir en lenguaje que promueva daño o insultos personales.'
+    return 'Eres un asistente cordial, educado y respetuoso.'
+
 # ==========================================
 # 3. LÓGICA DE NEGOCIO (FILTRO TEMÁTICO MEJORADO)
 # ==========================================
@@ -294,14 +312,16 @@ def seleccionar_mejor_review(df_local, topic_query=None):
         return sorted_df.iloc[0]
     return None
 
-async def generar_descripcion_async(llm, nombre, sample):
+async def generar_descripcion_async(llm, nombre, sample, tone='cordial'):
     try:
-        res = await llm.ainvoke(f"Describe '{nombre}' en máx 12 palabras atractivas basado en: {sample}")
+        prefix = tone_system_instruction(tone)
+        prompt = f"{prefix}\nDescribe '{nombre}' en máx 12 palabras atractivas basado en: {sample}"
+        res = await llm.ainvoke(prompt)
         return res.content.strip().replace('"','')
     except:
         return "Restaurante popular en Neuquén."
 
-async def obtener_restaurant_cards(nombres_restaurantes, df, llm, query_context=None):
+async def obtener_restaurant_cards(nombres_restaurantes, df, llm, query_context=None, tone='cordial'):
     cards = []
     tasks = [] 
     
@@ -321,12 +341,13 @@ async def obtener_restaurant_cards(nombres_restaurantes, df, llm, query_context=
                 frase = safe_str(best_review['texto'])[:350] + "..."
                 autor = formatear_autor(best_review.get('autor'))
 
-            desc = cache.get_json("desc", nombre_real)
+            cache_key = f"{nombre_real}__{sanitize_tone(tone)}"
+            desc = cache.get_json("desc", cache_key)
             if desc:
                 tasks.append({"type": "cached", "val": desc, "row": row, "frase": frase, "autor": autor, "nombre_real": nombre_real})
             else:
                 sample = " ".join([safe_str(t) for t in rest_df['texto'].head(5)])[:800]
-                task_coro = generar_descripcion_async(llm, nombre_real, sample)
+                task_coro = generar_descripcion_async(llm, nombre_real, sample, tone)
                 tasks.append({"type": "generate", "val": task_coro, "row": row, "frase": frase, "autor": autor, "nombre_real": nombre_real})
 
     generations_needed = [t['val'] for t in tasks if t['type'] == 'generate']
@@ -341,7 +362,7 @@ async def obtener_restaurant_cards(nombres_restaurantes, df, llm, query_context=
         else:
             descripcion = results[gen_idx]
             gen_idx += 1
-            cache.set_json("desc", item['nombre_real'], descripcion)
+            cache.set_json("desc", f"{item['nombre_real']}__{sanitize_tone(tone)}", descripcion)
 
         cards.append(RestaurantCard(
             nombre=item['nombre_real'],
@@ -424,7 +445,7 @@ async def consultar_estadisticas(query, df, llm):
         logger.error(f"Error consultar_estadisticas: {e}")
         return "No pude calcular esa estadística.", []
 
-async def resumir_opiniones_local(query_str, df, llm, topic=None):
+async def resumir_opiniones_local(query_str, df, llm, topic=None, tone='cordial'):
     if not query_str: return "Nombre vacío.", None, "", None
     
     q_clean = query_str.lower().strip()
@@ -457,7 +478,7 @@ async def resumir_opiniones_local(query_str, df, llm, topic=None):
         return resp_text, None, "", {"options": keys}
     
     restaurante = encontrados[0]
-    cache_key = f"{restaurante}_{topic}" if topic else restaurante
+    cache_key = f"{restaurante}_{topic}_{sanitize_tone(tone)}" if topic else f"{restaurante}__{sanitize_tone(tone)}"
     cached_text = cache.get_json("resumen_texto", cache_key)
     if cached_text:
         return f"¡Dale! Acá la data de **{restaurante}**:", restaurante, cached_text, None
@@ -467,7 +488,8 @@ async def resumir_opiniones_local(query_str, df, llm, topic=None):
     
     contexto_tema = f"El usuario pregunta específicamente sobre: '{topic}'. Resalta eso." if topic else ""
 
-    tpl = f"""Analiza: {{rest}}. Rating: {{rat}}. {contexto_tema}
+    tone_prefix = tone_system_instruction(tone)
+    tpl = f"""{tone_prefix}\nAnaliza: {{rest}}. Rating: {{rat}}. {contexto_tema}
     Reviews: {{revs}}
     Generá resumen Markdown (Argentino):
     ## 📊 La onda
@@ -491,6 +513,7 @@ async def resumir_opiniones_local(query_str, df, llm, topic=None):
 # ==========================================
 async def procesar_consulta(query, df, vectorstore, llm, ctx=None):
     if ctx is None: ctx = {}
+    tone = sanitize_tone(ctx.get('tone'))
     
     # 1. CONTEXTO NUMÉRICO
     if 'pending_options' in ctx and query.strip().isdigit():
@@ -503,8 +526,8 @@ async def procesar_consulta(query, df, vectorstore, llm, ctx=None):
             ctx['last_entity'] = seleccion
             original_topic = ctx.get('original_query', seleccion) 
             
-            resp, nombre_real, det, _ = await resumir_opiniones_local(seleccion, df, llm, original_topic)
-            cards = await obtener_restaurant_cards([nombre_real], df, llm, original_topic)
+            resp, nombre_real, det, _ = await resumir_opiniones_local(seleccion, df, llm, original_topic, tone)
+            cards = await obtener_restaurant_cards([nombre_real], df, llm, original_topic, tone)
             locs = obtener_coordenadas([nombre_real], df)
             return resp, "resumen", None, locs, cards, det
         return f"Elegí entre 1 y {len(opciones)}", "resumen", pending, [], [], ""
@@ -529,13 +552,13 @@ async def procesar_consulta(query, df, vectorstore, llm, ctx=None):
 
         if target:
             ctx['original_query'] = query
-            resp, nombre_real, det, opciones = await resumir_opiniones_local(target, df, llm, query)
+            resp, nombre_real, det, opciones = await resumir_opiniones_local(target, df, llm, query, tone)
             
             if opciones: return resp, "resumen", opciones, [], [], ""
             
             if nombre_real:
                 ctx['last_entity'] = nombre_real
-                cards = await obtener_restaurant_cards([nombre_real], df, llm, query)
+                cards = await obtener_restaurant_cards([nombre_real], df, llm, query, tone)
                 locs = obtener_coordenadas([nombre_real], df)
                 return resp, "resumen", None, locs, cards, det
             
@@ -554,11 +577,12 @@ async def procesar_consulta(query, df, vectorstore, llm, ctx=None):
         locales = locales[:5]
         
         # KEY: Pasamos la query para buscar reseñas relevantes
-        cards = await obtener_restaurant_cards(locales, df, llm, query)
+        cards = await obtener_restaurant_cards(locales, df, llm, query, tone)
         locs = obtener_coordenadas(locales, df)
         
+        prefix = tone_system_instruction(tone)
         prompt_rag = (
-            f"Usuario busca: '{query}'. Encontré: {', '.join(locales)}. "
+            f"{prefix}\nUsuario busca: '{query}'. Encontré: {', '.join(locales)}. "
             "Recomendalos en 1 frase corta para Neuquén."
         )
         rag_resp = await llm.ainvoke(prompt_rag)
@@ -579,7 +603,7 @@ def read_root(): return {"status": "online", "message": "API OK"}
 def health_check(): return {"status": "healthy", "df_size": len(df) if df is not None else 0}
 
 @app.get("/restaurant/{nombre}", response_model=RestaurantDetail)
-async def get_restaurant_detail(nombre: str, topic: Optional[str] = None):
+async def get_restaurant_detail(nombre: str, topic: Optional[str] = None, tone: Optional[str] = None):
     global df, llm
     if not nombre: raise HTTPException(status_code=404)
     
@@ -604,14 +628,16 @@ async def get_restaurant_detail(nombre: str, topic: Optional[str] = None):
             ))
 
     # 2. CACHÉ CON TOPIC
-    cache_key = f"{nombre_real}_{topic}" if topic else nombre_real
+    tone = sanitize_tone(tone)
+    cache_key = f"{nombre_real}_{topic}_{tone}" if topic else f"{nombre_real}__{tone}"
     analisis = cache.get_json("detail_topic", cache_key)
 
     if not analisis:
         sample = " | ".join([r.texto[:150] for r in reviews_list[:5]])
         contexto_tema = f"IMPORTANTE: El usuario busca '{topic}'. Resalta qué dicen las reseñas sobre eso." if topic else ""
+        prefix = tone_system_instruction(tone)
         
-        prompt_txt = f"""Analiza "{nombre_real}". {contexto_tema}
+        prompt_txt = f"""{prefix}\nAnaliza "{nombre_real}". {contexto_tema}
         Responde SOLO JSON válido:
         {{"resumen": "descripción de 2 oraciones...", "positivos": ["p1", "p2"], "negativos": ["n1"]}}
         Reviews: {sample}"""
@@ -642,11 +668,15 @@ async def get_restaurant_detail(nombre: str, topic: Optional[str] = None):
 @app.post("/chat", response_model=QueryResponse)
 async def chat(req: QueryRequest):
     try:
+        # Normalize tone in conversation context (explicit param overrides)
+        ctx = req.conversation_context.copy() if req.conversation_context else {}
+        if req.tone:
+            ctx['tone'] = sanitize_tone(req.tone)
         resp, mode, pend, locs, cards, det = await procesar_consulta(
-            req.query, df, vectorstore, llm, req.conversation_context
+            req.query, df, vectorstore, llm, ctx
         )
         
-        new_ctx = req.conversation_context.copy() if req.conversation_context else {}
+        new_ctx = ctx.copy() if ctx else {}
         if pend: 
             new_ctx['pending_options'] = pend
         elif 'pending_options' in new_ctx: 
