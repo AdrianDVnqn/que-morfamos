@@ -236,7 +236,8 @@ def obtener_restaurant_cards(nombres_restaurantes, df, llm):
             reseñas_validas = rest_df[rest_df['texto'].str.len() > 50]
             if not reseñas_validas.empty:
                 r = reseñas_validas.iloc[0]
-                frase = safe_str(r['texto'])[:120] + "..."
+                # aumentar la longitud de la frase destacada para mostrar un extracto más informativo
+                frase = safe_str(r['texto'])[:400] + "..."
                 autor = formatear_autor(r.get('autor'))
 
             desc = cache.get_json("desc", nombre_real)
