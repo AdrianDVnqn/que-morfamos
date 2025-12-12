@@ -306,18 +306,44 @@ def rankear_reviews_por_topico(df_reviews, topic=None):
     return df_local.sort_values(['score_topic', 'orden_fecha'], ascending=[False, True])
 
 def seleccionar_mejor_review(df_local, topic_query=None):
+    # 1. Ranking normal (ya incluye ponderación de estrellas y keywords)
     sorted_df = rankear_reviews_por_topico(df_local, topic_query)
-    candidatas = sorted_df[sorted_df['texto'].str.len() > 30]
+    
+    if sorted_df.empty: return None
+
+    # 2. ESCENARIO RAG (Búsqueda por tema)
+    if topic_query:
+        top_match = sorted_df.iloc[0]
+        
+        # Si el score es > 0, significa que encontró la palabra clave.
+        if top_match['score_topic'] > 0:
+            # VALIDACIÓN MÍNIMA:
+            # Aceptamos reseñas cortas (ej: "Alto flan!"), pero filtramos 
+            # basura extrema (menos de 4 chars, ej: "si", "ok", "no").
+            texto = safe_str(top_match['texto'])
+            if len(texto) >= 4:
+                return top_match
+            
+        # Si el score es 0 (o menor), significa que NO encontró el tema.
+        # Devolvemos None para que el "Patovica" en obtener_restaurant_cards
+        # descarte este restaurante de los resultados.
+        return None
+
+    # 3. ESCENARIO INFO GENERAL (Sin tema específico)
+    # Acá sí mantenemos el filtro de longitud para que la tarjeta se vea "bonita"
+    # con una frase armada, y no diga simplemente "Excelente".
+    candidatas = sorted_df[sorted_df['texto'].str.len() > 25] 
+    
     if not candidatas.empty:
         return candidatas.iloc[0]
-    elif not sorted_df.empty:
-        return sorted_df.iloc[0]
-    return None
+    
+    # Si todas son cortas, devolvemos la primera (la más reciente/mejor rankeada)
+    return sorted_df.iloc[0]
 
 async def generar_descripcion_async(llm, nombre, sample, tone='cordial'):
     try:
         prefix = tone_system_instruction(tone)
-        prompt = f"{prefix}\nDescribe '{nombre}' en máx 12 palabras atractivas basado en: {sample}"
+        prompt = f"{prefix}\nDescribe '{nombre}' en máx 15 palabras atractivas basado en: {sample}"
         res = await llm.ainvoke(prompt)
         return res.content.strip().replace('"','')
     except:
@@ -327,7 +353,6 @@ async def obtener_restaurant_cards(nombres_restaurantes, df, llm, query_context=
     cards = []
     tasks = [] 
     
-    # --- PASO 1: Generación de Cards (Igual que antes) ---
     for nombre in nombres_restaurantes:
         if not nombre: continue
         mask = df['restaurante'].str.lower() == nombre.lower()
@@ -338,13 +363,26 @@ async def obtener_restaurant_cards(nombres_restaurantes, df, llm, query_context=
 
             frase = ""
             autor = ""
+            
+            # 1. BUSCAMOS LA MEJOR RESEÑA (EL FILTRO)
             best_review = seleccionar_mejor_review(rest_df, query_context)
+            
+            # === PATOVICA (FILTRO DE RELEVANCIA) ===
+            # Si hay un tema de búsqueda (RAG) y best_review es None,
+            # significa que el restaurante no tiene NADA relevante sobre el tema.
+            # Lo descartamos para evitar falsos positivos.
+            if query_context and best_review is None:
+                continue 
+            # =======================================
+
             if best_review is not None:
                 frase = safe_str(best_review['texto'])[:350] + "..."
                 autor = formatear_autor(best_review.get('autor'))
 
+            # 2. GESTIÓN DE DESCRIPCIONES (CACHE vs LLM)
             cache_key = f"{nombre_real}__{sanitize_tone(tone)}"
             desc = cache.get_json("desc", cache_key)
+            
             if desc:
                 tasks.append({"type": "cached", "val": desc, "row": row, "frase": frase, "autor": autor, "nombre_real": nombre_real})
             else:
@@ -352,6 +390,7 @@ async def obtener_restaurant_cards(nombres_restaurantes, df, llm, query_context=
                 task_coro = generar_descripcion_async(llm, nombre_real, sample, tone)
                 tasks.append({"type": "generate", "val": task_coro, "row": row, "frase": frase, "autor": autor, "nombre_real": nombre_real})
 
+    # 3. EJECUCIÓN PARALELA DE GENERACIONES LLM
     generations_needed = [t['val'] for t in tasks if t['type'] == 'generate']
     if generations_needed:
         results = await asyncio.gather(*generations_needed)
@@ -378,38 +417,40 @@ async def obtener_restaurant_cards(nombres_restaurantes, df, llm, query_context=
             autor_reseña=safe_str(item['autor'])
         ))
 
-    # --- PASO 2: REORDENAMIENTO INTELIGENTE POR DENSIDAD ---
-    # Si hay un tema de búsqueda (query_context), ordenamos por especialización.
+    # 4. REORDENAMIENTO INTELIGENTE POR DENSIDAD
+    # Si estamos buscando un tema específico, ordenamos para que aparezcan primero
+    # los "especialistas" (alto % de menciones) y no solo los populares.
     if query_context and len(cards) > 1:
         keywords = get_keywords_from_topic(query_context)
         
         if keywords:
-            # Función auxiliar interna para calcular score
-            def calcular_score_especializacion(card):
+            def calcular_score_densidad(card):
                 # Filtramos el DF original para este restaurante
                 mask_rest = df['restaurante'] == card.nombre
                 reviews_rest = df[mask_rest]
                 
-                # Contamos cuántas reseñas contienen las palabras clave
-                # Usamos una expresión regular simple con las keywords
-                pattern = '|'.join([re.escape(k) for k in keywords])
-                hits = reviews_rest['texto'].str.lower().str.contains(pattern, na=False).sum()
+                # Unimos texto para búsqueda rápida de keywords
+                texto_gigante = " ".join(reviews_rest['texto'].fillna("").astype(str).str.lower())
                 
-                # FÓRMULA DE DENSIDAD CON SUAVIZADO
-                # Score = Hits / (Total + 10)
-                # El +10 penaliza a los que tienen muy pocas reviews totales
+                hits = 0
+                for k in keywords:
+                    hits += texto_gigante.count(k)
+                
+                # FÓRMULA DE SUAVIZADO: Score = Hits / (Total + 10)
+                # El +10 evita que un lugar con 1 review y 1 hit tenga 100% de score.
                 score = hits / (card.total_reviews + 10)
                 
-                # (Opcional) Bonus si tiene buen rating general
+                # Bonus pequeño por rating alto para desempatar
                 if card.rating >= 4.5: score *= 1.1
                 
-                logger.info(f"📊 {card.nombre} -> Hits: {hits}/{card.total_reviews} | Score: {score:.4f}")
                 return score
 
-            # Ordenamos la lista 'cards' in-place usando el score
-            cards.sort(key=calcular_score_especializacion, reverse=True)
+            # Ordenamos in-place (Mayor score primero)
+            cards.sort(key=calcular_score_densidad, reverse=True)
 
     return cards
+
+
 def obtener_restaurant_cards_simple(nombres_restaurantes, df):
     cards = []
     for nombre in nombres_restaurantes:
@@ -430,24 +471,16 @@ def obtener_restaurant_cards_simple(nombres_restaurantes, df):
 # ==========================================
 
 async def expandir_query_con_llm(query, llm):
-    """
-    Usa el LLM para generar sinónimos y platos relacionados
-    para filtrar con mayor puntería.
-    """
-    # 1. Chequeo caché (Idealmente usar Redis acá, simplifico para el ejemplo)
     cache_key = f"expansion_{query.lower().strip()}"
     cached = cache.get_json("keywords", cache_key)
     if cached: return cached
 
-    # 2. Prompt de expansión
+    # CAMBIO: Prompt mucho más estricto para evitar "postre" si busco "flan"
     template = """
     Actúa como experto gastronómico. El usuario busca: "{query}".
-    Genera una lista de 5 a 10 palabras clave que aparecerían en una reseña de un restaurante que cumple con esa búsqueda.
-    Incluye platos típicos, nacionalidades o ingredientes clave.
-    
-    Ejemplo:
-    Query: "Asiatica" -> asiatica, chino, china, japones, japonesa, sushi, wok, ramen, thai, curry.
-    Query: "Vegano" -> vegano, vegana, vegetariano, tofu, seitan, sin carne, plant based.
+    Genera una lista de 3 a 5 palabras clave SINÓNIMAS O ESPECÍFICAS.
+    NO incluyas categorías generales (ej: si busca 'flan' NO digas 'postre').
+    Si busca 'hamburguesa', NO digas 'comida rápida', di 'burger'.
     
     Responde SOLO las palabras separadas por coma, en minúsculas.
     """
@@ -455,21 +488,15 @@ async def expandir_query_con_llm(query, llm):
     try:
         res = await llm.ainvoke(template)
         texto = res.content.lower().strip()
-        # Limpiamos y convertimos a lista
         keywords = [k.strip() for k in texto.split(',') if k.strip()]
         
-        # Agregamos la query original por si acaso
         original = query.lower().strip()
         if original not in keywords:
             keywords.insert(0, original)
             
-        # 3. Guardar en caché
         cache.set_json("keywords", cache_key, keywords)
-        
-        logger.info(f"r🔍 Expansión '{query}' -> {keywords}")
         return keywords
     except Exception as e:
-        logger.error(f"Error expandiendo query: {e}")
         return [query.lower().strip()]
 
 
