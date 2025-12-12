@@ -113,6 +113,7 @@ class RestaurantDetail(BaseModel):
 class QueryRequest(BaseModel):
     query: str
     conversation_context: Optional[dict] = None
+    tone: Optional[str] = None
 
 class QueryResponse(BaseModel):
     response: str
