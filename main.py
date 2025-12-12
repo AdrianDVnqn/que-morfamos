@@ -429,6 +429,50 @@ def obtener_restaurant_cards_simple(nombres_restaurantes, df):
 # 4. INTENCIÓN Y DETECCIÓN (BRAIN)
 # ==========================================
 
+async def expandir_query_con_llm(query, llm):
+    """
+    Usa el LLM para generar sinónimos y platos relacionados
+    para filtrar con mayor puntería.
+    """
+    # 1. Chequeo caché (Idealmente usar Redis acá, simplifico para el ejemplo)
+    cache_key = f"expansion_{query.lower().strip()}"
+    cached = cache.get_json("keywords", cache_key)
+    if cached: return cached
+
+    # 2. Prompt de expansión
+    template = """
+    Actúa como experto gastronómico. El usuario busca: "{query}".
+    Genera una lista de 5 a 10 palabras clave que aparecerían en una reseña de un restaurante que cumple con esa búsqueda.
+    Incluye platos típicos, nacionalidades o ingredientes clave.
+    
+    Ejemplo:
+    Query: "Asiatica" -> asiatica, chino, china, japones, japonesa, sushi, wok, ramen, thai, curry.
+    Query: "Vegano" -> vegano, vegana, vegetariano, tofu, seitan, sin carne, plant based.
+    
+    Responde SOLO las palabras separadas por coma, en minúsculas.
+    """
+    
+    try:
+        res = await llm.ainvoke(template)
+        texto = res.content.lower().strip()
+        # Limpiamos y convertimos a lista
+        keywords = [k.strip() for k in texto.split(',') if k.strip()]
+        
+        # Agregamos la query original por si acaso
+        original = query.lower().strip()
+        if original not in keywords:
+            keywords.insert(0, original)
+            
+        # 3. Guardar en caché
+        cache.set_json("keywords", cache_key, keywords)
+        
+        logger.info(f"r🔍 Expansión '{query}' -> {keywords}")
+        return keywords
+    except Exception as e:
+        logger.error(f"Error expandiendo query: {e}")
+        return [query.lower().strip()]
+
+
 def detectar_mencion_exacta(query, df):
     """
     Busca si el query contiene el nombre de algún restaurante existente.
@@ -680,51 +724,89 @@ async def procesar_consulta(query, df, vectorstore, llm, ctx=None):
     # 7. RAG (RECOMENDACIÓN)
     if intent == "RECOMMENDATION":
         try:
-            docs = vectorstore.similarity_search(query, k=20)
+            # A. Búsqueda Vectorial (Trae candidatos por similitud semántica pura)
+            docs = vectorstore.similarity_search(query, k=25)
             seen = set()
-            locales_candidatos = []
+            locales_preliminares = []
             for d in docs:
                 nom = d.metadata.get('nombre')
                 if nom and nom not in seen:
                     seen.add(nom)
-                    locales_candidatos.append(nom)
+                    locales_preliminares.append(nom)
             
-            locales_candidatos = locales_candidatos[:5]
+            # B. EL FILTRO INTELIGENTE (EXPANSIÓN + VALIDACIÓN)
             
-            if not locales_candidatos:
-                 return "No encontré nada relacionado a eso. ¡Qué hambre!", "rag", None, [], [], ""
+            # 1. Expandimos la query usando el LLM
+            # Ej: "Asiatica" -> ['asiatica', 'sushi', 'wok', 'china', 'japonesa']
+            keywords_expandidas = await expandir_query_con_llm(query, llm)
+            
+            locales_confirmados = []
+            
+            if not keywords_expandidas:
+                locales_confirmados = locales_preliminares[:5]
+            else:
+                for local in locales_preliminares:
+                    mask = df['restaurante'].str.lower() == local.lower()
+                    if mask.any():
+                        rest_df = df[mask]
+                        # Unimos texto para buscar rápido
+                        texto_gigante = " ".join(rest_df['texto'].fillna("").astype(str).str.lower())
+                        
+                        # Chequeamos si ALGUNA de las keywords expandidas está presente
+                        match = False
+                        for k in keywords_expandidas:
+                            # Usamos ' in ' simple. Podrías usar regex boundaries \b para más precisión
+                            if k in texto_gigante:
+                                match = True
+                                break # Con encontrar 1 coincidencia alcanza (ej. encontró "sushi")
+                        
+                        if match:
+                            locales_confirmados.append(local)
+                        else:
+                            # Burger King muere acá porque no dice "sushi", "wok" ni "china"
+                            logger.info(f"🗑️ Descartado: {local} (No matcheó con {keywords_expandidas})")
 
-            # Generamos cards PRIMERO
-            cards = await obtener_restaurant_cards(locales_candidatos, df, llm, query, tone)
+                locales_confirmados = locales_confirmados[:5]
+
+            if not locales_confirmados:
+                 return "Busqué lugares con eso, pero no encontré reseñas que confirmen que lo tienen.", "rag", None, [], [], ""
+
+            # C. Generar Cards
+            cards = await obtener_restaurant_cards(locales_confirmados, df, llm, query, tone)
             
-            # Extraemos SOLO los nombres que se convirtieron en tarjeta exitosamente
+            # REORDENAMIENTO POR DENSIDAD (Usando keywords expandidas)
+            if len(cards) > 1:
+                def calcular_score_densidad(card):
+                    mask_rest = df['restaurante'] == card.nombre
+                    hits = 0
+                    reviews_rest = df[mask_rest]
+                    texto_completo = " ".join(reviews_rest['texto'].fillna("").astype(str).str.lower())
+                    
+                    # Sumamos hits de TODAS las variantes
+                    for k in keywords_expandidas:
+                        hits += texto_completo.count(k)
+                    
+                    return hits / (card.total_reviews + 5)
+
+                cards.sort(key=calcular_score_densidad, reverse=True)
+
             nombres_finales = [c.nombre for c in cards]
             
-            if not nombres_finales:
-                 return "Encontré referencias, pero no tengo información detallada de esos lugares. Disculpá.", "rag", None, [], [], ""
-
-            # Obtenemos coordenadas solo de esos
+            # ... (Resto del código igual: prompt final y retorno) ...
             locs = obtener_coordenadas(nombres_finales, df)
-            
-            # Prompt al LLM usando SOLO la lista confirmada (Single Source of Truth)
             prefix = tone_system_instruction(tone)
             prompt_rag = (
-                f"{prefix}\n"
-                f"Usuario pregunta: '{query}'.\n"
-                f"Tengo información confirmada de estos lugares: {', '.join(nombres_finales)}.\n"
-                "Recomendalos brevemente mencionando por qué coinciden. "
-                "No menciones lugares que no estén en esta lista."
+                f"{prefix}\nUsuario pregunta: '{query}'.\n"
+                f"Lugares VERIFICADOS: {', '.join(nombres_finales)}.\n"
+                "Recomendalos explicando qué plato tienen relacionado a la búsqueda."
             )
             rag_resp = await llm.ainvoke(prompt_rag)
-            
             return rag_resp.content, "rag", None, locs, cards, ""
-            
+
         except Exception as e:
             logger.error(f"Error RAG: {e}")
-            return "Tuve un problema buscando eso. ¿Probamos de nuevo?", "rag", None, [], [], ""
-            
-    return "No entendí bien qué buscás, ¿podés reformular?", "rag", None, [], [], ""
-
+            return "Tuve un problema buscando eso.", "rag", None, [], [], ""
+        
 # ==========================================
 # 6. ENDPOINTS
 # ==========================================
