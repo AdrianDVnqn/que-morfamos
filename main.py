@@ -1,6 +1,7 @@
 import os
 import json
 import re
+import unicodedata
 import asyncio
 import logging
 import pandas as pd
@@ -137,6 +138,16 @@ async def startup_event():
                 if col in df.columns:
                     df[col] = df[col].fillna("").astype(str).str.strip()
             df['rating_gral'] = pd.to_numeric(df['rating_gral'], errors='coerce').fillna(0.0)
+            # Normalize ascii columns for search (remove accents/diacritics)
+            def _norm(s):
+                if pd.isna(s) or s is None: return ""
+                t = str(s).lower().strip()
+                t = unicodedata.normalize('NFD', t)
+                t = ''.join(ch for ch in t if unicodedata.category(ch) != 'Mn')
+                t = re.sub(r'[^\w\s]', '', t)
+                return t
+            df['restaurante_ascii'] = df['restaurante'].apply(_norm)
+            df['texto_ascii'] = df['texto'].apply(_norm)
             logger.info(f"✅ DataFrame cargado: {len(df)} filas.")
         except Exception as e:
             logger.error(f"❌ Error Parquet: {e}")
@@ -381,20 +392,32 @@ async def clasificar_intencion(query, llm):
 async def consultar_estadisticas(query, df, llm):
     try:
         prompt = f"Extrae palabra clave para filtrar (ej: 'pizzerias' -> 'pizza'). Query: {query}. Solo la palabra."
-        keyword = await llm.ainvoke(prompt) 
-        keyword = keyword.content.strip().lower()
-        keyword = re.sub(r'[^\w\s]', '', keyword)
-        
+        keyword_raw = await llm.ainvoke(prompt)
+        # Support both str and ChatMessage-like return types
+        try:
+            keyword_text = keyword_raw.content.strip().lower()
+        except Exception:
+            keyword_text = str(keyword_raw).strip().lower()
+        # sanitize
+        keyword_text = re.sub(r'[^\w\s]', '', keyword_text)
+        # try to extract a stemmed keyword using our helper
+        klist = get_keywords_from_topic(keyword_text)
+        keyword = klist[0] if klist else (keyword_text.split()[0] if keyword_text else "")
+        keyword = keyword.strip()
         total = df['restaurante'].nunique()
         if "total" in keyword or len(keyword) < 2:
             return f"Tengo registrados **{total}** restaurantes.", []
-        
-        mask = (df['restaurante'].str.lower().str.contains(keyword, na=False) | 
-                df['texto'].str.lower().str.contains(keyword, na=False))
-        
+        # Normalize keyword and match against ascii-normalized columns
+        keyword_ascii = unicodedata.normalize('NFD', keyword)
+        keyword_ascii = ''.join(ch for ch in keyword_ascii if unicodedata.category(ch) != 'Mn')
+        keyword_ascii = re.sub(r'[^\w\s]', '', keyword_ascii)
+        mask = (df['restaurante_ascii'].str.contains(keyword_ascii, na=False) | 
+                df['texto_ascii'].str.contains(keyword_ascii, na=False))
         locales_filtrados = df[mask]['restaurante'].unique().tolist()
         return f"Encontré **{len(locales_filtrados)}** lugares relacionados con '{keyword}'.", locales_filtrados
-    except: return "No pude calcular esa estadística.", []
+    except Exception as e:
+        logger.error(f"Error consultar_estadisticas: {e}")
+        return "No pude calcular esa estadística.", []
 
 async def resumir_opiniones_local(query_str, df, llm, topic=None):
     if not query_str: return "Nombre vacío.", None, "", None
