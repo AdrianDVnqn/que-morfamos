@@ -226,12 +226,12 @@ def sanitize_tone(t):
 def tone_system_instruction(tone):
     tone = sanitize_tone(tone)
     if tone == 'cordial':
-        return 'Sos un asistente de buenos aires, cordial, educado y respetuoso. Responde de forma clara y amable.'
+        return 'Sos un asistente de Neuquén y alrededores, cordial, educado y respetuoso. Responde de forma clara y amable.'
     if tone == 'soberbio':
-        return 'Sos un asistente de buenos aires, con tono soberbio y pedante — respuestas seguras, elocuentes y presuntuosas.'
+        return 'Sos un asistente de Neuquén y alrededores, con tono soberbio y pedante — respuestas seguras, elocuentes y presuntuosas.'
     if tone == 'sassy':
-        return 'Sos un asistente de buenos aires, irónico y con humor mordaz (sassy), con respuestas directas y breves.'
-    return 'Sos un asistente de buenos aires, cordial, educado y respetuoso. Responde de forma clara y amable.'
+        return 'Sos un asistente de Neuquén y alrededores, irónico y con humor mordaz (sassy), con respuestas directas y breves.'
+    return 'Sos un asistente de Neuquén y alrededores, cordial, educado y respetuoso. Responde de forma clara y amable.'
 
 # ==========================================
 # 3. LÓGICA DE NEGOCIO
