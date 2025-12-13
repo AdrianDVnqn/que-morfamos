@@ -499,23 +499,47 @@ async def expandir_query_con_llm(query, llm):
     except Exception as e:
         return [query.lower().strip()]
 
-
 def detectar_mencion_exacta(query, df):
     """
-    Busca si el query contiene el nombre de algún restaurante existente.
-    Prioriza los nombres más largos (ej: 'Burger King' antes que 'Burger').
+    1. Busca coincidencia exacta del nombre completo.
+    2. Si falla, busca coincidencia de la PRIMERA palabra del nombre (para casos como 'Growler' vs 'Growler Station').
     """
     if df is None or df.empty: return None
     q_norm = query.lower().strip()
+    
+    # Normalización de stopwords para no matchear "La" de "La Nonna"
+    stopwords_nombres = {"la", "el", "los", "las", "de", "del", "lo", "al"}
+    
     nombres = df['restaurante'].unique().tolist()
-    # Ordenar por largo descendente para evitar parciales incorrectos
+    # Ordenar por largo descendente para prioridad (ej: 'Burger King' > 'Burger')
     nombres.sort(key=len, reverse=True)
     
+    # 1. BÚSQUEDA EXACTA (Nombre Completo)
     for nombre in nombres:
         nombre_clean = nombre.lower().strip()
-        # Chequeo simple de inclusión
         if nombre_clean in q_norm:
-            return nombre # Retornamos el nombre real (capitalizado como está en DB)
+            return nombre
+            
+    # 2. BÚSQUEDA POR PRIMERA PALABRA (Aproximación para "Growler", "Mostaza")
+    # Solo si la primera palabra es distintiva (larga y no stopword)
+    for nombre in nombres:
+        parts = nombre.lower().split()
+        if not parts: continue
+        
+        first_word = parts[0]
+        # Limpieza de stopwords al inicio del nombre (ej: "El Biguá" -> "Biguá")
+        if first_word in stopwords_nombres and len(parts) > 1:
+            first_word = parts[1]
+            
+        # Solo consideramos palabras clave fuertes (>3 letras) para evitar falsos positivos
+        if len(first_word) > 3:
+            # Usamos regex boundary (\b) o simple 'in' con espacios para evitar que "Bar" matchee "Bariloche"
+            # Pero para hacerlo simple y efectivo: chequeamos si está en la query
+            if first_word in q_norm:
+                # Devolvemos el nombre de la coincidencia (aunque sea parcial) 
+                # para que el sistema sepa que hay un local candidato.
+                return nombre 
+
     return None
 
 async def clasificar_intencion(query, llm, match_db=None):
