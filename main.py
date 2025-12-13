@@ -653,21 +653,25 @@ async def resumir_opiniones_local(query_str, df, llm, topic=None, tone='cordial'
     return f"¡Dale! Acá la data de **{restaurante}**:", restaurante, res, None
 
 # ==========================================
-# 5. ROUTER PRINCIPAL
+# 5. ROUTER PRINCIPAL (ROUTER)
 # ==========================================
 async def procesar_consulta(query, df, vectorstore, llm, ctx=None):
     if ctx is None: ctx = {}
     tone = sanitize_tone(ctx.get('tone'))
     
-    # 1. CONTEXTO NUMÉRICO
+    # 1. CONTEXTO NUMÉRICO (Desambiguación)
     if 'pending_options' in ctx and query.strip().isdigit():
+        # ... (código existente de manejo de opciones numéricas) ...
+        # Copia tu bloque existente aquí, no cambia nada.
         num = int(query.strip())
         pending = ctx['pending_options']
         opciones = pending.get('options', []) if isinstance(pending, dict) else pending
+        
         if 1 <= num <= len(opciones):
             seleccion = opciones[num - 1]
             ctx['last_entity'] = seleccion
             original_topic = ctx.get('original_query', seleccion) 
+            
             resp, nombre_real, det, _ = await resumir_opiniones_local(
                 seleccion, df, llm, original_topic, tone, es_seleccion_directa=True
             )
@@ -676,14 +680,25 @@ async def procesar_consulta(query, df, vectorstore, llm, ctx=None):
             return resp, "resumen", None, locs, cards, det
         return f"Elegí entre 1 y {len(opciones)}", "resumen", pending, [], [], ""
 
-    # 2. PRE-SCAN
+    # 2. PRE-SCAN: "El Chismoso"
     posible_match = detectar_mencion_exacta(query, df)
 
-    # 3. CLASIFICACIÓN
-    clasificacion = await clasificar_intencion(query, llm, match_db=posible_match)
-    intent = clasificacion.get("intent")
-    entity = clasificacion.get("entity")
-    logger.info(f"🧠 Router: {intent} | Entity: {entity} | DB Match: {posible_match}")
+    # === NUEVO: REGLA DURA PARA ESTADÍSTICAS ===
+    # Si detectamos intención clara de contar, NO usamos el LLM para clasificar.
+    # Esto arregla "cuantos lugares de sushi hay" yendo directo a STATS.
+    stats_triggers = ["cuantos", "cuántos", "cantidad", "total de", "numero de", "número de"]
+    es_pregunta_stats = any(trigger in query.lower() for trigger in stats_triggers)
+
+    if es_pregunta_stats:
+        intent = "STATS"
+        entity = None
+        logger.info(f"🧠 Router: STATS (Detectado por palabras clave)")
+    else:
+        # 3. CLASIFICACIÓN LLM (Solo si no es una pregunta obvia de stats)
+        clasificacion = await clasificar_intencion(query, llm, match_db=posible_match)
+        intent = clasificacion.get("intent")
+        entity = clasificacion.get("entity")
+        logger.info(f"🧠 Router: {intent} | Entity: {entity} | DB Match: {posible_match}")
     
     # 4. OVERRIDE
     if intent == "RECOMMENDATION" and posible_match:
@@ -693,11 +708,14 @@ async def procesar_consulta(query, df, vectorstore, llm, ctx=None):
 
     # 5. STATS
     if intent == "STATS":
+        # ... (Tu código existente de stats) ...
         resp, locales = await consultar_estadisticas(query, df, llm)
         cards = obtener_restaurant_cards_simple(locales, df)
         locs = obtener_coordenadas(locales, df)
         return resp, "estadisticas", None, locs, cards, ""
 
+    # ... (El resto de las intenciones INFO ESPECIFICA y RAG siguen igual) ...
+    
     # 6. INFO ESPECÍFICA
     if intent == "SPECIFIC_INFO":
         target = entity
@@ -721,8 +739,9 @@ async def procesar_consulta(query, df, vectorstore, llm, ctx=None):
 
     # 7. RAG (RECOMENDACIÓN BLINDADA)
     if intent == "RECOMMENDATION":
+        # ... (Tu bloque RAG actualizado que te pasé antes con analizar_query_semantica) ...
+        # (Asegúrate de mantener el bloque RAG que te pasé en la respuesta anterior)
         try:
-            # A. Vector Search
             docs = vectorstore.similarity_search(query, k=25)
             seen = set()
             locales_preliminares = []
@@ -732,15 +751,12 @@ async def procesar_consulta(query, df, vectorstore, llm, ctx=None):
                     seen.add(nom)
                     locales_preliminares.append(nom)
             
-            # B. ANÁLISIS SEMÁNTICO (NUEVO)
             analisis = await analizar_query_semantica(query, llm)
             tipo_busqueda = analisis.get("tipo", "VIBE")
             keywords = analisis.get("keywords", [])
             
-            # C. Filtrado de Candidatos
             locales_confirmados = []
             if tipo_busqueda == "PRODUCTO":
-                # MODO ESTRICTO: Solo pasan los que mencionan el producto
                 for local in locales_preliminares:
                     mask = df['restaurante'].str.lower() == local.lower()
                     if mask.any():
@@ -750,7 +766,6 @@ async def procesar_consulta(query, df, vectorstore, llm, ctx=None):
                                 locales_confirmados.append(local)
                                 break
             else:
-                # MODO VIBE: Confiamos en Pinecone
                 locales_confirmados = locales_preliminares
             
             locales_confirmados = locales_confirmados[:5]
@@ -758,7 +773,6 @@ async def procesar_consulta(query, df, vectorstore, llm, ctx=None):
             if not locales_confirmados:
                  return "No encontré lugares que coincidan con tu búsqueda en Neuquén.", "rag", None, [], [], ""
 
-            # D. Generar Cards (con switch de modo estricto)
             es_estricto = (tipo_busqueda == "PRODUCTO")
             
             cards = await obtener_restaurant_cards(
@@ -773,7 +787,6 @@ async def procesar_consulta(query, df, vectorstore, llm, ctx=None):
 
             locs = obtener_coordenadas(nombres_finales, df)
             
-            # E. PROMPT BLINDADO
             prefix = tone_system_instruction(tone)
             prompt_rag = (
                 f"{prefix}\n"
@@ -790,7 +803,7 @@ async def procesar_consulta(query, df, vectorstore, llm, ctx=None):
         except Exception as e:
             logger.error(f"Error RAG: {e}")
             return "Tuve un problema técnico buscando eso.", "rag", None, [], [], ""
-            
+
     return "No entendí bien qué buscás, ¿podés reformular?", "rag", None, [], [], ""
 
 # ==========================================
