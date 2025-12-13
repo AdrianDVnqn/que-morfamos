@@ -468,46 +468,83 @@ async def analizar_query_semantica(query, llm):
         return {"tipo": "VIBE", "keywords": [query.lower()]}
 
 def detectar_mencion_exacta(query, df):
+    """
+    1. Busca coincidencia exacta del nombre completo.
+    2. Si falla, busca coincidencia de la PRIMERA palabra del nombre.
+       PERO ignora palabras genéricas (ej: no matchea 'Sushi' solo porque existe 'Sushi Club').
+    """
     if df is None or df.empty: return None
     q_norm = query.lower().strip()
+    
+    # Palabras que NO deben disparar una búsqueda de nombre propio si están solas
+    generic_blocklist = {
+        "sushi", "pizza", "burger", "hamburguesa", "helado", "birra", 
+        "cerveza", "cafe", "café", "parrilla", "pasta", "milanesa", 
+        "ensalada", "comida", "postre", "resto", "bar"
+    }
+    
     stopwords_nombres = {"la", "el", "los", "las", "de", "del", "lo", "al"}
+    
     nombres = df['restaurante'].unique().tolist()
     nombres.sort(key=len, reverse=True)
     
+    # 1. BÚSQUEDA EXACTA (Nombre Completo) - Esta SIEMPRE gana
+    # Si existe un local llamado "Sushi" a secas, y el usuario escribe "Sushi", entra acá.
     for nombre in nombres:
         nombre_clean = nombre.lower().strip()
+        # Usamos borders de palabra para que "Mostaza" no matchee dentro de "Mostaza Shopping" incorrectamente
+        # pero para simplificar, el 'in' suele funcionar si ordenamos por largo.
         if nombre_clean in q_norm:
             return nombre
             
+    # 2. BÚSQUEDA POR PRIMERA PALABRA (Aproximación)
     for nombre in nombres:
         parts = nombre.lower().split()
         if not parts: continue
+        
         first_word = parts[0]
         if first_word in stopwords_nombres and len(parts) > 1:
             first_word = parts[1]
-        if len(first_word) > 3:
-            if first_word in q_norm:
+            
+        # Limpieza de caracteres raros (ej: "McDonald's" -> "mcdonalds")
+        first_word_clean = re.sub(r'[^\w\s]', '', first_word)
+
+        if len(first_word_clean) > 3:
+            # === EL CAMBIO CLAVE ===
+            # Si la "palabra distintiva" es genérica (ej: Sushi), la ignoramos.
+            # Así "lugares de sushi" no activa "Sushi Club".
+            if first_word_clean in generic_blocklist:
+                continue
+
+            # Verificamos si la palabra está en la query como palabra completa
+            # (Usamos regex para evitar que "Bar" matchee dentro de "Barato")
+            if re.search(r'\b' + re.escape(first_word_clean) + r'\b', q_norm):
                 return nombre 
+
     return None
 
 async def clasificar_intencion(query, llm, match_db=None):
     pista_contexto = ""
     if match_db:
         pista_contexto = (
-            f"⚠️ NOTA DE BASE DE DATOS: Existe un comercio llamado '{match_db}'. "
-            f"Si el usuario pregunta por '{match_db}', clasifícalo como 'SPECIFIC_INFO' y entity='{match_db}'."
+            f"⚠️ NOTA DE BASE DE DATOS: Existe un comercio registrado llamado '{match_db}'. "
+            f"PODRÍA ser que el usuario pregunte por él. "
+            f"PERO: Si la pregunta es sobre CANTIDAD ('cuántos', 'hay'), ignora este nombre y marca 'STATS'."
         )
 
     template = f"""
     Clasifica la intención del usuario. QUERY: "{{query}}"
     {pista_contexto}
 
+    PRIORIDAD DE REGLAS:
+    1. Si pregunta "cuántos", "cantidad", "total de", o "qué hay" (en sentido de existencia general) -> "STATS".
+    2. Si nombra un local específico (ver nota de DB) -> "SPECIFIC_INFO".
+    3. Si busca comida, tipo de plato o recomendación general -> "RECOMMENDATION".
+
     OPCIONES:
-    1. "STATS": El usuario pide cantidades, números o estadísticas.
-    2. "SPECIFIC_INFO": El usuario pregunta por un LUGAR específico (ej: "opiniones de Growler", "Atu Sushi").
-    3. "RECOMMENDATION": El usuario busca COMIDA o SUGERENCIAS generales.
-    
-    IMPORTANTE: Si el usuario pide un producto (ej: "helado") y NO nombra un local, es "RECOMMENDATION".
+    - "STATS": Cantidades, totales.
+    - "SPECIFIC_INFO": Info de un lugar específico.
+    - "RECOMMENDATION": Búsqueda de comida/vibes.
     
     Responde SOLO JSON: {{"intent": "...", "entity": "..."}} 
     """
