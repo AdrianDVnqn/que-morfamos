@@ -7,7 +7,7 @@ import logging
 import pandas as pd
 import numpy as np
 from typing import List, Optional
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
@@ -60,10 +60,23 @@ class RedisCacheManager:
             json_str = json.dumps(value_dict, ensure_ascii=False)
             self.client.set(full_key, json_str, ex=expire)
         except: pass
+    
+    # Nuevo método para manejar strings simples (para el ban)
+    def set_value(self, key, value, expire=None):
+        if not self.client: return
+        try:
+            self.client.set(key, value, ex=expire)
+        except: pass
+        
+    def get_value(self, key):
+        if not self.client: return None
+        try:
+            return self.client.get(key)
+        except: return None
 
 cache = RedisCacheManager(UPSTASH_REDIS_REST_URL, UPSTASH_REDIS_REST_TOKEN)
 
-app = FastAPI(title="Que Morfamos API (Semantic)", version="5.5.0")
+app = FastAPI(title="Que Morfamos API (Semantic)", version="5.6.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -225,9 +238,7 @@ def sanitize_tone(t):
 
 def tone_system_instruction(tone):
     tone = sanitize_tone(tone)
-    # Cambio sutil: definimos el ACENTO/ORIGEN del asistente, no su UBICACIÓN actual.
     base = "Sos un asistente gastronómico experto en Neuquén. Hablas con acento argentino/porteño."
-    
     if tone == 'cordial':
         return f'{base} Sos cordial, educado y respetuoso.'
     if tone == 'soberbio':
@@ -302,15 +313,13 @@ def seleccionar_mejor_review(df_local, topic_query=None):
     
     if sorted_df.empty: return None
 
-    # Lógica de RAG
     if topic_query:
         top_match = sorted_df.iloc[0]
         if top_match['score_topic'] > 0:
             if len(safe_str(top_match['texto'])) >= 4:
                 return top_match
-        return None # Si no hay match de topic
+        return None 
 
-    # Lógica de Info General
     candidatas = sorted_df[sorted_df['texto'].str.len() > 25] 
     if not candidatas.empty:
         return candidatas.iloc[0]
@@ -319,13 +328,18 @@ def seleccionar_mejor_review(df_local, topic_query=None):
 async def generar_descripcion_async(llm, nombre, sample, tone='cordial'):
     try:
         prefix = tone_system_instruction(tone)
-        prompt = f"{prefix}\nDescribe '{nombre}' en máx 15 palabras atractivas basado en: {sample}"
+        prompt = (
+            f"{prefix}\n"
+            f"CONTEXTO: El restaurante '{nombre}' queda en NEUQUÉN CAPITAL.\n"
+            f"Basado en estas reseñas: {sample}\n"
+            "Describe el lugar en máx 15 palabras atractivas.\n"
+            "IMPORTANTE: NO menciones 'Buenos Aires', asume siempre Neuquén."
+        )
         res = await llm.ainvoke(prompt)
         return res.content.strip().replace('"','')
     except:
         return "Restaurante popular en Neuquén."
 
-# === ACTUALIZACIÓN: OBTENER CARDS CON STRICT MODE ===
 async def obtener_restaurant_cards(nombres_restaurantes, df, llm, query_context=None, tone='cordial', strict_mode=True, keywords_list=None):
     cards = []
     tasks = [] 
@@ -341,21 +355,14 @@ async def obtener_restaurant_cards(nombres_restaurantes, df, llm, query_context=
             frase = ""
             autor = ""
             
-            # Buscamos review relevante
             best_review = seleccionar_mejor_review(rest_df, query_context)
             
-            # === PATOVICA DINÁMICO ===
             if query_context and strict_mode:
-                # MODO ESTRICTO (Para comidas): Si no hay mención, descartar.
                 if best_review is None:
                     continue
             elif query_context and not strict_mode:
-                # MODO FLEXIBLE (Para citas/vibes):
-                # Si no encontramos la palabra exacta "cita", NO descartamos.
-                # Usamos fallback a la mejor review general.
                 if best_review is None:
                     best_review = seleccionar_mejor_review(rest_df, None)
-            # ==========================
 
             if best_review is not None:
                 frase = safe_str(best_review['texto'])[:350] + "..."
@@ -396,15 +403,12 @@ async def obtener_restaurant_cards(nombres_restaurantes, df, llm, query_context=
             autor_reseña=safe_str(item['autor'])
         ))
         
-    # Reordenamiento por densidad (Usamos keywords_list si existe)
     if keywords_list and len(cards) > 1:
         def calcular_score_densidad(card):
             mask_rest = df['restaurante'] == card.nombre
-            # Unimos todo el texto para conteo rápido
             texto_gigante = " ".join(df[mask_rest]['texto'].fillna("").astype(str).str.lower())
             hits = 0
             for k in keywords_list: hits += texto_gigante.count(k)
-            # Suavizado +10
             return hits / (card.total_reviews + 10)
         
         cards.sort(key=calcular_score_densidad, reverse=True)
@@ -430,12 +434,7 @@ def obtener_restaurant_cards_simple(nombres_restaurantes, df):
 # 4. INTENCIÓN Y DETECCIÓN (BRAIN)
 # ==========================================
 
-# === NUEVO: ANÁLISIS SEMÁNTICO (PRODUCTO vs VIBE) ===
 async def analizar_query_semantica(query, llm):
-    """
-    Determina si la búsqueda es sobre un PRODUCTO (Filtro estricto) 
-    o una VIBE/OCASIÓN (Filtro flexible).
-    """
     cache_key = f"analysis_{query.lower().strip()}"
     cached = cache.get_json("analysis", cache_key)
     if cached: return cached
@@ -453,13 +452,11 @@ async def analizar_query_semantica(query, llm):
     
     Responde SOLO JSON: {{"tipo": "PRODUCTO" o "VIBE", "keywords": ["k1", "k2"]}}
     """
-    
     try:
         res = await llm.ainvoke(template)
         clean = res.content.strip().replace("```json", "").replace("```", "")
         data = json.loads(clean)
         
-        # Agregamos la query original a las keywords
         if query.lower().strip() not in data['keywords']:
             data['keywords'].insert(0, query.lower().strip())
             
@@ -467,86 +464,51 @@ async def analizar_query_semantica(query, llm):
         return data
     except Exception as e:
         logger.error(f"Error analisis semantico: {e}")
-        # Ante la duda, asumimos VIBE para no filtrar de más
         return {"tipo": "VIBE", "keywords": [query.lower()]}
 
 def detectar_mencion_exacta(query, df):
-    """
-    Intenta detectar si el usuario nombró un local, manejando variaciones como:
-    - Nombre completo: "Restaurante El Ciervo"
-    - Nombre núcleo: "El Ciervo" (sin el prefijo 'Restaurante')
-    - Nombre corto: "Ciervo" (sin artículos, con cuidado de blacklists)
-    """
     if df is None or df.empty: return None
     q_norm = query.lower().strip()
     
-    # 1. Lista de tipos de local para ignorar (Prefijos)
     venue_prefixes = {
         "restaurante", "parrilla", "bar", "confiteria", "pizzeria", "bodegon", 
         "cerveceria", "hamburgueseria", "heladeria", "cafe", "bistro", "resto", 
         "rotiseria", "panaderia", "sushi", "casa"
     }
-    
-    # 2. Artículos / Conectores para ignorar en la búsqueda de "palabra única"
     stopwords = {"el", "la", "los", "las", "de", "del", "lo", "al", "y", "en"}
-    
-    # 3. Lista negra de palabras que, si quedan solas, NO son un local
-    # (Ej: Si un local se llama "La Comida", y queda "Comida", no queremos matchear).
     generic_blocklist = {
         "sushi", "pizza", "burger", "hamburguesa", "helado", "birra", 
         "cerveza", "cafe", "café", "parrilla", "pasta", "milanesa", 
         "ensalada", "comida", "postre", "resto", "bar", "almuerzo", "cena",
-        "ciervo", "trucha", "cordero" # Agregamos carnes comunes si hay riesgo
+        "ciervo", "trucha", "cordero"
     }
-    # NOTA: "ciervo" está en blacklist por si buscan el animal, 
-    # PERO la lógica de "Nombre Núcleo" (abajo) salvará a "El Ciervo".
 
     nombres = df['restaurante'].unique().tolist()
-    # Ordenamos por largo para priorizar "El Ciervo" sobre "Ciervo"
     nombres.sort(key=len, reverse=True)
 
     for nombre_real in nombres:
         nombre_lower = nombre_real.lower().strip()
-        
-        # --- ESTRATEGIA A: Coincidencia Exacta del DB ---
         if nombre_lower in q_norm:
             return nombre_real
 
-        # --- ESTRATEGIA B: Coincidencia del "Nombre Núcleo" (Sin Restaurante/Parrilla) ---
-        # Ej: "Restaurante El Ciervo" -> "El Ciervo"
         parts = nombre_lower.split()
-        
-        # Filtramos los prefijos de tipo de local
         core_parts = [p for p in parts if re.sub(r'[^\w]', '', p) not in venue_prefixes]
+        if not core_parts: continue 
+        core_name = " ".join(core_parts) 
         
-        if not core_parts: continue # Si el local se llamaba "Restaurante", lo saltamos
-        
-        core_name = " ".join(core_parts) # "el ciervo"
-        
-        # Verificamos si el núcleo está en la query (con bordes de palabra)
-        # Usamos regex para que "el ciervo" matchee "que tal es el ciervo"
         if len(core_name) > 2:
             pattern = r'(?<!\w)' + re.escape(core_name) + r'(?!\w)'
             if re.search(pattern, q_norm):
                 return nombre_real
 
-        # --- ESTRATEGIA C: Coincidencia de Palabra Distintiva ---
-        # Ej: "El Ciervo" -> "Ciervo" (Solo si no está en blacklist)
-        # Esto sirve para "Vamos a Growler" (Nombre real: Growler Station)
-        
-        # Quitamos stopwords del núcleo
         distinctive_parts = [p for p in core_parts if p not in stopwords]
-        
         if distinctive_parts:
-            dist_name = distinctive_parts[0] # Tomamos la primera palabra fuerte
+            dist_name = distinctive_parts[0] 
             dist_clean = re.sub(r'[^\w]', '', dist_name)
-            
-            # Solo si es una palabra larga y NO es genérica
             if len(dist_clean) > 3 and dist_clean not in generic_blocklist:
                 pattern_dist = r'(?<!\w)' + re.escape(dist_clean) + r'(?!\w)'
                 if re.search(pattern_dist, q_norm):
                     return nombre_real
-
     return None
 
 async def clasificar_intencion(query, llm, match_db=None):
@@ -564,8 +526,8 @@ async def clasificar_intencion(query, llm, match_db=None):
     OPCIONES:
     1. "STATS": El usuario pide cantidades, números o estadísticas.
     2. "SPECIFIC_INFO": El usuario pregunta por un LUGAR específico (ej: "opiniones de Growler", "Atu Sushi").
-    3. "RECOMMENDATION": El usuario busca COMIDA, LUGAR o SUGERENCIAS gastronómicas (ej: "dónde comer helado", "lugar para cita", "barato").
-    4. "IRRELEVANT": La consulta es incoherente, ofensiva, no tiene sentido semántico, o NO tiene relación con comida/restaurantes/salidas en Neuquén (ej: "precio del dolar", "comer personas", "asdasd", "quien es messi").
+    3. "RECOMMENDATION": El usuario busca COMIDA, LUGAR o SUGERENCIAS gastronómicas.
+    4. "IRRELEVANT": La consulta es incoherente, ofensiva, no tiene sentido semántico, o NO tiene relación con comida/restaurantes/salidas en Neuquén.
 
     Responde SOLO JSON: {{"intent": "...", "entity": "..."}} 
     """
@@ -575,8 +537,6 @@ async def clasificar_intencion(query, llm, match_db=None):
         clean_json = res_str.strip().replace("```json", "").replace("```", "")
         return json.loads(clean_json)
     except:
-        # Ante la duda, si falla el JSON, lo mandamos a RAG por si acaso, 
-        # o podés poner "IRRELEVANT" si preferís ser conservador.
         return {"intent": "RECOMMENDATION", "entity": None}
 
 async def consultar_estadisticas(query, df, llm):
@@ -656,9 +616,18 @@ async def resumir_opiniones_local(query_str, df, llm, topic=None, tone='cordial'
     
     contexto_tema = f"El usuario pregunta específicamente sobre: '{topic}'. Resalta eso." if topic else ""
     tone_prefix = tone_system_instruction(tone)
-    tpl = f"""{tone_prefix}\nAnaliza: {{rest}}. Rating: {{rat}}. {contexto_tema}
-    Reviews: {{revs}}
-    Generá resumen Markdown (Argentino):
+    # CORRECCIÓN: Inyectamos el contexto geográfico en el template del detalle también
+    tpl = f"""{tone_prefix}\n
+    Analiza el restaurante: {{rest}} (Ubicado en NEUQUÉN CAPITAL).
+    Rating: {{rat}}. 
+    {contexto_tema}
+    
+    Reviews de usuarios: {{revs}}
+    
+    Generá un resumen en Markdown con acento Argentino.
+    REGLA: NO digas que está en Buenos Aires. Es Neuquén.
+    
+    Estructura:
     ## 📊 La onda
     ## 👍 Lo bueno
     ## 💡 A mejorar
@@ -678,47 +647,79 @@ async def resumir_opiniones_local(query_str, df, llm, topic=None, tone='cordial'
 # ==========================================
 # 5. ROUTER PRINCIPAL (ROUTER)
 # ==========================================
-async def procesar_consulta(query, df, vectorstore, llm, ctx=None):
+async def procesar_consulta(query, df, vectorstore, llm, ctx=None, user_ip=None):
     if ctx is None: ctx = {}
     tone = sanitize_tone(ctx.get('tone'))
     
-    # 0. VERIFICACIÓN DE "BANEO" (Strike System)
-    # Leemos el contador de strikes del contexto (si no existe, es 0)
+    # 0. VERIFICACIÓN DE "BANEO" POR IP (Redis)
+    # Si la IP está baneada en Redis, rechazamos directo.
+    if user_ip:
+        ban_key = f"ban:{user_ip}"
+        is_banned = cache.get_value(ban_key)
+        if is_banned:
+             return "⛔ Sistema bloqueado temporalmente. Intente más tarde.", "blocked", None, [], [], ""
+
+    # 0.1 VERIFICACIÓN DE "STRIKES" DE SESIÓN
     strikes = ctx.get('strikes', 0)
-    
     if strikes >= 5:
+        # Si llega a 5, baneamos la IP en Redis por 2 horas (7200 segundos)
+        if user_ip:
+            ban_key = f"ban:{user_ip}"
+            cache.set_value(ban_key, "true", expire=7200)
+            logger.warning(f"🚫 IP BANEADA POR 2HS: {user_ip}")
+        
         return "⛔ Sistema bloqueado por consultas incoherentes. Refrescá la página para empezar de nuevo.", "blocked", None, [], [], ""
 
-    # 1. CONTEXTO NUMÉRICO (Igual que antes...)
+    # 1. CONTEXTO NUMÉRICO
     if 'pending_options' in ctx and query.strip().isdigit():
-        # ... (código existente) ...
-        # (Asegurate de devolver el contexto actualizado en el return de este bloque también si fuera necesario, 
-        # pero por ahora lo dejamos simple).
-        pass 
+        num = int(query.strip())
+        pending = ctx['pending_options']
+        opciones = pending.get('options', []) if isinstance(pending, dict) else pending
+        if 1 <= num <= len(opciones):
+            seleccion = opciones[num - 1]
+            ctx['last_entity'] = seleccion
+            original_topic = ctx.get('original_query', seleccion) 
+            resp, nombre_real, det, _ = await resumir_opiniones_local(
+                seleccion, df, llm, original_topic, tone, es_seleccion_directa=True
+            )
+            cards = await obtener_restaurant_cards([nombre_real], df, llm, original_topic, tone)
+            locs = obtener_coordenadas([nombre_real], df)
+            return resp, "resumen", None, locs, cards, det
+        return f"Elegí entre 1 y {len(opciones)}", "resumen", pending, [], [], ""
 
-    # 2. PRE-SCAN (Igual que antes...)
+    # 2. PRE-SCAN
     posible_match = detectar_mencion_exacta(query, df)
 
-    # ... (Detección de stats igual que antes) ...
-    # Supongamos que llegamos a la clasificación LLM
-    
+    # === REGLA DURA PARA ESTADÍSTICAS ===
+    stats_triggers = ["cuantos", "cuántos", "cantidad", "total de", "numero de", "número de"]
+    es_pregunta_stats = any(trigger in query.lower() for trigger in stats_triggers)
+
     # 3. CLASIFICACIÓN
+    intent = ""
+    entity = None
+
     if es_pregunta_stats:
         intent = "STATS"
         entity = None
+        logger.info(f"🧠 Router: STATS (Detectado por palabras clave)")
     else:
         clasificacion = await clasificar_intencion(query, llm, match_db=posible_match)
         intent = clasificacion.get("intent")
         entity = clasificacion.get("entity")
+        logger.info(f"🧠 Router: {intent} | Entity: {entity} | DB Match: {posible_match}")
 
     # === BLOQUE DE INCOHERENCIAS (Strike +1) ===
     if intent == "IRRELEVANT":
-        # Aumentamos el contador
         strikes += 1
-        ctx['strikes'] = strikes # Actualizamos el contexto
+        ctx['strikes'] = strikes 
         
+        # Chequeo inmediato para banear si este fue el 5to strike
         if strikes >= 5:
-            return "⛔ Has alcanzado el límite de preguntas fuera de tópico. Refrescá para reiniciar.", "blocked", None, [], [], ""
+             if user_ip:
+                ban_key = f"ban:{user_ip}"
+                cache.set_value(ban_key, "true", expire=7200)
+                logger.warning(f"🚫 IP BANEADA POR 2HS: {user_ip}")
+             return "⛔ Has alcanzado el límite de preguntas fuera de tópico. Refrescá para reiniciar.", "blocked", None, [], [], ""
             
         mensajes_error = [
             f"Mmm, no entendí. Preguntame sobre comida. (Advertencia {strikes}/5)",
@@ -727,10 +728,8 @@ async def procesar_consulta(query, df, vectorstore, llm, ctx=None):
         ]
         import random
         rta = random.choice(mensajes_error)
-        
-        # Devolvemos la respuesta y el contexto actualizado con el strike nuevo
         return rta, "rag", None, [], [], ""
-    
+
     # 4. OVERRIDE
     if intent == "RECOMMENDATION" and posible_match:
         logger.info(f"🔄 Override: LLM dijo Recommendation, pero '{posible_match}' es un local real.")
@@ -739,14 +738,11 @@ async def procesar_consulta(query, df, vectorstore, llm, ctx=None):
 
     # 5. STATS
     if intent == "STATS":
-        # ... (Tu código existente de stats) ...
         resp, locales = await consultar_estadisticas(query, df, llm)
         cards = obtener_restaurant_cards_simple(locales, df)
         locs = obtener_coordenadas(locales, df)
         return resp, "estadisticas", None, locs, cards, ""
 
-    # ... (El resto de las intenciones INFO ESPECIFICA y RAG siguen igual) ...
-    
     # 6. INFO ESPECÍFICA
     if intent == "SPECIFIC_INFO":
         target = entity
@@ -770,8 +766,6 @@ async def procesar_consulta(query, df, vectorstore, llm, ctx=None):
 
     # 7. RAG (RECOMENDACIÓN BLINDADA)
     if intent == "RECOMMENDATION":
-        # ... (Tu bloque RAG actualizado que te pasé antes con analizar_query_semantica) ...
-        # (Asegúrate de mantener el bloque RAG que te pasé en la respuesta anterior)
         try:
             docs = vectorstore.similarity_search(query, k=25)
             seen = set()
@@ -834,7 +828,7 @@ async def procesar_consulta(query, df, vectorstore, llm, ctx=None):
         except Exception as e:
             logger.error(f"Error RAG: {e}")
             return "Tuve un problema técnico buscando eso.", "rag", None, [], [], ""
-
+            
     return "No entendí bien qué buscás, ¿podés reformular?", "rag", None, [], [], ""
 
 # ==========================================
@@ -842,7 +836,7 @@ async def procesar_consulta(query, df, vectorstore, llm, ctx=None):
 # ==========================================
 
 @app.get("/")
-def read_root(): return {"status": "online", "message": "API OK v5.5"}
+def read_root(): return {"status": "online", "message": "API OK v5.6"}
 
 @app.get("/health")
 def health_check(): return {"status": "healthy", "df_size": len(df) if df is not None else 0}
@@ -904,11 +898,15 @@ async def get_restaurant_detail(nombre: str, topic: Optional[str] = None, tone: 
     )
 
 @app.post("/chat", response_model=QueryResponse)
-async def chat(req: QueryRequest):
+async def chat(req: QueryRequest, request: Request):
     try:
         ctx = req.conversation_context.copy() if req.conversation_context else {}
         if req.tone: ctx['tone'] = sanitize_tone(req.tone)
-        resp, mode, pend, locs, cards, det = await procesar_consulta(req.query, df, vectorstore, llm, ctx)
+        
+        # Obtenemos IP del cliente
+        client_ip = request.client.host
+        
+        resp, mode, pend, locs, cards, det = await procesar_consulta(req.query, df, vectorstore, llm, ctx, user_ip=client_ip)
         
         new_ctx = ctx.copy() if ctx else {}
         if pend: new_ctx['pending_options'] = pend
