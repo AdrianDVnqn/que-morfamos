@@ -61,7 +61,6 @@ class RedisCacheManager:
             self.client.set(full_key, json_str, ex=expire)
         except: pass
     
-    # Nuevo método para manejar strings simples (para el ban)
     def set_value(self, key, value, expire=None):
         if not self.client: return
         try:
@@ -76,7 +75,7 @@ class RedisCacheManager:
 
 cache = RedisCacheManager(UPSTASH_REDIS_REST_URL, UPSTASH_REDIS_REST_TOKEN)
 
-app = FastAPI(title="Que Morfamos API (Semantic)", version="5.6.0")
+app = FastAPI(title="Que Morfamos API (Semantic)", version="5.8.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -476,13 +475,10 @@ def detectar_mencion_exacta(query, df):
         "rotiseria", "panaderia", "sushi", "casa"
     }
     stopwords = {"el", "la", "los", "las", "de", "del", "lo", "al", "y", "en"}
-    generic_blocklist = {
-        "sushi", "pizza", "burger", "hamburguesa", "helado", "birra", 
-        "cerveza", "cafe", "café", "parrilla", "pasta", "milanesa", 
-        "ensalada", "comida", "postre", "resto", "bar", "almuerzo", "cena",
-        "ciervo", "trucha", "cordero"
-    }
-
+    # NOTA: Eliminamos la blacklist genérica que bloqueaba "sushi" o "ciervo"
+    # Ahora confiamos en que si el usuario escribe el nombre, es el local.
+    # Si escribe "sushi" a secas, y existe "Sushi", el LLM decidirá si es el local o comida.
+    
     nombres = df['restaurante'].unique().tolist()
     nombres.sort(key=len, reverse=True)
 
@@ -505,7 +501,8 @@ def detectar_mencion_exacta(query, df):
         if distinctive_parts:
             dist_name = distinctive_parts[0] 
             dist_clean = re.sub(r'[^\w]', '', dist_name)
-            if len(dist_clean) > 3 and dist_clean not in generic_blocklist:
+            # Quitamos el chequeo de generic_blocklist para que "El Ciervo" pase
+            if len(dist_clean) > 3: 
                 pattern_dist = r'(?<!\w)' + re.escape(dist_clean) + r'(?!\w)'
                 if re.search(pattern_dist, q_norm):
                     return nombre_real
@@ -515,19 +512,27 @@ async def clasificar_intencion(query, llm, match_db=None):
     pista_contexto = ""
     if match_db:
         pista_contexto = (
-            f"⚠️ NOTA CRÍTICA: He detectado que el usuario menciona EXACTAMENTE el nombre de un local: '{match_db}'. "
-            f"Aunque '{match_db}' parezca un nombre de comida o animal, DEBES clasificarlo como 'SPECIFIC_INFO'."
+            f"⚠️ DATO: Existe un comercio real llamado '{match_db}'. "
+            f"Si el query coincide, prioriza 'SPECIFIC_INFO'. "
         )
 
     template = f"""
-    Clasifica la intención del usuario. QUERY: "{{query}}"
+    Actúa como un MODERADOR y Clasificador de intenciones para una App de Restaurantes en Neuquén.
+    
+    QUERY DEL USUARIO: "{{query}}"
     {pista_contexto}
 
-    OPCIONES:
-    1. "STATS": El usuario pide cantidades, números o estadísticas.
-    2. "SPECIFIC_INFO": El usuario pregunta por un LUGAR específico (ej: "opiniones de Growler", "Atu Sushi").
-    3. "RECOMMENDATION": El usuario busca COMIDA, LUGAR o SUGERENCIAS gastronómicas.
-    4. "IRRELEVANT": La consulta es incoherente, ofensiva, no tiene sentido semántico, o NO tiene relación con comida/restaurantes/salidas en Neuquén.
+    Tu misión es proteger al sistema de consultas basura y clasificar las válidas.
+    
+    REGLAS DE SEGURIDAD (PRIORIDAD MÁXIMA):
+    - Si el query contiene términos sexuales, genitales, insultos, violencia o incoherencias (ej: "tetas", "pito", "travestis", "culo", "matar", "asdasd"), DEBES responder "IRRELEVANT".
+    - NO intentes interpretar metáforas culinarias forzadas. Si dice "pene", es IRRELEVANT, no busques salchichas.
+    - Temas no gastronómicos (dólar, clima, fútbol, política) -> IRRELEVANT.
+
+    SI PASA EL FILTRO, CLASIFICA ASÍ:
+    1. "STATS": Pregunta por cantidades o totales ("cuántos hay", "total de pizzerías").
+    2. "SPECIFIC_INFO": Pregunta por un lugar específico ("opiniones de Antares", "Mostaza").
+    3. "RECOMMENDATION": Busca comida, antojos o tipos de lugar ("hamburguesa", "lugar romántico", "sushi", "merienda").
 
     Responde SOLO JSON: {{"intent": "...", "entity": "..."}} 
     """
@@ -616,7 +621,7 @@ async def resumir_opiniones_local(query_str, df, llm, topic=None, tone='cordial'
     
     contexto_tema = f"El usuario pregunta específicamente sobre: '{topic}'. Resalta eso." if topic else ""
     tone_prefix = tone_system_instruction(tone)
-    # CORRECCIÓN: Inyectamos el contexto geográfico en el template del detalle también
+    
     tpl = f"""{tone_prefix}\n
     Analiza el restaurante: {{rest}} (Ubicado en NEUQUÉN CAPITAL).
     Rating: {{rat}}. 
@@ -652,7 +657,6 @@ async def procesar_consulta(query, df, vectorstore, llm, ctx=None, user_ip=None)
     tone = sanitize_tone(ctx.get('tone'))
     
     # 0. VERIFICACIÓN DE "BANEO" POR IP (Redis)
-    # Si la IP está baneada en Redis, rechazamos directo.
     if user_ip:
         ban_key = f"ban:{user_ip}"
         is_banned = cache.get_value(ban_key)
@@ -662,7 +666,6 @@ async def procesar_consulta(query, df, vectorstore, llm, ctx=None, user_ip=None)
     # 0.1 VERIFICACIÓN DE "STRIKES" DE SESIÓN
     strikes = ctx.get('strikes', 0)
     if strikes >= 5:
-        # Si llega a 5, baneamos la IP en Redis por 2 horas (7200 segundos)
         if user_ip:
             ban_key = f"ban:{user_ip}"
             cache.set_value(ban_key, "true", expire=7200)
@@ -690,11 +693,10 @@ async def procesar_consulta(query, df, vectorstore, llm, ctx=None, user_ip=None)
     # 2. PRE-SCAN
     posible_match = detectar_mencion_exacta(query, df)
 
-    # === REGLA DURA PARA ESTADÍSTICAS ===
+    # 3. REGLA DURA PARA ESTADÍSTICAS
     stats_triggers = ["cuantos", "cuántos", "cantidad", "total de", "numero de", "número de"]
     es_pregunta_stats = any(trigger in query.lower() for trigger in stats_triggers)
 
-    # 3. CLASIFICACIÓN
     intent = ""
     entity = None
 
@@ -703,6 +705,7 @@ async def procesar_consulta(query, df, vectorstore, llm, ctx=None, user_ip=None)
         entity = None
         logger.info(f"🧠 Router: STATS (Detectado por palabras clave)")
     else:
+        # CLASIFICACIÓN LLM (FILTRO SEMÁNTICO)
         clasificacion = await clasificar_intencion(query, llm, match_db=posible_match)
         intent = clasificacion.get("intent")
         entity = clasificacion.get("entity")
@@ -713,7 +716,6 @@ async def procesar_consulta(query, df, vectorstore, llm, ctx=None, user_ip=None)
         strikes += 1
         ctx['strikes'] = strikes 
         
-        # Chequeo inmediato para banear si este fue el 5to strike
         if strikes >= 5:
              if user_ip:
                 ban_key = f"ban:{user_ip}"
@@ -836,7 +838,7 @@ async def procesar_consulta(query, df, vectorstore, llm, ctx=None, user_ip=None)
 # ==========================================
 
 @app.get("/")
-def read_root(): return {"status": "online", "message": "API OK v5.6"}
+def read_root(): return {"status": "online", "message": "API OK v5.8"}
 
 @app.get("/health")
 def health_check(): return {"status": "healthy", "df_size": len(df) if df is not None else 0}
