@@ -449,28 +449,34 @@ async def analizar_query_semantica(query, llm):
     cached = cache.get_json("analysis", cache_key)
     if cached: return cached
 
-    # Prompt agresivo para detectar malas intenciones en el segundo paso
     template = """
-    Analiza la intención del usuario para una app de restaurantes FAMILIAR.
+    Analiza la query del usuario para búsqueda en base de datos de restaurantes.
     Query: "{query}"
     
-    1. SEGURIDAD (CRÍTICO): 
-       - Si la query contiene términos sexuales, insultos, violencia, o conceptos grotescos (ej: "pene", "travestis", "tetas", "caca", "matar"), MARCA "tipo": "BLOCK".
-       - No busques metáforas culinarias para palabras sucias. Si dice "pito", es BLOCK.
+    PASO 1: SEGURIDAD (Veto)
+    - Si la query es OFENSIVA/SEXUAL/GROTESCA (ej: "tetas", "pito", "travesti", "caca", "sexo"), marca "tipo": "BLOCK".
+    - EXCEPCIONES VÁLIDAS (NO BLOQUEAR): "Pechuga", "Cerveza", "Chorizo", "Salchicha", "Huevos".
+    - CONTEXTO SOCIAL VÁLIDO (NO BLOQUEAR): "Citas", "Romántico", "Niños", "Chicos", "Infancias", "Gente mayor".
     
-    2. Si es seguro, clasifica:
-       - "PRODUCTO": Comida/ingrediente específico.
-       - "VIBE": Ambiente/ocasión.
+    PASO 2: CLASIFICACIÓN (Si no es Block)
+    - "PRODUCTO": Busca un plato o ingrediente concreto (Pizza, Sushi, Birra, Flan).
+    - "VIBE": Busca un estilo, ocasión o público específico (Romántico, Familiar, Para ir con chicos, Gente mayor, Barato, Lindo).
     
-    Responde SOLO JSON: {{"tipo": "PRODUCTO" | "VIBE" | "BLOCK", "keywords": ["k1"]}}
+    Responde SOLO JSON: {{"tipo": "PRODUCTO" | "VIBE" | "BLOCK", "keywords": ["k1", "k2"]}}
     """
     try:
         res = await llm.ainvoke(template)
         clean = res.content.strip().replace("```json", "").replace("```", "")
         data = json.loads(clean)
+        
+        if query.lower().strip() not in data.get('keywords', []):
+            if 'keywords' not in data: data['keywords'] = []
+            data['keywords'].insert(0, query.lower().strip())
+            
         cache.set_json("analysis", cache_key, data)
         return data
     except Exception as e:
+        # Fallback seguro: VIBE para no filtrar de más
         return {"tipo": "VIBE", "keywords": [query.lower()]}
 
 def detectar_mencion_exacta(query, df):
@@ -530,19 +536,29 @@ async def clasificar_intencion(query, llm, match_db=None):
         )
 
     template = f"""
-    Eres el MODERADOR de seguridad de una App de Restaurantes.
+    Eres el clasificador de intenciones de una App Gastronómica en Neuquén.
     Query: "{{query}}"
     {pista_contexto}
 
-    REGLAS DE ORO (SEGURIDAD):
-    1. Si la query contiene términos sexuales (vulgares o anatómicos como "pito", "tetas", "pene", "culo", "travesti"), insultos, violencia o discriminación -> RESPONDE "IRRELEVANT".
-    2. NO seas creativo. "Tetas" NO es comida. "Travestis" NO es una categoría.
-    3. Si la query no tiene nada que ver con comida (ej: "precio dolar", "futbol") -> RESPONDE "IRRELEVANT".
+    TU MISIÓN: Distinguir pedidos de comida/salidas reales de basura/ofensas.
 
-    Si pasa el filtro:
-    - "STATS": Cantidades/totales.
-    - "SPECIFIC_INFO": Lugar específico.
-    - "RECOMMENDATION": Búsqueda de comida.
+    ✅ LO PERMITIDO (WHITELIST - DEJAR PASAR):
+    - Todo tipo de COMIDA: Pizzas, hamburguesas, sushi, milanesas, postres, etc.
+    - Todo tipo de BEBIDA: Cerveza, birra, vino, tragos, café (EL ALCOHOL ES VÁLIDO).
+    - Tipos de LUGAR: Bares, boliches, restaurantes, parrillas, carritos.
+    - AMBIENTE y PÚBLICO: Citas románticas, salir con chicos/infancias, lugares para gente mayor, familias, amigos, primera cita.
+
+    ❌ LO PROHIBIDO (BLACKLIST - BLOQUEAR):
+    - Términos SEXUALES explícitos o vulgares (pito, tetas, culo, travesti, sexo explícito).
+    - VIOLENCIA, insultos, odio, racismo.
+    - Temas NO relacionados a salidas/comida (política, fútbol, clima, dólar).
+    - INCOHERENCIAS totales (ej: "asdasd", "jklñ").
+
+    CLASIFICACIÓN:
+    1. "STATS": Pregunta cantidades ("cuántos hay").
+    2. "SPECIFIC_INFO": Pregunta por un lugar con Nombre Propio ("Antares", "Mostaza").
+    3. "RECOMMENDATION": Busca comida, bebida, recomendación general o ambiente ("mejores pizzas", "donde ir con abuelos", "lugar para niños").
+    4. "IRRELEVANT": Cae en la BLACKLIST o no tiene sentido.
 
     Responde SOLO JSON: {{"intent": "...", "entity": "..."}} 
     """
@@ -552,7 +568,7 @@ async def clasificar_intencion(query, llm, match_db=None):
         clean_json = res_str.strip().replace("```json", "").replace("```", "")
         return json.loads(clean_json)
     except:
-        return {"intent": "IRRELEVANT", "entity": None}
+        return {"intent": "RECOMMENDATION", "entity": None}
 
 async def consultar_estadisticas(query, df, llm):
     """ USA LLM_MINI """
