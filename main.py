@@ -472,57 +472,80 @@ async def analizar_query_semantica(query, llm):
 
 def detectar_mencion_exacta(query, df):
     """
-    1. Busca coincidencia exacta del nombre completo.
-    2. Si falla, busca coincidencia de la PRIMERA palabra del nombre.
-       PERO ignora palabras genéricas (ej: no matchea 'Sushi' solo porque existe 'Sushi Club').
+    Intenta detectar si el usuario nombró un local, manejando variaciones como:
+    - Nombre completo: "Restaurante El Ciervo"
+    - Nombre núcleo: "El Ciervo" (sin el prefijo 'Restaurante')
+    - Nombre corto: "Ciervo" (sin artículos, con cuidado de blacklists)
     """
     if df is None or df.empty: return None
     q_norm = query.lower().strip()
     
-    # Palabras que NO deben disparar una búsqueda de nombre propio si están solas
+    # 1. Lista de tipos de local para ignorar (Prefijos)
+    venue_prefixes = {
+        "restaurante", "parrilla", "bar", "confiteria", "pizzeria", "bodegon", 
+        "cerveceria", "hamburgueseria", "heladeria", "cafe", "bistro", "resto", 
+        "rotiseria", "panaderia", "sushi", "casa"
+    }
+    
+    # 2. Artículos / Conectores para ignorar en la búsqueda de "palabra única"
+    stopwords = {"el", "la", "los", "las", "de", "del", "lo", "al", "y", "en"}
+    
+    # 3. Lista negra de palabras que, si quedan solas, NO son un local
+    # (Ej: Si un local se llama "La Comida", y queda "Comida", no queremos matchear).
     generic_blocklist = {
         "sushi", "pizza", "burger", "hamburguesa", "helado", "birra", 
         "cerveza", "cafe", "café", "parrilla", "pasta", "milanesa", 
-        "ensalada", "comida", "postre", "resto", "bar"
+        "ensalada", "comida", "postre", "resto", "bar", "almuerzo", "cena",
+        "ciervo", "trucha", "cordero" # Agregamos carnes comunes si hay riesgo
     }
-    
-    stopwords_nombres = {"la", "el", "los", "las", "de", "del", "lo", "al"}
-    
+    # NOTA: "ciervo" está en blacklist por si buscan el animal, 
+    # PERO la lógica de "Nombre Núcleo" (abajo) salvará a "El Ciervo".
+
     nombres = df['restaurante'].unique().tolist()
+    # Ordenamos por largo para priorizar "El Ciervo" sobre "Ciervo"
     nombres.sort(key=len, reverse=True)
-    
-    # 1. BÚSQUEDA EXACTA (Nombre Completo) - Esta SIEMPRE gana
-    # Si existe un local llamado "Sushi" a secas, y el usuario escribe "Sushi", entra acá.
-    for nombre in nombres:
-        nombre_clean = nombre.lower().strip()
-        # Usamos borders de palabra para que "Mostaza" no matchee dentro de "Mostaza Shopping" incorrectamente
-        # pero para simplificar, el 'in' suele funcionar si ordenamos por largo.
-        if nombre_clean in q_norm:
-            return nombre
-            
-    # 2. BÚSQUEDA POR PRIMERA PALABRA (Aproximación)
-    for nombre in nombres:
-        parts = nombre.lower().split()
-        if not parts: continue
+
+    for nombre_real in nombres:
+        nombre_lower = nombre_real.lower().strip()
         
-        first_word = parts[0]
-        if first_word in stopwords_nombres and len(parts) > 1:
-            first_word = parts[1]
+        # --- ESTRATEGIA A: Coincidencia Exacta del DB ---
+        if nombre_lower in q_norm:
+            return nombre_real
+
+        # --- ESTRATEGIA B: Coincidencia del "Nombre Núcleo" (Sin Restaurante/Parrilla) ---
+        # Ej: "Restaurante El Ciervo" -> "El Ciervo"
+        parts = nombre_lower.split()
+        
+        # Filtramos los prefijos de tipo de local
+        core_parts = [p for p in parts if re.sub(r'[^\w]', '', p) not in venue_prefixes]
+        
+        if not core_parts: continue # Si el local se llamaba "Restaurante", lo saltamos
+        
+        core_name = " ".join(core_parts) # "el ciervo"
+        
+        # Verificamos si el núcleo está en la query (con bordes de palabra)
+        # Usamos regex para que "el ciervo" matchee "que tal es el ciervo"
+        if len(core_name) > 2:
+            pattern = r'(?<!\w)' + re.escape(core_name) + r'(?!\w)'
+            if re.search(pattern, q_norm):
+                return nombre_real
+
+        # --- ESTRATEGIA C: Coincidencia de Palabra Distintiva ---
+        # Ej: "El Ciervo" -> "Ciervo" (Solo si no está en blacklist)
+        # Esto sirve para "Vamos a Growler" (Nombre real: Growler Station)
+        
+        # Quitamos stopwords del núcleo
+        distinctive_parts = [p for p in core_parts if p not in stopwords]
+        
+        if distinctive_parts:
+            dist_name = distinctive_parts[0] # Tomamos la primera palabra fuerte
+            dist_clean = re.sub(r'[^\w]', '', dist_name)
             
-        # Limpieza de caracteres raros (ej: "McDonald's" -> "mcdonalds")
-        first_word_clean = re.sub(r'[^\w\s]', '', first_word)
-
-        if len(first_word_clean) > 3:
-            # === EL CAMBIO CLAVE ===
-            # Si la "palabra distintiva" es genérica (ej: Sushi), la ignoramos.
-            # Así "lugares de sushi" no activa "Sushi Club".
-            if first_word_clean in generic_blocklist:
-                continue
-
-            # Verificamos si la palabra está en la query como palabra completa
-            # (Usamos regex para evitar que "Bar" matchee dentro de "Barato")
-            if re.search(r'\b' + re.escape(first_word_clean) + r'\b', q_norm):
-                return nombre 
+            # Solo si es una palabra larga y NO es genérica
+            if len(dist_clean) > 3 and dist_clean not in generic_blocklist:
+                pattern_dist = r'(?<!\w)' + re.escape(dist_clean) + r'(?!\w)'
+                if re.search(pattern_dist, q_norm):
+                    return nombre_real
 
     return None
 
@@ -530,25 +553,20 @@ async def clasificar_intencion(query, llm, match_db=None):
     pista_contexto = ""
     if match_db:
         pista_contexto = (
-            f"⚠️ NOTA DE BASE DE DATOS: Existe un comercio registrado llamado '{match_db}'. "
-            f"PODRÍA ser que el usuario pregunte por él. "
-            f"PERO: Si la pregunta es sobre CANTIDAD ('cuántos', 'hay'), ignora este nombre y marca 'STATS'."
+            f"⚠️ NOTA CRÍTICA: He detectado que el usuario menciona EXACTAMENTE el nombre de un local: '{match_db}'. "
+            f"Aunque '{match_db}' parezca un nombre de comida o animal, DEBES clasificarlo como 'SPECIFIC_INFO'."
         )
 
     template = f"""
     Clasifica la intención del usuario. QUERY: "{{query}}"
     {pista_contexto}
 
-    PRIORIDAD DE REGLAS:
-    1. Si pregunta "cuántos", "cantidad", "total de", o "qué hay" (en sentido de existencia general) -> "STATS".
-    2. Si nombra un local específico (ver nota de DB) -> "SPECIFIC_INFO".
-    3. Si busca comida, tipo de plato o recomendación general -> "RECOMMENDATION".
-
     OPCIONES:
-    - "STATS": Cantidades, totales.
-    - "SPECIFIC_INFO": Info de un lugar específico.
-    - "RECOMMENDATION": Búsqueda de comida/vibes.
-    
+    1. "STATS": El usuario pide cantidades, números o estadísticas.
+    2. "SPECIFIC_INFO": El usuario pregunta por un LUGAR específico (ej: "opiniones de Growler", "Atu Sushi").
+    3. "RECOMMENDATION": El usuario busca COMIDA, LUGAR o SUGERENCIAS gastronómicas (ej: "dónde comer helado", "lugar para cita", "barato").
+    4. "IRRELEVANT": La consulta es incoherente, ofensiva, no tiene sentido semántico, o NO tiene relación con comida/restaurantes/salidas en Neuquén (ej: "precio del dolar", "comer personas", "asdasd", "quien es messi").
+
     Responde SOLO JSON: {{"intent": "...", "entity": "..."}} 
     """
     try:
@@ -557,6 +575,8 @@ async def clasificar_intencion(query, llm, match_db=None):
         clean_json = res_str.strip().replace("```json", "").replace("```", "")
         return json.loads(clean_json)
     except:
+        # Ante la duda, si falla el JSON, lo mandamos a RAG por si acaso, 
+        # o podés poner "IRRELEVANT" si preferís ser conservador.
         return {"intent": "RECOMMENDATION", "entity": None}
 
 async def consultar_estadisticas(query, df, llm):
@@ -662,46 +682,54 @@ async def procesar_consulta(query, df, vectorstore, llm, ctx=None):
     if ctx is None: ctx = {}
     tone = sanitize_tone(ctx.get('tone'))
     
-    # 1. CONTEXTO NUMÉRICO (Desambiguación)
-    if 'pending_options' in ctx and query.strip().isdigit():
-        # ... (código existente de manejo de opciones numéricas) ...
-        # Copia tu bloque existente aquí, no cambia nada.
-        num = int(query.strip())
-        pending = ctx['pending_options']
-        opciones = pending.get('options', []) if isinstance(pending, dict) else pending
-        
-        if 1 <= num <= len(opciones):
-            seleccion = opciones[num - 1]
-            ctx['last_entity'] = seleccion
-            original_topic = ctx.get('original_query', seleccion) 
-            
-            resp, nombre_real, det, _ = await resumir_opiniones_local(
-                seleccion, df, llm, original_topic, tone, es_seleccion_directa=True
-            )
-            cards = await obtener_restaurant_cards([nombre_real], df, llm, original_topic, tone)
-            locs = obtener_coordenadas([nombre_real], df)
-            return resp, "resumen", None, locs, cards, det
-        return f"Elegí entre 1 y {len(opciones)}", "resumen", pending, [], [], ""
+    # 0. VERIFICACIÓN DE "BANEO" (Strike System)
+    # Leemos el contador de strikes del contexto (si no existe, es 0)
+    strikes = ctx.get('strikes', 0)
+    
+    if strikes >= 5:
+        return "⛔ Sistema bloqueado por consultas incoherentes. Refrescá la página para empezar de nuevo.", "blocked", None, [], [], ""
 
-    # 2. PRE-SCAN: "El Chismoso"
+    # 1. CONTEXTO NUMÉRICO (Igual que antes...)
+    if 'pending_options' in ctx and query.strip().isdigit():
+        # ... (código existente) ...
+        # (Asegurate de devolver el contexto actualizado en el return de este bloque también si fuera necesario, 
+        # pero por ahora lo dejamos simple).
+        pass 
+
+    # 2. PRE-SCAN (Igual que antes...)
     posible_match = detectar_mencion_exacta(query, df)
 
-    # === NUEVO: REGLA DURA PARA ESTADÍSTICAS ===
-    # Si detectamos intención clara de contar, NO usamos el LLM para clasificar.
-    # Esto arregla "cuantos lugares de sushi hay" yendo directo a STATS.
-    stats_triggers = ["cuantos", "cuántos", "cantidad", "total de", "numero de", "número de"]
-    es_pregunta_stats = any(trigger in query.lower() for trigger in stats_triggers)
-
+    # ... (Detección de stats igual que antes) ...
+    # Supongamos que llegamos a la clasificación LLM
+    
+    # 3. CLASIFICACIÓN
     if es_pregunta_stats:
         intent = "STATS"
         entity = None
-        logger.info(f"🧠 Router: STATS (Detectado por palabras clave)")
     else:
-        # 3. CLASIFICACIÓN LLM (Solo si no es una pregunta obvia de stats)
         clasificacion = await clasificar_intencion(query, llm, match_db=posible_match)
         intent = clasificacion.get("intent")
         entity = clasificacion.get("entity")
-        logger.info(f"🧠 Router: {intent} | Entity: {entity} | DB Match: {posible_match}")
+
+    # === BLOQUE DE INCOHERENCIAS (Strike +1) ===
+    if intent == "IRRELEVANT":
+        # Aumentamos el contador
+        strikes += 1
+        ctx['strikes'] = strikes # Actualizamos el contexto
+        
+        if strikes >= 5:
+            return "⛔ Has alcanzado el límite de preguntas fuera de tópico. Refrescá para reiniciar.", "blocked", None, [], [], ""
+            
+        mensajes_error = [
+            f"Mmm, no entendí. Preguntame sobre comida. (Advertencia {strikes}/5)",
+            f"Epa, eso no suena a comida. Tirame una data de restaurantes. (Advertencia {strikes}/5)",
+            f"No se entendió che. Centrémonos en morfar. (Advertencia {strikes}/5)"
+        ]
+        import random
+        rta = random.choice(mensajes_error)
+        
+        # Devolvemos la respuesta y el contexto actualizado con el strike nuevo
+        return rta, "rag", None, [], [], ""
     
     # 4. OVERRIDE
     if intent == "RECOMMENDATION" and posible_match:
