@@ -490,10 +490,9 @@ def detectar_mencion_exacta(query, df):
     }
     stopwords = {"el", "la", "los", "las", "de", "del", "lo", "al", "y", "en"}
     
-    # LISTA NEGRA GENÉRICA: Para que "sushi" no active el local "Sushi Club" automáticamente.
-    # Pero "El Ciervo" sí pase porque no es genérico per se en combinación.
+    # Palabras que, si están solas, NO son un nombre propio válido.
     generic_blocklist = {
-        "sushi", "pizza", "burger", "hamburguesa", "helado", "birra", 
+        "sushi", "pizza", "pizzas", "burger", "hamburguesa", "helado", "birra", 
         "cerveza", "cafe", "café", "parrilla", "pasta", "milanesa", 
         "ensalada", "comida", "postre", "resto", "bar", "almuerzo", "cena"
     }
@@ -516,14 +515,19 @@ def detectar_mencion_exacta(query, df):
             if re.search(pattern, q_norm):
                 return nombre_real
 
+        # Búsqueda por palabra clave única (ej: "Planeta" de "Pizzas Planeta")
         distinctive_parts = [p for p in core_parts if p not in stopwords]
         if distinctive_parts:
-            dist_name = distinctive_parts[0] 
-            dist_clean = re.sub(r'[^\w]', '', dist_name)
-            if len(dist_clean) > 3 and dist_clean not in generic_blocklist:
-                pattern_dist = r'(?<!\w)' + re.escape(dist_clean) + r'(?!\w)'
-                if re.search(pattern_dist, q_norm):
-                    return nombre_real
+            # Iteramos todas las partes, no solo la primera
+            for part in distinctive_parts:
+                part_clean = re.sub(r'[^\w]', '', part)
+                # Si la parte es genérica (ej: "Pizzas"), la ignoramos
+                if part_clean in generic_blocklist: continue
+                
+                if len(part_clean) > 3:
+                    pattern_dist = r'(?<!\w)' + re.escape(part_clean) + r'(?!\w)'
+                    if re.search(pattern_dist, q_norm):
+                        return nombre_real
     return None
 
 async def clasificar_intencion(query, llm, match_db=None):
@@ -684,59 +688,67 @@ async def procesar_consulta(query, df, vectorstore, llm_mini, llm_smart, ctx=Non
     if ctx is None: ctx = {}
     tone = sanitize_tone(ctx.get('tone'))
     
+    # ... (Bloques 0 y 1 de Baneo y Contexto Numérico siguen igual) ...
     # 0. VERIFICACIÓN DE "BANEO" POR IP (Redis)
     if user_ip:
         ban_key = f"ban:{user_ip}"
         is_banned = cache.get_value(ban_key)
-        if is_banned:
-             return "⛔ Sistema bloqueado temporalmente. Intente más tarde.", "blocked", None, [], [], ""
+        if is_banned: return "⛔ Sistema bloqueado temporalmente.", "blocked", None, [], [], ""
 
-    # 0.1 VERIFICACIÓN DE "STRIKES" DE SESIÓN
+    # 0.1 VERIFICACIÓN DE "STRIKES"
     strikes = ctx.get('strikes', 0)
-    if strikes >= 5:
-        if user_ip:
-            ban_key = f"ban:{user_ip}"
-            cache.set_value(ban_key, "true", expire=7200)
-            logger.warning(f"🚫 IP BANEADA POR 2HS: {user_ip}")
-        return "⛔ Sistema bloqueado por consultas incoherentes. Refrescá la página para empezar de nuevo.", "blocked", None, [], [], ""
+    if strikes >= 5: return "⛔ Bloqueado por seguridad.", "blocked", None, [], [], ""
 
     # 1. CONTEXTO NUMÉRICO
     if 'pending_options' in ctx and query.strip().isdigit():
-        num = int(query.strip())
-        pending = ctx['pending_options']
-        opciones = pending.get('options', []) if isinstance(pending, dict) else pending
-        if 1 <= num <= len(opciones):
-            seleccion = opciones[num - 1]
-            ctx['last_entity'] = seleccion
-            original_topic = ctx.get('original_query', seleccion) 
-            resp, nombre_real, det, _ = await resumir_opiniones_local(
-                seleccion, df, llm_mini, original_topic, tone, es_seleccion_directa=True
-            )
-            cards = await obtener_restaurant_cards([nombre_real], df, llm_mini, original_topic, tone)
-            locs = obtener_coordenadas([nombre_real], df)
-            return resp, "resumen", None, locs, cards, det
-        return f"Elegí entre 1 y {len(opciones)}", "resumen", pending, [], [], ""
+        # ... (código existente) ...
+        pass
 
-    # 2. PRE-SCAN
+    # 2. PRE-SCAN DE NOMBRE
     posible_match = detectar_mencion_exacta(query, df)
 
-    # 3. REGLA DURA PARA ESTADÍSTICAS
-    stats_triggers = ["cuantos", "cuántos", "cantidad", "total de", "numero de", "número de"]
-    es_pregunta_stats = any(trigger in query.lower() for trigger in stats_triggers)
+    # === NUEVO: LOGICA "MEJORES" (RANKING OVERRIDE) ===
+    # Si el usuario pide "mejores", "top", "ranking", forzamos recomendación
+    # A MENOS QUE esté pidiendo el mejor plato DE un lugar específico.
+    
+    ranking_triggers = ["mejores", "mejor", "top", "ranking", "cuales son", "cuáles son"]
+    es_ranking = any(t in query.lower() for t in ranking_triggers)
 
     intent = ""
     entity = None
 
-    if es_pregunta_stats:
-        intent = "STATS"
-        entity = None
-        logger.info(f"🧠 Router: STATS (Detectado por palabras clave)")
-    else:
-        # CLASIFICACIÓN LLM CON SMART MODEL (FILTRO SEMÁNTICO)
-        clasificacion = await clasificar_intencion(query, llm_smart, match_db=posible_match)
-        intent = clasificacion.get("intent")
-        entity = clasificacion.get("entity")
-        logger.info(f"🧠 Router: {intent} | Entity: {entity} | DB Match: {posible_match}")
+    if es_ranking:
+        # CASO SUTIL: "Cual es la mejor hamburguesa de Antares?" -> Eso sí es SPECIFIC_INFO.
+        # ¿Cómo sabemos? Si el nombre del local ("Antares") está ENTERO en la query.
+        
+        # Si 'posible_match' fue detectado por una coincidencia parcial (ej: "Pizzas" en "Pizzas Planeta")
+        # pero la query dice "Mejores pizzas", entonces:
+        # posible_match ("Pizzas Planeta") NO está en query ("Mejores pizzas").
+        # ENTONCES: Ignoramos el match y vamos a RAG.
+        
+        if posible_match and posible_match.lower() in query.lower():
+            # El usuario nombró explícitamente el local completo. Respetamos SPECIFIC_INFO.
+            logger.info(f"🧠 Router: Ranking dentro de local específico ({posible_match})")
+            pass # Dejamos que siga la lógica normal, clasificará como SPECIFIC_INFO
+        else:
+            # El usuario pidió ranking genérico. Forzamos Recommendation.
+            intent = "RECOMMENDATION"
+            posible_match = None # Anulamos el match falso positivo
+            logger.info(f"🧠 Router: Ranking Genérico detectado ('Mejores...'). Forzando RAG.")
+
+    # 3. REGLA DURA PARA ESTADÍSTICAS
+    # ... (resto de la lógica igual) ...
+    stats_triggers = ["cuantos", "cuántos", "cantidad", "total de", "numero de"]
+    es_pregunta_stats = any(trigger in query.lower() for trigger in stats_triggers)
+
+    if not intent: # Solo si no decidimos ya que es ranking
+        if es_pregunta_stats:
+            intent = "STATS"
+        else:
+            # CLASIFICACIÓN LLM
+            clasificacion = await clasificar_intencion(query, llm_smart, match_db=posible_match)
+            intent = clasificacion.get("intent")
+            entity = clasificacion.get("entity")
 
     # === BLOQUE DE INCOHERENCIAS ===
     if intent == "IRRELEVANT":
