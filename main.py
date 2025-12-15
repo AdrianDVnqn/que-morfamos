@@ -75,7 +75,7 @@ class RedisCacheManager:
 
 cache = RedisCacheManager(UPSTASH_REDIS_REST_URL, UPSTASH_REDIS_REST_TOKEN)
 
-app = FastAPI(title="Que Morfamos API (Semantic)", version="6.3.0")
+app = FastAPI(title="Que Morfamos API (Semantic)", version="6.4.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -88,8 +88,8 @@ app.add_middleware(
 # Variables globales
 df = None
 vectorstore = None
-llm_mini = None  # gpt-4o-mini (Costo bajo Output)
-llm_smart = None # gpt-5-mini / gpt-4o (Alta inteligencia, bajo Input)
+llm_mini = None  # gpt-4o-mini (Output barato)
+llm_smart = None # gpt-5-mini / gpt-4o (Input barato, alta inteligencia)
 
 # --- MODELOS PYDANTIC ---
 class RestaurantCard(BaseModel):
@@ -175,12 +175,12 @@ async def startup_event():
             index_name=PINECONE_INDEX_NAME, embedding=embeddings
         )
         
-        # 1. CEREBRO HABLADOR (Para escribir respuestas largas)
+        # 1. CEREBRO HABLADOR (Low Cost Output)
         llm_mini = ChatOpenAI(model="gpt-4o-mini", temperature=0)
         
-        # 2. CEREBRO PENSANTE (Para filtrar seguridad y clasificar)
-        # Usa el mejor modelo que tengas disponible (gpt-5-mini, gpt-4o, deepseek-v3)
-        llm_smart = ChatOpenAI(model="gpt-5-mini", temperature=0) 
+        # 2. CEREBRO PENSANTE (High IQ) 
+        # Idealmente gpt-5-mini o gpt-4o para mejor seguridad.
+        llm_smart = ChatOpenAI(model="gpt-5-mini", temperature=0)
         
         logger.info("✅ IA lista (Arquitectura Híbrida).")
     except Exception as e:
@@ -268,7 +268,6 @@ def get_keywords_from_topic(topic):
     }
     words = safe_str(topic).lower().split()
     clean_words = [w for w in words if w not in stopwords and len(w) > 2]
-    # Normalización simple
     stemmed_words = []
     for w in clean_words:
         if w.endswith('es') and len(w) > 4: stemmed_words.append(w[:-2])
@@ -346,11 +345,13 @@ async def generar_descripcion_async(llm, nombre, sample, tone='cordial'):
     except:
         return "Restaurante popular en Neuquén."
 
-# === OBTENCIÓN DE CARDS CON TOLERANCIA VIBE ===
 async def obtener_restaurant_cards(nombres_restaurantes, df, llm, query_context=None, tone='cordial', strict_mode=True, keywords_list=None):
     cards = []
     tasks = [] 
     
+    # Preparamos los términos de búsqueda: usamos las keywords limpias si existen
+    search_terms = keywords_list if keywords_list else ([query_context] if query_context else [])
+
     for nombre in nombres_restaurantes:
         if not nombre: continue
         mask = df['restaurante'].str.lower() == nombre.lower()
@@ -362,22 +363,20 @@ async def obtener_restaurant_cards(nombres_restaurantes, df, llm, query_context=
             frase = ""
             autor = ""
             
-            # Buscamos review específica
-            best_review = seleccionar_mejor_review(rest_df, query_context)
+            # Buscamos la mejor review usando el primer término limpio (ej: "cerveceria" en vez de "mejores cervecerias")
+            primary_topic = search_terms[0] if search_terms else None
+            best_review = seleccionar_mejor_review(rest_df, primary_topic)
             
             # === PATOVICA DINÁMICO ===
-            # Si el usuario busca un concepto abstracto (VIBE) como "cervecería", 
-            # no exigimos que la palabra aparezca.
-            if query_context:
-                if strict_mode:
-                    # MODO PRODUCTO: Si no encuentra "flan", descarta el lugar.
-                    if best_review is None:
-                        continue
-                else:
-                    # MODO VIBE: Si no encuentra "cerveceria", usa cualquier review (confiamos en Pinecone).
-                    if best_review is None:
-                        best_review = seleccionar_mejor_review(rest_df, None)
-            # =========================
+            if strict_mode:
+                # MODO PRODUCTO (Estricto): Si no hay review relevante, descartamos el lugar.
+                if best_review is None:
+                    continue
+            else:
+                # MODO VIBE (Flexible): Si no hay review exacta, permitimos mostrar el lugar.
+                if best_review is None:
+                    best_review = seleccionar_mejor_review(rest_df, None)
+            # ==========================
 
             if best_review is not None:
                 frase = safe_str(best_review['texto'])[:350] + "..."
@@ -418,14 +417,14 @@ async def obtener_restaurant_cards(nombres_restaurantes, df, llm, query_context=
             autor_reseña=safe_str(item['autor'])
         ))
     
-    # Reordenar por densidad de keywords (si aplica)
+    # Reordenamiento por densidad
     if keywords_list and len(cards) > 1:
         def calcular_score_densidad(card):
             mask_rest = df['restaurante'] == card.nombre
             texto_gigante = " ".join(df[mask_rest]['texto'].fillna("").astype(str).str.lower())
             hits = 0
             for k in keywords_list: hits += texto_gigante.count(k)
-            return hits / (card.total_reviews + 50)
+            return hits / (card.total_reviews + 50) # Suavizado
         
         cards.sort(key=calcular_score_densidad, reverse=True)
 
@@ -451,28 +450,22 @@ def obtener_restaurant_cards_simple(nombres_restaurantes, df):
 # ==========================================
 
 async def analizar_query_semantica(query, llm):
-    """
-    USA LLM_SMART. 
-    1. Filtro de Seguridad (Block).
-    2. Clasificación (Producto vs Vibe).
-    3. Limpieza de keywords (Singularización y eliminación de 'mejores').
-    """
+    """ USA LLM_SMART. Retorna: {tipo, keywords} """
     cache_key = f"analysis_{query.lower().strip()}"
     cached = cache.get_json("analysis", cache_key)
     if cached: return cached
 
-    # Prompt REFORZADO para seguridad y limpieza
     template = """
     Analiza la intención del usuario para una app de restaurantes FAMILIAR.
     Query: "{query}"
     
     1. SEGURIDAD (CRÍTICO - BLOCK):
        - Si contiene términos sexuales, insultos, violencia o conceptos grotescos (ej: "tetas", "pito", "travesti", "culo", "matar", "sexo", "caca"), MARCA "tipo": "BLOCK".
-       - EXCEPCIONES (NO BLOQUEAR): "Pechuga", "Cerveza", "Chorizo", "Salchicha", "Huevos", "Pebete".
+       - EXCEPCIONES VÁLIDAS: "Pechuga", "Cerveza", "Chorizo", "Salchicha", "Huevos", "Pebete".
     
     2. CLASIFICACIÓN (Si es seguro):
-       - "PRODUCTO": Busca un plato o ingrediente concreto (Pizza, Sushi, Flan).
-       - "VIBE": Busca un TIPO de local (Cerveceria, Pizzeria, Parrilla), ocasión (Cita, Amigos, Niños, Cumpleaños) o Bebida (Birra, Vino).
+       - "PRODUCTO": Plato o ingrediente concreto (Pizza, Sushi, Flan).
+       - "VIBE": Tipo de local (Cerveceria, Pizzeria, Parrilla), ocasión (Cita, Amigos, Niños, Cumpleaños) o Bebida (Birra, Vino).
     
     3. KEYWORDS:
        - Extrae sustantivos.
@@ -486,19 +479,17 @@ async def analizar_query_semantica(query, llm):
         clean = res.content.strip().replace("```json", "").replace("```", "")
         data = json.loads(clean)
         
-        # === LIMPIEZA MANUAL EXTRA (Por si el LLM falla) ===
-        # Limpiamos "mejores", "top" y plurales antes de buscar
+        # === LIMPIEZA MANUAL EXTRA (Garantiza "mejores cervecerias" -> "cerveceria") ===
         stopwords_ranking = ["mejores", "mejor", "top", "ranking", "los", "las", "el", "la", "de", "en", "neuquen", "buenos", "buen"]
         words = query.lower().split()
         
         for w in words:
             if w not in stopwords_ranking:
-                # Heurística simple de singularización
                 w_sing = w
+                # Singularización simple
                 if w.endswith('es') and len(w) > 4: w_sing = w[:-2]
                 elif w.endswith('s') and len(w) > 3: w_sing = w[:-1]
                 
-                # Solo agregamos si no está ya en la lista
                 if w_sing not in data.get('keywords', []):
                     if 'keywords' not in data: data['keywords'] = []
                     data['keywords'].append(w_sing)
@@ -506,8 +497,9 @@ async def analizar_query_semantica(query, llm):
         cache.set_json("analysis", cache_key, data)
         return data
     except Exception as e:
-        logger.error(f"Error semantico: {e}")
-        return {"tipo": "VIBE", "keywords": [query.lower()]}
+        # Ante error técnico, pasamos VIBE y limpiamos la query manualmente
+        clean_q = query.lower().replace("mejores", "").replace("mejor", "").strip()
+        return {"tipo": "VIBE", "keywords": [clean_q]}
 
 def detectar_mencion_exacta(query, df):
     if df is None or df.empty: return None
@@ -520,7 +512,7 @@ def detectar_mencion_exacta(query, df):
     }
     stopwords = {"el", "la", "los", "las", "de", "del", "lo", "al", "y", "en"}
     
-    # Generic Blacklist para que "Pizzas" no active "Pizzas Planeta"
+    # Lista negra para que "Pizzas" no active "Pizzas Planeta", pero "Planeta" sí.
     generic_blocklist = {
         "sushi", "pizza", "pizzas", "burger", "hamburguesa", "helado", "birra", 
         "cerveza", "cafe", "café", "parrilla", "pasta", "milanesa", 
@@ -550,7 +542,6 @@ def detectar_mencion_exacta(query, df):
             for part in distinctive_parts:
                 clean_part = re.sub(r'[^\w]', '', part)
                 if len(clean_part) < 3: continue
-                # Si la palabra es genérica, la ignoramos. "Planeta" pasa, "Pizzas" no.
                 if clean_part in generic_blocklist: continue
                 
                 pattern_dist = r'(?<!\w)' + re.escape(clean_part) + r'(?!\w)'
@@ -709,8 +700,7 @@ async def procesar_consulta(query, df, vectorstore, llm_mini, llm_smart, ctx=Non
     # 0. VERIFICACIÓN DE "BANEO" POR IP
     if user_ip:
         ban_key = f"ban:{user_ip}"
-        is_banned = cache.get_value(ban_key)
-        if is_banned: return "⛔ Sistema bloqueado temporalmente.", "blocked", None, [], [], ""
+        if cache.get_value(ban_key): return "⛔ Sistema bloqueado temporalmente.", "blocked", None, [], [], ""
 
     # 0.1 VERIFICACIÓN DE "STRIKES"
     strikes = ctx.get('strikes', 0)
@@ -736,59 +726,64 @@ async def procesar_consulta(query, df, vectorstore, llm_mini, llm_smart, ctx=Non
     # 2. PRE-SCAN DE NOMBRE
     posible_match = detectar_mencion_exacta(query, df)
 
-    # 3. ROUTER INTELIGENTE 
-    # (OJO: Se eliminó el atajo 'es_ranking' para que 'mejores travestis' NO pase)
-    
-    stats_triggers = ["cuantos", "cuántos", "cantidad", "total de", "numero de"]
-    es_pregunta_stats = any(trigger in query.lower() for trigger in stats_triggers)
-
+    # === LOGICA "MEJORES" (RANKING OVERRIDE) ===
+    # Si dice "mejor" y nombra un local específico ("mejor plato de Antares"), dejamos pasar.
+    # Si dice "mejores pizzas", aunque "Pizzas" matchee con "Pizzas Planeta" (si no estuviera en blacklist),
+    # aquí validamos que si la frase es genérica, vaya a RAG.
+    ranking_triggers = ["mejores", "mejor", "top", "ranking", "cuales son"]
+    es_ranking = any(t in query.lower() for t in ranking_triggers)
     intent = ""
     entity = None
 
-    if es_pregunta_stats:
-        intent = "STATS"
-    else:
-        # Todo pasa por la IA Smart para detectar seguridad
-        clasificacion = await clasificar_intencion(query, llm_smart, match_db=posible_match)
-        intent = clasificacion.get("intent")
-        entity = clasificacion.get("entity")
+    if es_ranking:
+        if posible_match and posible_match.lower() in query.lower():
+            pass # Es específico ("Mejor de Antares")
+        else:
+            # Es genérico ("Mejores pizzas"), forzamos Recomendación,
+            # PERO primero el Clasificador se encargará de ver si es seguro.
+            intent = "RECOMMENDATION" 
+            posible_match = None 
+
+    stats_triggers = ["cuantos", "cuántos", "cantidad", "total de", "numero de"]
+    es_pregunta_stats = any(trigger in query.lower() for trigger in stats_triggers)
+
+    if not intent:
+        if es_pregunta_stats:
+            intent = "STATS"
+        else:
+            # AHORA SÍ: "Mejores travestis" pasa por aquí y el LLM lo frena.
+            clasificacion = await clasificar_intencion(query, llm_smart, match_db=posible_match)
+            intent = clasificacion.get("intent")
+            entity = clasificacion.get("entity")
 
     # === BLOQUE DE INCOHERENCIAS ===
     if intent == "IRRELEVANT":
         strikes += 1
         ctx['strikes'] = strikes 
         if strikes >= 5:
-             if user_ip:
-                ban_key = f"ban:{user_ip}"
-                cache.set_value(ban_key, "true", expire=7200)
+             if user_ip: cache.set_value(f"ban:{user_ip}", "true", expire=7200)
              return "⛔ Has alcanzado el límite. Chau.", "blocked", None, [], [], ""
         
-        msgs = ["Eso no suena a comida.", "Mmm, preguntame sobre restaurantes.", "No entendí, ¿qué buscás para comer?"]
-        import random
-        return random.choice(msgs), "rag", None, [], [], ""
+        return "Mmm, no entendí o eso no tiene que ver con comida. Probá otra cosa.", "rag", None, [], [], ""
 
-    # 4. OVERRIDE
     if intent == "RECOMMENDATION" and posible_match:
-        # Si el LLM dice RAG pero hay un match exacto, revisamos si es ranking genérico
-        # Si NO dice "mejores", forzamos Specific Info
-        if "mejores" not in query.lower() and "mejor" not in query.lower():
-             intent = "SPECIFIC_INFO"
-             entity = posible_match
+        intent = "SPECIFIC_INFO"
+        entity = posible_match
 
-    # 5. STATS
     if intent == "STATS":
         resp, locales = await consultar_estadisticas(query, df, llm_mini)
         cards = obtener_restaurant_cards_simple(locales, df)
         locs = obtener_coordenadas(locales, df)
         return resp, "estadisticas", None, locs, cards, ""
 
-    # 6. INFO ESPECÍFICA
     if intent == "SPECIFIC_INFO":
         target = entity if entity else (posible_match if posible_match else ctx.get('last_entity'))
         if target:
             target_clean = target.lower().strip()
             match_exists = df['restaurante'].str.lower().str.contains(target_clean, na=False, regex=False).any()
-            if match_exists:
+            if not match_exists:
+                intent = "RECOMMENDATION" 
+            else:
                 ctx['original_query'] = query
                 resp, nombre_real, det, opciones = await resumir_opiniones_local(target, df, llm_mini, query, tone)
                 if opciones: return resp, "resumen", opciones, [], [], ""
@@ -797,11 +792,26 @@ async def procesar_consulta(query, df, vectorstore, llm_mini, llm_smart, ctx=Non
                     cards = await obtener_restaurant_cards([nombre_real], df, llm_mini, query, tone)
                     locs = obtener_coordenadas([nombre_real], df)
                     return resp, "resumen", None, locs, cards, det
-            intent = "RECOMMENDATION" # Fallback
+            intent = "RECOMMENDATION"
 
     # 7. RAG (Con doble chequeo de seguridad)
     if intent == "RECOMMENDATION":
         try:
+            # 1. ANÁLISIS SEMÁNTICO PRIMERO (Para bloquear antes de buscar)
+            analisis = await analizar_query_semantica(query, llm_smart)
+            
+            # === CHECK DE SEGURIDAD CRÍTICO ===
+            if analisis.get("tipo") == "BLOCK":
+                strikes += 1
+                ctx['strikes'] = strikes
+                logger.warning(f"🚫 Query bloqueada: '{query}'")
+                return "Epa, esa búsqueda no va. Preguntame sobre comida o lugares.", "rag", None, [], [], ""
+            # ==================================
+
+            keywords = analisis.get("keywords", [])
+            tipo_busqueda = analisis.get("tipo", "VIBE")
+            
+            # 2. BÚSQUEDA VECTORIAL
             docs = vectorstore.similarity_search(query, k=25)
             seen = set()
             locales_preliminares = []
@@ -811,17 +821,7 @@ async def procesar_consulta(query, df, vectorstore, llm_mini, llm_smart, ctx=Non
                     seen.add(nom)
                     locales_preliminares.append(nom)
 
-            # ANÁLISIS SEMÁNTICO (Segunda capa de seguridad)
-            analisis = await analizar_query_semantica(query, llm_smart)
-            
-            if analisis.get("tipo") == "BLOCK":
-                strikes += 1
-                ctx['strikes'] = strikes
-                return "⛔ Búsqueda no permitida.", "rag", None, [], [], ""
-
-            keywords = analisis.get("keywords", [])
-            tipo_busqueda = analisis.get("tipo", "VIBE")
-            
+            # 3. FILTRADO (Usando las keywords limpias)
             locales_confirmados = []
             if tipo_busqueda == "PRODUCTO":
                 for local in locales_preliminares:
@@ -833,8 +833,7 @@ async def procesar_consulta(query, df, vectorstore, llm_mini, llm_smart, ctx=Non
                                 locales_confirmados.append(local)
                                 break
             else:
-                # VIBE: Confiamos en Pinecone
-                locales_confirmados = locales_preliminares
+                locales_confirmados = locales_preliminares # VIBE confía en Pinecone
             
             locales_confirmados = locales_confirmados[:5]
 
@@ -843,6 +842,7 @@ async def procesar_consulta(query, df, vectorstore, llm_mini, llm_smart, ctx=Non
 
             es_estricto = (tipo_busqueda == "PRODUCTO")
             
+            # Pasamos keywords limpias para que busque bien en las reviews
             cards = await obtener_restaurant_cards(
                 locales_confirmados, df, llm_mini, query, tone, 
                 strict_mode=es_estricto, keywords_list=keywords
@@ -855,15 +855,16 @@ async def procesar_consulta(query, df, vectorstore, llm_mini, llm_smart, ctx=Non
 
             locs = obtener_coordenadas(nombres_finales, df)
             
+            # 4. RESPUESTA NATURAL (Fix: Adiós respuesta robótica)
             prefix = tone_system_instruction(tone)
             prompt_rag = (
                 f"{prefix}\n"
-                f"El usuario busca: '{query}' en NEUQUÉN CAPITAL.\n"
-                f"He verificado estos lugares en mi base de datos: {', '.join(nombres_finales)}.\n"
-                "INSTRUCCIONES:\n"
-                "1. Recomienda SOLO los lugares de la lista de arriba.\n"
-                "2. NO inventes lugares de Buenos Aires u otras ciudades.\n"
-                "3. Explica brevemente por qué coinciden con la búsqueda."
+                f"El usuario buscó: '{query}'.\n"
+                f"Le recomendé estos lugares: {', '.join(nombres_finales)}.\n"
+                "INSTRUCCIONES DE RESPUESTA:\n"
+                "1. Sé natural y directo. NO digas 'Entiendo que buscas...', ni 'De la lista mencionada', ni saludes.\n"
+                "2. Decí algo como: '¡Dale! Acá te traigo las mejores opciones para [lo que buscó]:' o 'Encontré estos lugares ideales para vos:'.\n"
+                "3. Explica en 1 oración por qué elegiste estos lugares."
             )
             rag_resp = await llm_mini.ainvoke(prompt_rag)
             return rag_resp.content, "rag", None, locs, cards, ""
@@ -879,7 +880,7 @@ async def procesar_consulta(query, df, vectorstore, llm_mini, llm_smart, ctx=Non
 # ==========================================
 
 @app.get("/")
-def read_root(): return {"status": "online", "message": "API OK v6.3"}
+def read_root(): return {"status": "online", "message": "API OK v6.4"}
 
 @app.get("/health")
 def health_check(): return {"status": "healthy", "df_size": len(df) if df is not None else 0}
