@@ -449,18 +449,18 @@ async def analizar_query_semantica(query, llm):
     cached = cache.get_json("analysis", cache_key)
     if cached: return cached
 
+    # Prompt ajustado para que "Cervecería" sea VIBE (Flexible) y "Cerveza" sea PRODUCTO (Estricto o Vibe según contexto, pero mejor Vibe para bebidas).
     template = """
-    Analiza la query del usuario para búsqueda en base de datos de restaurantes.
+    Analiza la intención del usuario para una app de restaurantes.
     Query: "{query}"
     
-    PASO 1: SEGURIDAD (Veto)
-    - Si la query es OFENSIVA/SEXUAL/GROTESCA (ej: "tetas", "pito", "travesti", "caca", "sexo"), marca "tipo": "BLOCK".
-    - EXCEPCIONES VÁLIDAS (NO BLOQUEAR): "Pechuga", "Cerveza", "Chorizo", "Salchicha", "Huevos".
-    - CONTEXTO SOCIAL VÁLIDO (NO BLOQUEAR): "Citas", "Romántico", "Niños", "Chicos", "Infancias", "Gente mayor".
+    1. SEGURIDAD (CRÍTICO): 
+       - Si contiene términos sexuales, insultos o violencia -> "BLOCK".
+       - (Recuerda: "Pechuga", "Chorizo", "Huevos" son comida válida).
     
-    PASO 2: CLASIFICACIÓN (Si no es Block)
-    - "PRODUCTO": Busca un plato o ingrediente concreto (Pizza, Sushi, Birra, Flan).
-    - "VIBE": Busca un estilo, ocasión o público específico (Romántico, Familiar, Para ir con chicos, Gente mayor, Barato, Lindo).
+    2. CLASIFICACIÓN:
+       - "PRODUCTO": Busca un PLATO o INGREDIENTE específico que debe estar en el menú (ej: "flan", "ramen", "tacos", "mollejas"). -> Activa Filtro Estricto.
+       - "VIBE": Busca un TIPO DE LUGAR (ej: "cervecería", "pizzería", "parrilla", "bodegón"), una ocasión (ej: "cita", "amigos") o bebida general (ej: "birra", "vino"). -> Activa Filtro Flexible.
     
     Responde SOLO JSON: {{"tipo": "PRODUCTO" | "VIBE" | "BLOCK", "keywords": ["k1", "k2"]}}
     """
@@ -469,6 +469,7 @@ async def analizar_query_semantica(query, llm):
         clean = res.content.strip().replace("```json", "").replace("```", "")
         data = json.loads(clean)
         
+        # Agregamos la query original a las keywords
         if query.lower().strip() not in data.get('keywords', []):
             if 'keywords' not in data: data['keywords'] = []
             data['keywords'].insert(0, query.lower().strip())
@@ -476,7 +477,7 @@ async def analizar_query_semantica(query, llm):
         cache.set_json("analysis", cache_key, data)
         return data
     except Exception as e:
-        # Fallback seguro: VIBE para no filtrar de más
+        # Fallback a VIBE que es el más permisivo
         return {"tipo": "VIBE", "keywords": [query.lower()]}
 
 def detectar_mencion_exacta(query, df):
