@@ -444,23 +444,28 @@ def obtener_restaurant_cards_simple(nombres_restaurantes, df):
 async def analizar_query_semantica(query, llm):
     """
     USA LLM_SMART. Determina si la búsqueda es Producto, Vibe, o contenido OFENSIVO.
+    Normaliza plurales y elimina palabras de ranking.
     """
     cache_key = f"analysis_{query.lower().strip()}"
     cached = cache.get_json("analysis", cache_key)
     if cached: return cached
 
-    # Prompt ajustado para que "Cervecería" sea VIBE (Flexible) y "Cerveza" sea PRODUCTO (Estricto o Vibe según contexto, pero mejor Vibe para bebidas).
+    # Prompt ajustado: Pide SINGULAR y excluye adjetivos de ranking
     template = """
     Analiza la intención del usuario para una app de restaurantes.
     Query: "{query}"
     
-    1. SEGURIDAD (CRÍTICO): 
+    1. SEGURIDAD: 
        - Si contiene términos sexuales, insultos o violencia -> "BLOCK".
-       - (Recuerda: "Pechuga", "Chorizo", "Huevos" son comida válida).
     
     2. CLASIFICACIÓN:
-       - "PRODUCTO": Busca un PLATO o INGREDIENTE específico que debe estar en el menú (ej: "flan", "ramen", "tacos", "mollejas"). -> Activa Filtro Estricto.
-       - "VIBE": Busca un TIPO DE LUGAR (ej: "cervecería", "pizzería", "parrilla", "bodegón"), una ocasión (ej: "cita", "amigos") o bebida general (ej: "birra", "vino"). -> Activa Filtro Flexible.
+       - "PRODUCTO": Plato/Ingrediente concreto (ej: "flan", "hamburguesa").
+       - "VIBE": Tipo de lugar, ocasión, bebida general o categoría (ej: "cerveceria", "pizzeria", "cita").
+    
+    3. KEYWORDS (CRÍTICO):
+       - Devuelve solo sustantivos en SINGULAR.
+       - Elimina palabras como "mejores", "el", "la", "top", "ranking".
+       - Ej: "Mejores cervecerias" -> ["cerveceria", "birra", "cerveza_artesanal"]
     
     Responde SOLO JSON: {{"tipo": "PRODUCTO" | "VIBE" | "BLOCK", "keywords": ["k1", "k2"]}}
     """
@@ -469,15 +474,36 @@ async def analizar_query_semantica(query, llm):
         clean = res.content.strip().replace("```json", "").replace("```", "")
         data = json.loads(clean)
         
-        # Agregamos la query original a las keywords
-        if query.lower().strip() not in data.get('keywords', []):
-            if 'keywords' not in data: data['keywords'] = []
-            data['keywords'].insert(0, query.lower().strip())
+        # === LIMPIEZA MANUAL DE LA QUERY ORIGINAL ===
+        # Para evitar que "mejores cervecerías" rompa la búsqueda por no encontrar la frase exacta.
+        stopwords_ranking = ["mejores", "mejor", "top", "ranking", "los", "las", "el", "la", "de", "en", "neuquen"]
+        
+        words = query.lower().split()
+        clean_words = [w for w in words if w not in stopwords_ranking]
+        
+        # Convertimos plurales simples a singular (heurística básica por si el LLM falla)
+        # Ej: "cervecerias" -> "cerveceria"
+        clean_words_singular = []
+        for w in clean_words:
+            if w.endswith("es") and len(w) > 4: 
+                clean_words_singular.append(w[:-2])
+            elif w.endswith("s") and len(w) > 3: 
+                clean_words_singular.append(w[:-1])
+            else:
+                clean_words_singular.append(w)
+                
+        # Agregamos las palabras limpias a las keywords del LLM
+        current_keywords = data.get('keywords', [])
+        for w in clean_words_singular:
+            if w not in current_keywords:
+                current_keywords.append(w)
+        
+        data['keywords'] = current_keywords
             
         cache.set_json("analysis", cache_key, data)
         return data
     except Exception as e:
-        # Fallback a VIBE que es el más permisivo
+        logger.error(f"Error semantico: {e}")
         return {"tipo": "VIBE", "keywords": [query.lower()]}
 
 def detectar_mencion_exacta(query, df):
