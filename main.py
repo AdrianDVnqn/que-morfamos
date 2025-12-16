@@ -978,88 +978,129 @@ async def procesar_consulta(query, df, vectorstore, llm_mini, llm_smart, ctx=Non
         # Si falló lo específico, pasamos a Recomendación
         intent = "RECOMMENDATION"
 
-    # --- CAMINO C: RECOMENDACIÓN (RAG + PONDERACIÓN) ---
+# --- CAMINO C: RECOMENDACIÓN (PIPELINE ESTRICTO) ---
     if intent == "RECOMMENDATION":
         try:
-            # 1. Análisis Semántico (Solo para seguridad y detectar tipo)
+            # 1. Análisis Semántico
             analisis = await analizar_query_semantica(query, llm_smart)
             if analisis.get("tipo") == "BLOCK":
                 ctx['strikes'] = strikes + 1
                 return f"Epa, esa búsqueda no va. ({strikes+1}/5)", "rag", None, [], [], ""
 
-            # 2. Búsqueda Vectorial (Pinecone) - TRAE SEMÁNTICA PURA
-            docs = vectorstore.similarity_search(query, k=50) 
+            keywords = analisis.get("keywords", [])
+            synonyms = analisis.get("synonyms", [])
+            
+            # Preparamos los términos de filtrado estricto
+            filtro_terms = set(keywords)
+            if synonyms: filtro_terms.update(synonyms)
+            filtro_terms = [t.lower() for t in filtro_terms if len(t) > 3]
+
+            # 2. Búsqueda Vectorial (Pinecone) - El "Barrido Amplio"
+            docs = vectorstore.similarity_search(query, k=60) # Traemos bastantes para filtrar
             seen = set()
-            locales_candidatos = []
+            candidatos_crudos = []
             for d in docs:
                 nom = d.metadata.get('nombre')
                 if nom and nom not in seen:
                     seen.add(nom)
-                    locales_candidatos.append(nom)
-            
-            # (ELIMINADO EL FILTRO DE KEYWORDS TEXTUALES "if k in texto...")
-            # Dejamos que Pinecone se encargue de la similitud (Pelotero ≈ Juegos)
+                    candidatos_crudos.append(nom)
 
-            # 3. PRE-RANKING MATEMÁTICO (Calidad)
-            # Ordenamos los 50 candidatos por Rating + Cantidad de Reviews
-            def calcular_score_calidad(nombre_local):
-                mask = df['restaurante'].str.lower() == nombre_local.lower()
+            # 3. FILTRADO POR EVIDENCIA (Hard Filter)
+            # Separamos la paja del trigo ANTES de mirar las estrellas
+            grupo_alta_relevancia = []
+            grupo_baja_relevancia = []
+
+            if filtro_terms:
+                for local in candidatos_crudos:
+                    mask = df['restaurante'] == local
+                    if not mask.any(): continue
+                    
+                    # Leemos un snippet generoso de reviews (primeras 30) para buscar la palabra
+                    # Esto es rápido porque es Python puro, no LLM.
+                    texto_dump = " ".join(df[mask]['texto'].fillna("").astype(str).head(30).tolist()).lower()
+                    
+                    tiene_match = False
+                    for term in filtro_terms:
+                        if term in texto_dump:
+                            tiene_match = True
+                            break
+                    
+                    if tiene_match:
+                        grupo_alta_relevancia.append(local)
+                    else:
+                        grupo_baja_relevancia.append(local)
+            else:
+                # Si no hay keywords (búsqueda vaga), todos son "alta relevancia"
+                grupo_alta_relevancia = candidatos_crudos
+
+            # 4. SELECCIÓN PARA EL JUEZ
+            # Si encontramos lugares con la palabra clave, SOLO procesamos esos.
+            # Ignoramos el resto (aunque tengan 5 estrellas, si no dicen "pelotero", no sirven).
+            
+            candidatos_a_verificar = []
+            
+            if grupo_alta_relevancia:
+                # Si hay muchos con la palabra, ahí sí desempatamos por calidad para no saturar al LLM
+                def sort_by_quality(nombre):
+                    mask = df['restaurante'] == nombre
+                    row = df[mask].iloc[0]
+                    return safe_float(row.get('rating_gral'))
+                
+                grupo_alta_relevancia.sort(key=sort_by_quality, reverse=True)
+                # Tomamos el Top 10 de los que TIENEN la palabra
+                candidatos_a_verificar = grupo_alta_relevancia[:10]
+            else:
+                # Fallback: Si nadie dice la palabra, usamos los mejores del vector search
+                candidatos_a_verificar = grupo_baja_relevancia[:10]
+
+            # 5. EL JUEZ LLM (Verificación de Contexto)
+            # Ahora el juez recibe una lista de lugares que YA sabemos que contienen la palabra.
+            # Su único trabajo es filtrar los "No tiene..."
+            locales_verificados = await verificar_candidatos_con_llm(
+                candidatos_a_verificar, df, query, llm_mini
+            )
+            
+            # Si el Juez mata a todos (muy estricto), fallback a los candidatos con palabra clave
+            if not locales_verificados and grupo_alta_relevancia:
+                locales_verificados = candidatos_a_verificar[:3]
+
+            # 6. RANKING FINAL (Ahora sí, por calidad)
+            # De los que pasaron TODAS las pruebas, mostramos los mejores.
+            def calcular_score_final(nombre_local):
+                mask = df['restaurante'] == nombre_local
                 if not mask.any(): return 0
                 row = df[mask].iloc[0]
                 rat = safe_float(row.get('rating_gral'))
                 revs = safe_int(row.get('total_reviews_google'))
-                if revs < 5: return 0 
-                return rat + (math.log10(revs + 1) * 0.3)
+                return rat + (math.log10(revs + 1) * 0.2) # Logaritmo suave
 
-            locales_candidatos.sort(key=calcular_score_calidad, reverse=True)
-            
-            # Nos quedamos con los Top 10 mejores calificados para someterlos a juicio
-            top_candidatos = locales_candidatos[:10]
-
-            # 4. EL JUEZ LLM (Filtro de Contexto)
-            # Aquí es donde descartamos "Starbucks" si la reseña dice "vayan a un pelotero, no acá"
-            locales_confirmados = await verificar_candidatos_con_llm(
-                top_candidatos, df, query, llm_mini
-            )
-
-            # === FALLBACK DE SEGURIDAD ===
-            # Si el Juez eliminó TODOS los candidatos (lista vacía),
-            # volvemos a usar los candidatos originales de Pinecone/Math.
-            # Preferimos mostrar un resultado "quizás erróneo" a decir "No encontré nada".
-            if not locales_confirmados and top_candidatos:
-                logger.warning("El Juez eliminó todos los candidatos. Usando Fallback.")
-                locales_confirmados = top_candidatos[:3]
-
-            # Recorte final
-            locales_finales = locales_confirmados[:5]
+            locales_verificados.sort(key=calcular_score_final, reverse=True)
+            locales_finales = locales_verificados[:5]
 
             if not locales_finales: 
-                return "No encontré lugares que coincidan con tu búsqueda.", "rag", None, [], [], ""
+                return "No encontré lugares que cumplan con ese requisito específico.", "rag", None, [], [], ""
 
-            # 5. Generación de Cards y Respuesta
-            # Pasamos keywords vacías [] para que 'obtener_restaurant_cards' no intente filtrar nada más
+            # 7. Generación de Cards y Respuesta
             cards = await obtener_restaurant_cards(
                 locales_finales, df, llm_mini, query, tone, 
-                strict_mode=False, keywords_list=[]
+                strict_mode=False, 
+                keywords_list=keywords,
+                synonyms_list=synonyms
             )
-            nombres_finales_cards = [c.nombre for c in cards]
-            locs = obtener_coordenadas(nombres_finales_cards, df)
+            nombres_finales = [c.nombre for c in cards]
+            locs = obtener_coordenadas(nombres_finales, df)
             
             detalles_lugares = "\n".join([f"- {c.nombre}: {c.descripcion}" for c in cards])
-            
             prefix = tone_system_instruction(tone)
             
-            # PROMPT CORREGIDO: INSTRUCCIONES ESTRICTAS DE FIDELIDAD
             prompt_rag = (
                 f"{prefix}\n"
                 f"SITUACIÓN: El usuario buscó '{query}'.\n"
-                f"Hemos analizado las reseñas y encontramos estos resultados verificados:\n"
-                f"{detalles_lugares}\n\n"
-                f"INSTRUCCIONES CRÍTICAS (LEER ATENTAMENTE):\n"
-                "1. Tu única fuente de verdad son las descripciones de arriba. IGNORA tu conocimiento previo sobre estos lugares.\n"
-                "2. Si la descripción dice que el lugar TIENE lo que busca el usuario (ej: 'tiene pelotero', 'tiene juegos'), DEBES CONFIRMARLO en tu respuesta.\n"
-                "3. NO contradigas la información provista. Si la descripción dice 'sí', tu respuesta es 'sí'.\n"
-                "4. Genera una recomendación entusiasta para cada opción."
+                f"Resultados VERIFICADOS:\n{detalles_lugares}\n\n"
+                f"INSTRUCCIONES:\n"
+                "1. Basate EXCLUSIVAMENTE en las descripciones provistas.\n"
+                "2. Confirmale al usuario que estos lugares cumplen con su búsqueda.\n"
+                "3. Genera una recomendación útil."
             )
             
             rag_resp = await llm_mini.ainvoke(prompt_rag)
