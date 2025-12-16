@@ -524,6 +524,10 @@ async def analizar_query_semantica(query, llm):
         return {"tipo": "VIBE", "keywords": [query.lower()]}
 
 def detectar_mencion_exacta(query, df):
+    """
+    Detecta si el usuario nombró un lugar exacto.
+    FIX v7.3: STOPWORDS AGRESIVAS para evitar match con 'Que Pesto' cuando preguntan 'Que tal'.
+    """
     if df is None or df.empty: return None
     q_norm = query.lower().strip()
     
@@ -532,7 +536,9 @@ def detectar_mencion_exacta(query, df):
         "cerveceria", "hamburgueseria", "heladeria", "cafe", "bistro", "resto", 
         "rotiseria", "panaderia", "sushi", "casa"
     }
-    stopwords = {"el", "la", "los", "las", "de", "del", "lo", "al", "y", "en"}
+    # AGREGADO: "que", "tal", "es", "como", "onda" a las palabras ignoradas
+    stopwords = {"el", "la", "los", "las", "de", "del", "lo", "al", "y", "en", "que", "qué", "tal", "como", "es", "onda", "son"}
+    
     generic_blocklist = {
         "sushi", "pizza", "pizzas", "burger", "hamburguesa", "helado", "birra", 
         "cerveza", "cafe", "café", "parrilla", "pasta", "milanesa", 
@@ -544,23 +550,30 @@ def detectar_mencion_exacta(query, df):
 
     for nombre_real in nombres:
         nombre_lower = nombre_real.lower().strip()
-        if nombre_lower in q_norm: return nombre_real
+        
+        # 1. Match Exacto Total (Siempre gana, aunque sea corto)
+        if nombre_lower == q_norm: return nombre_real
 
+        # 2. Match Núcleo (Ej: "Antares" en "Antares Neuquen")
         parts = nombre_lower.split()
         core_parts = [p for p in parts if re.sub(r'[^\w]', '', p) not in venue_prefixes]
         if not core_parts: continue 
         core_name = " ".join(core_parts) 
         
-        if len(core_name) > 2:
+        # FIX: Solo matcheamos nucleo si es > 3 letras (evita matches falsos con "Que", "Sur", "Bar")
+        if len(core_name) > 3:
             pattern = r'(?<!\w)' + re.escape(core_name) + r'(?!\w)'
             if re.search(pattern, q_norm): return nombre_real
 
+        # 3. Match Palabra Distintiva
         distinctive_parts = [p for p in core_parts if p not in stopwords]
         if distinctive_parts:
             for part in distinctive_parts:
                 clean_part = re.sub(r'[^\w]', '', part)
-                if len(clean_part) < 3: continue
+                # FIX: Solo matcheamos palabras sueltas si son > 3 letras
+                if len(clean_part) <= 3: continue
                 if clean_part in generic_blocklist: continue
+                
                 pattern_dist = r'(?<!\w)' + re.escape(clean_part) + r'(?!\w)'
                 if re.search(pattern_dist, q_norm): return nombre_real
     return None
@@ -787,13 +800,26 @@ async def procesar_consulta(query, df, vectorstore, llm_mini, llm_smart, ctx=Non
         return resp, "estadisticas", None, locs, cards, ""
 
     if intent == "SPECIFIC_INFO":
-        target = entity if entity else (posible_match if posible_match else ctx.get('last_entity'))
+        # LÓGICA CORREGIDA: NO USAR LAST_ENTITY SI NO FUE SOLICITADO
+        target = None
+        
+        # 1. Si el LLM dice explícitamente "LAST_ENTITY" (ej: "y es caro?")
+        if entity == "LAST_ENTITY":
+            target = ctx.get('last_entity')
+        # 2. Si el LLM extrajo un nombre nuevo (ej: "Growler"), ÚSALO.
+        elif entity and entity != "LAST_ENTITY":
+            target = entity
+        # 3. Si Regex encontró algo (Match exacto), usalo como fallback fuerte.
+        elif posible_match:
+            target = posible_match
+        
+        # (Aquí eliminamos el 'else: target = ctx.get(last_entity)' que causaba el error)
+
         if target:
             target_clean = target.lower().strip()
             match_exists = df['restaurante'].str.lower().str.contains(target_clean, na=False, regex=False).any()
-            if not match_exists:
-                intent = "RECOMMENDATION" 
-            else:
+            
+            if match_exists:
                 ctx['original_query'] = query
                 resp, nombre_real, det, opciones = await resumir_opiniones_local(target, df, llm_mini, query, tone)
                 if opciones: return resp, "resumen", opciones, [], [], ""
@@ -802,7 +828,13 @@ async def procesar_consulta(query, df, vectorstore, llm_mini, llm_smart, ctx=Non
                     cards = await obtener_restaurant_cards([nombre_real], df, llm_mini, query, tone)
                     locs = obtener_coordenadas([nombre_real], df)
                     return resp, "resumen", None, locs, cards, det
-            intent = "RECOMMENDATION"
+            else:
+                # Si el target era explícito ("Growler") y no existe en DF, avisar en lugar de inventar.
+                if entity and entity != "LAST_ENTITY":
+                     return f"No tengo info sobre **{entity}** en Neuquén. ¿Se llama así el lugar?", "rag", None, [], [], ""
+        
+        # Si no hay target válido, pasamos a recomendación general
+        intent = "RECOMMENDATION"
 
     if intent == "RECOMMENDATION":
         try:
