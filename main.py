@@ -995,23 +995,11 @@ async def procesar_consulta(query, df, vectorstore, llm_mini, llm_smart, ctx=Non
 
 # --- CAMINO A: ESTADÍSTICAS ---
     if intent == "STATS":
-        # 1. Obtenemos dato numérico y lista
-        resp_texto, lista_locales = await consultar_estadisticas(query, df, llm_mini)
+        resp, locales = await consultar_estadisticas(query, df, llm_mini)
+        cards = obtener_restaurant_cards_simple(locales, df)
+        locs = obtener_coordenadas(locales, df)
+        return resp, "estadisticas", None, locs, cards, ""
         
-        cards = []
-        # Siempre mostramos los puntos en el mapa (el mapa se banca 50 pines)
-        locs = obtener_coordenadas(lista_locales, df)
-        
-        # 2. LÓGICA DE VISUALIZACIÓN INTELIGENTE
-        # Solo generamos tarjetas visuales si son poquitas (Top 5)
-        # para no spammear el chat.
-        if 0 < len(lista_locales) <= 5:
-            # Usamos la versión FULL (con LLM) porque son pocas y vale la pena que se vean lindas
-            cards = await obtener_restaurant_cards(
-                lista_locales, df, llm_mini, query_context=query, tone=tone, strict_mode=False
-            )
-        
-        return resp_texto, "estadisticas", None, locs, cards, ""
 
     # --- CAMINO B: INFO ESPECÍFICA (UN LUGAR) ---
     if intent == "SPECIFIC_INFO":
