@@ -888,7 +888,7 @@ async def resumir_opiniones_local(query_str, df, llm, topic=None, tone='cordial'
     
     # 7. Guardado y Retorno final
     cache.set_json("resumen_texto", cache_key, res)
-    return f"Acá la data de **{restaurante}**:", restaurante, res, None
+    return res, restaurante, res, None # ahora el resumen sale tanto en el chat como en la tarjeta
 
 async def verificar_candidatos_con_llm(candidatos, df, query, llm):
     """
