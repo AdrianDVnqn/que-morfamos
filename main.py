@@ -745,6 +745,57 @@ async def resumir_opiniones_local(query_str, df, llm, topic=None, tone='cordial'
     cache.set_json("resumen_texto", cache_key, res)
     return f"Acá la data de **{restaurante}**:", restaurante, res, None
 
+async def verificar_candidatos_con_llm(candidatos, df, query, llm):
+    """
+    JUEZ SEMÁNTICO: Toma una lista de candidatos y verifica si el contexto
+    de las reseñas coincide con la intención del usuario.
+    Elimina casos como: "Deberían tener pelotero" cuando se busca "Con pelotero".
+    """
+    if not candidatos: return []
+    
+    texto_validacion = ""
+    # Analizamos máximo 10 candidatos para no saturar al LLM
+    for local in candidatos[:10]:
+        mask = df['restaurante'] == local
+        if not mask.any(): continue
+        
+        # Tomamos las primeras 5 reseñas completas (o hasta 1000 caracteres)
+        # No filtramos por palabra clave, dejamos que el LLM lea todo el contexto.
+        reviews_texto = " ".join(df[mask]['texto'].fillna("").astype(str).head(5).tolist())
+        snippet = reviews_texto[:800] # Recortamos para ahorrar tokens
+        
+        texto_validacion += f"- LOCAL: {local}\n  RESEÑAS: \"...{snippet}...\"\n\n"
+
+    prompt = f"""
+    Eres un JUEZ DE CALIDAD para un buscador de restaurantes.
+    El usuario busca: "{query}"
+    
+    Tu tarea: Analizar las reseñas de los siguientes locales y DECIDIR si realmente cumplen con la búsqueda.
+    
+    CRITERIOS DE ELIMINACIÓN (FALSOS POSITIVOS):
+    1. La reseña menciona el término NEGATIVAMENTE (ej: "No tiene pelotero", "Debería tener juegos").
+    2. El término aparece en un contexto que NO es el que busca el usuario (ej: "Parece un pelotero de lo ruidoso", "No es un lugar para niños").
+    
+    CRITERIOS DE ACEPTACIÓN:
+    1. El local TIENE lo que se pide o es relevante semánticamente (ej: Busca "pelotero", reseña dice "juegos para chicos").
+    
+    CANDIDATOS:
+    {texto_validacion}
+    
+    Responde SOLO un JSON con la lista de nombres de los locales APROBADOS.
+    Ejemplo: ["Local A", "Local B"]
+    """
+    
+    try:
+        res = await llm.ainvoke(prompt)
+        clean = res.content.strip().replace("```json", "").replace("```", "")
+        validos = json.loads(clean)
+        return validos
+    except Exception as e:
+        logger.error(f"Error Juez LLM: {e}")
+        # Si falla el juez, ante la duda dejamos pasar a los originales (Fail-Open)
+        return candidatos
+
 # ==========================================
 # 6. ROUTER PRINCIPAL
 # ==========================================
@@ -841,80 +892,73 @@ async def procesar_consulta(query, df, vectorstore, llm_mini, llm_smart, ctx=Non
     # --- CAMINO C: RECOMENDACIÓN (RAG + PONDERACIÓN) ---
     if intent == "RECOMMENDATION":
         try:
-            # 1. Análisis Semántico
+            # 1. Análisis Semántico (Solo para seguridad y detectar tipo)
             analisis = await analizar_query_semantica(query, llm_smart)
             if analisis.get("tipo") == "BLOCK":
                 ctx['strikes'] = strikes + 1
                 return f"Epa, esa búsqueda no va. ({strikes+1}/5)", "rag", None, [], [], ""
 
-            keywords = analisis.get("keywords", [])
-            tipo_busqueda = analisis.get("tipo", "VIBE")
-            
-            # 2. Búsqueda Vectorial (Pinecone)
-            docs = vectorstore.similarity_search(query, k=50) # Traemos 50 candidatos
+            # 2. Búsqueda Vectorial (Pinecone) - TRAE SEMÁNTICA PURA
+            docs = vectorstore.similarity_search(query, k=50) 
             seen = set()
-            locales_preliminares = []
+            locales_candidatos = []
             for d in docs:
                 nom = d.metadata.get('nombre')
                 if nom and nom not in seen:
                     seen.add(nom)
-                    locales_preliminares.append(nom)
+                    locales_candidatos.append(nom)
+            
+            # (ELIMINADO EL FILTRO DE KEYWORDS TEXTUALES "if k in texto...")
+            # Dejamos que Pinecone se encargue de la similitud (Pelotero ≈ Juegos)
 
-            # 3. Filtrado por Keywords
-            locales_filtrados = []
-            if tipo_busqueda == "PRODUCTO":
-                for local in locales_preliminares:
-                    mask = df['restaurante'].str.lower() == local.lower()
-                    if mask.any():
-                        texto_gigante = " ".join(df[mask]['texto'].fillna("").astype(str).str.lower())
-                        for k in keywords:
-                            if k in texto_gigante:
-                                locales_filtrados.append(local)
-                                break
-            else:
-                locales_filtrados = locales_preliminares
-
-            # 4. RANKING PONDERADO (LA FORMULA MÁGICA)
-            # -------------------------------------------------------
+            # 3. PRE-RANKING MATEMÁTICO (Calidad)
+            # Ordenamos los 50 candidatos por Rating + Cantidad de Reviews
             def calcular_score_calidad(nombre_local):
                 mask = df['restaurante'].str.lower() == nombre_local.lower()
                 if not mask.any(): return 0
                 row = df[mask].iloc[0]
-                
                 rat = safe_float(row.get('rating_gral'))
                 revs = safe_int(row.get('total_reviews_google'))
-                
-                # Filtro anti-fantasmas (menos de 10 reviews no rankean)
-                if revs < 10: return 0 
-                
-                # FÓRMULA: Rating + (Log10(Reviews) * 0.3)
-                # Esto hace que 4.8 con 1000 reviews le gane a 5.0 con 10 reviews.
+                if revs < 5: return 0 
                 return rat + (math.log10(revs + 1) * 0.3)
-            # -------------------------------------------------------
 
-            # Ordenamos y cortamos el Top 5
-            locales_filtrados.sort(key=calcular_score_calidad, reverse=True)
-            locales_confirmados = locales_filtrados[:5]
+            locales_candidatos.sort(key=calcular_score_calidad, reverse=True)
+            
+            # Nos quedamos con los Top 10 mejores calificados para someterlos a juicio
+            top_candidatos = locales_candidatos[:10]
 
-            if not locales_confirmados: 
+            # 4. EL JUEZ LLM (Filtro de Contexto)
+            # Aquí es donde descartamos "Starbucks" si la reseña dice "vayan a un pelotero, no acá"
+            locales_confirmados = await verificar_candidatos_con_llm(
+                top_candidatos, df, query, llm_mini
+            )
+
+            # Si el juez fue muy estricto y borró todo, usamos los matemáticos como fallback
+            if not locales_confirmados and top_candidatos:
+                locales_confirmados = top_candidatos[:3]
+
+            # Recorte final a Top 5
+            locales_finales = locales_confirmados[:5]
+
+            if not locales_finales: 
                 return "No encontré lugares que coincidan con tu búsqueda.", "rag", None, [], [], ""
 
-            # 5. Generación de Respuesta
+            # 5. Generación de Cards y Respuesta
+            # Pasamos keywords vacías [] para que 'obtener_restaurant_cards' no intente filtrar nada más
             cards = await obtener_restaurant_cards(
-                locales_confirmados, df, llm_mini, query, tone, 
-                (tipo_busqueda == "PRODUCTO"), keywords
+                locales_finales, df, llm_mini, query, tone, 
+                strict_mode=False, keywords_list=[]
             )
-            nombres_finales = [c.nombre for c in cards]
-            locs = obtener_coordenadas(nombres_finales, df)
+            nombres_finales_cards = [c.nombre for c in cards]
+            locs = obtener_coordenadas(nombres_finales_cards, df)
             
             detalles_lugares = "\n".join([f"- {c.nombre}: {c.descripcion}" for c in cards])
             prefix = tone_system_instruction(tone)
             prompt_rag = (
                 f"{prefix}\nEl usuario buscó: '{query}'.\n"
-                f"Lugares seleccionados (ordenados por calidad/relevancia):\n{detalles_lugares}\n"
+                f"Lugares verificados:\n{detalles_lugares}\n"
                 f"INSTRUCCIONES:\n1. Saluda: 'Si estás buscando {query}, te recomiendo...'.\n"
-                "2. Si la query es rara, saluda genérico.\n"
-                "3. Genera la lista."
+                "2. Genera la lista con **Nombre** en negrita y descripción."
             )
             rag_resp = await llm_mini.ainvoke(prompt_rag)
             return rag_resp.content, "rag", None, locs, cards, ""
@@ -922,9 +966,7 @@ async def procesar_consulta(query, df, vectorstore, llm_mini, llm_smart, ctx=Non
         except Exception as e:
             logger.error(f"Error RAG: {e}")
             return "Tuve un problema técnico buscando eso.", "rag", None, [], [], ""
-
-    return "No entendí, ¿podés reformular?", "rag", None, [], [], ""
-
+        
 # ==========================================
 # 7. ENDPOINTS
 # ==========================================
