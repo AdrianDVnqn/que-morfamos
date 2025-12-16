@@ -1046,13 +1046,22 @@ async def procesar_consulta(query, df, vectorstore, llm_mini, llm_smart, ctx=Non
             locs = obtener_coordenadas(nombres_finales_cards, df)
             
             detalles_lugares = "\n".join([f"- {c.nombre}: {c.descripcion}" for c in cards])
+            
             prefix = tone_system_instruction(tone)
+            
+            # PROMPT CORREGIDO: INSTRUCCIONES ESTRICTAS DE FIDELIDAD
             prompt_rag = (
-                f"{prefix}\nEl usuario buscó: '{query}'.\n"
-                f"Lugares verificados:\n{detalles_lugares}\n"
-                f"INSTRUCCIONES:\n1. Saluda: 'Si estás buscando {query}, te recomiendo...'.\n"
-                "2. Genera la lista con **Nombre** en negrita y descripción."
+                f"{prefix}\n"
+                f"SITUACIÓN: El usuario buscó '{query}'.\n"
+                f"Hemos analizado las reseñas y encontramos estos resultados verificados:\n"
+                f"{detalles_lugares}\n\n"
+                f"INSTRUCCIONES CRÍTICAS (LEER ATENTAMENTE):\n"
+                "1. Tu única fuente de verdad son las descripciones de arriba. IGNORA tu conocimiento previo sobre estos lugares.\n"
+                "2. Si la descripción dice que el lugar TIENE lo que busca el usuario (ej: 'tiene pelotero', 'tiene juegos'), DEBES CONFIRMARLO en tu respuesta.\n"
+                "3. NO contradigas la información provista. Si la descripción dice 'sí', tu respuesta es 'sí'.\n"
+                "4. Genera una recomendación entusiasta para cada opción."
             )
+            
             rag_resp = await llm_mini.ainvoke(prompt_rag)
             return rag_resp.content, "rag", None, locs, cards, ""
             
