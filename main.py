@@ -382,11 +382,42 @@ async def generar_descripcion_async(llm, nombre, sample, tone='cordial'):
         return res.content.strip().replace('"','')
     except:
         return "Restaurante popular en Neuquén."
+    
+    
+def obtener_reviews_tematicas(df_local, keywords, limit=5):
+    """
+    Busca en TODAS las reviews del local aquellas que contengan las keywords.
+    Si encuentra, devuelve esas. Si no, devuelve las más recientes/relevantes.
+    """
+    if not keywords:
+        return df_local.head(limit)
+    
+    # Filtramos las reviews que contengan alguna de las keywords
+    # Usamos una expresión regular para buscar cualquiera de las palabras
+    pattern = '|'.join([re.escape(k) for k in keywords if len(k) > 3])
+    
+    if not pattern:
+        return df_local.head(limit)
+        
+    mask = df_local['texto'].str.lower().str.contains(pattern, regex=True)
+    reviews_tematicas = df_local[mask]
+    
+    if not reviews_tematicas.empty:
+        # Priorizamos las positivas si hay muchas (para evitar quejas viejas)
+        # Ordenamos por fecha o rating si es posible
+        return reviews_tematicas.head(limit)
+    else:
+        # Fallback: Si no hay mención explícita (raro si Pinecone lo trajo), devolvemos las generales
+        return df_local.head(limit)
 
 async def obtener_restaurant_cards(nombres_restaurantes, df, llm, query_context=None, tone='cordial', strict_mode=True, keywords_list=None):
     cards = []
     tasks = [] 
-    search_terms = keywords_list if keywords_list else ([query_context] if query_context else [])
+    
+    # Definimos keywords de búsqueda (si no vienen en lista, usamos la query)
+    search_keywords = keywords_list if keywords_list else ([query_context] if query_context else [])
+    # Limpiamos keywords cortas
+    search_keywords = [k.lower() for k in search_keywords if len(k) > 3]
 
     for nombre in nombres_restaurantes:
         if not nombre: continue
@@ -396,43 +427,52 @@ async def obtener_restaurant_cards(nombres_restaurantes, df, llm, query_context=
             row = rest_df.iloc[0]
             nombre_real = safe_str(row['restaurante'])
 
-            frase = ""
-            autor = ""
-            primary_topic = search_terms[0] if search_terms else None
-            best_review = seleccionar_mejor_review(rest_df, primary_topic)
+            # === CAMBIO CLAVE AQUÍ ===
+            # En lugar de tomar las primeras 5 al azar, buscamos las que hablan del tema
+            if search_keywords:
+                reviews_filtradas = obtener_reviews_tematicas(rest_df, search_keywords, limit=6)
+                # Si encontramos reviews temáticas, las usamos para armar el 'sample'
+                sample_text = " ... ".join([safe_str(t) for t in reviews_filtradas['texto']])[:3000]
+                
+                # También extraemos la mejor review temática para la "frase destacada"
+                best_review = reviews_filtradas.iloc[0] if not reviews_filtradas.empty else rest_df.iloc[0]
+            else:
+                sample_text = " ".join([safe_str(t) for t in rest_df['texto'].head(5)])[:800]
+                best_review = rest_df.iloc[0]
+            # =========================
+
+            frase = safe_str(best_review['texto'])[:200] + "..."
+            autor = formatear_autor(best_review.get('autor'))
+
+            # Cache key incluye el tema para que la descripción cambie según la búsqueda
+            # (Ej: Descripción para "Pizza" vs Descripción para "Pelotero")
+            topic_key = "-".join(search_keywords) if search_keywords else "general"
+            cache_key = f"desc_{nombre_real}_{topic_key}_{sanitize_tone(tone)}"
             
-            if query_context:
-                if strict_mode:
-                    if best_review is None: continue
-                else:
-                    if best_review is None: best_review = seleccionar_mejor_review(rest_df, None)
-
-            if best_review is not None:
-                frase = safe_str(best_review['texto'])[:350] + "..."
-                autor = formatear_autor(best_review.get('autor'))
-
-            cache_key = f"{nombre_real}__{sanitize_tone(tone)}"
             desc = cache.get_json("desc", cache_key)
+            
             if desc:
                 tasks.append({"type": "cached", "val": desc, "row": row, "frase": frase, "autor": autor, "nombre_real": nombre_real})
             else:
-                sample = " ".join([safe_str(t) for t in rest_df['texto'].head(5)])[:800]
-                task_coro = generar_descripcion_async(llm, nombre_real, sample, tone)
-                tasks.append({"type": "generate", "val": task_coro, "row": row, "frase": frase, "autor": autor, "nombre_real": nombre_real})
+                # Prompt mejorado para forzar la mención del tema
+                contexto_extra = f"El usuario busca específicamente: '{', '.join(search_keywords)}'. SI EL TEXTO LO MENCIONA, DESTAÇALO." if search_keywords else ""
+                
+                task_coro = generar_descripcion_async_tematica(llm, nombre_real, sample_text, tone, contexto_extra)
+                tasks.append({"type": "generate", "val": task_coro, "row": row, "frase": frase, "autor": autor, "nombre_real": nombre_real, "cache_key": cache_key})
 
+    # Ejecución Async
     generations_needed = [t['val'] for t in tasks if t['type'] == 'generate']
     if generations_needed:
         results = await asyncio.gather(*generations_needed)
     
     gen_idx = 0
     for item in tasks:
-        descripcion = ""
         if item['type'] == 'cached':
             descripcion = item['val']
         else:
             descripcion = results[gen_idx]
             gen_idx += 1
-            cache.set_json("desc", f"{item['nombre_real']}__{sanitize_tone(tone)}", descripcion)
+            cache.set_json("desc", item['cache_key'], descripcion)
 
         cards.append(RestaurantCard(
             nombre=item['nombre_real'],
@@ -446,16 +486,24 @@ async def obtener_restaurant_cards(nombres_restaurantes, df, llm, query_context=
             autor_reseña=safe_str(item['autor'])
         ))
     
-    if keywords_list and len(cards) > 1:
-        def calcular_score_densidad(card):
-            mask_rest = df['restaurante'] == card.nombre
-            texto_gigante = " ".join(df[mask_rest]['texto'].fillna("").astype(str).str.lower())
-            hits = 0
-            for k in keywords_list: hits += texto_gigante.count(k)
-            return hits / (card.total_reviews + 50)
-        cards.sort(key=calcular_score_densidad, reverse=True)
-
     return cards
+
+# Helper para el prompt de descripción
+async def generar_descripcion_async_tematica(llm, nombre, sample, tone, contexto_extra):
+    try:
+        prefix = tone_system_instruction(tone)
+        prompt = (
+            f"{prefix}\n"
+            f"CONTEXTO: Restaurante '{nombre}' en NEUQUÉN.\n"
+            f"{contexto_extra}\n"
+            f"Reviews de evidencia: {sample}\n\n"
+            "TAREA: Describe el lugar en 1 oración atractiva (máx 20 palabras).\n"
+            "Si las reviews confirman que tiene lo que busca el usuario (ej: pelotero), CONFIRMALO en la descripción."
+        )
+        res = await llm.ainvoke(prompt)
+        return res.content.strip().replace('"','')
+    except:
+        return f"Restaurante popular en Neuquén: {nombre}."
 
 def obtener_restaurant_cards_simple(nombres_restaurantes, df):
     cards = []
