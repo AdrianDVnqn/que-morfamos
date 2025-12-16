@@ -1050,14 +1050,47 @@ async def procesar_consulta(query, df, vectorstore, llm_mini, llm_smart, ctx=Non
                 if mask.any(): match_exists = True
 
             if match_exists:
-                ctx['original_query'] = query
-                resp, nombre_final, det, opciones = await resumir_opiniones_local(target, df, llm_mini, query, tone)
+                # ---------------------------------------------------------
+                # 1. LOGICA DE LIMPIEZA DE TÓPICO (CRÍTICO)
+                # ---------------------------------------------------------
+                # Detectamos si es solo el nombre (ej: "Atila") o una pregunta (ej: "Atila tiene juegos?")
+                # Si la query es casi igual de larga que el nombre, asumimos que NO hay tópico específico.
+                
+                es_solo_navegacion = len(query.strip()) <= len(target.strip()) + 5
+                
+                # Si es solo navegación, el topic es None (para que haga un resumen general).
+                # Si hay pregunta, usamos la query completa como topic.
+                topic_actual = None if es_solo_navegacion else query
+
+                # ---------------------------------------------------------
+                # 2. GESTIÓN DEL CONTEXTO (Anti-Zombie)
+                # ---------------------------------------------------------
+                # Siempre borramos la búsqueda anterior (ej: "pelotero")
+                if 'original_query' in ctx: del ctx['original_query']
+                
+                # Solo guardamos el nuevo topic si realmente es una pregunta específica
+                if topic_actual:
+                    ctx['original_query'] = topic_actual
+
+                # ---------------------------------------------------------
+                # 3. LLAMADAS A FUNCIONES (Usando la variable limpia)
+                # ---------------------------------------------------------
+                # OJO ACÁ: Cambiamos 'query' por 'topic_actual'
+                resp, nombre_final, det, opciones = await resumir_opiniones_local(
+                    target, df, llm_mini, topic=topic_actual, tone=tone
+                )
                 
                 if opciones: return resp, "resumen", opciones, [], [], ""
                 
                 if nombre_final:
                     ctx['last_entity'] = nombre_final
-                    cards = await obtener_restaurant_cards([nombre_final], df, llm_mini, query, tone)
+                    
+                    # ACÁ TAMBIÉN: Usamos 'topic_actual' (que puede ser None)
+                    # Esto evita que busque "Atila" dentro de las reviews de "Atila"
+                    cards = await obtener_restaurant_cards(
+                        [nombre_final], df, llm_mini, query_context=topic_actual, tone=tone
+                    )
+                    
                     locs = obtener_coordenadas([nombre_final], df)
                     return resp, "resumen", None, locs, cards, det
             
@@ -1071,8 +1104,16 @@ async def procesar_consulta(query, df, vectorstore, llm_mini, llm_smart, ctx=Non
 
 # --- CAMINO C: RECOMENDACIÓN (PIPELINE ESTRICTO) ---
     if intent == "RECOMMENDATION":
-        # Si busco recomendaciones nuevas, olvido el lugar anterior
-        if 'last_entity' in ctx: del ctx['last_entity'] # <--- LIMPIEZA
+# ====================================================
+        # 🛡️ FIX CRÍTICO: LIMPIEZA DE MEMORIA ZOMBIE
+        # ====================================================
+        # Si entramos acá, es una búsqueda nueva. Borramos
+        # cualquier rastro de la entidad o búsqueda anterior.
+        
+        vars_to_kill = ['last_entity', 'original_query', 'pending_options']
+        for var in vars_to_kill:
+            if var in ctx: 
+                del ctx[var]
         try:
             # 1. Análisis Semántico
             analisis = await analizar_query_semantica(query, llm_smart)
