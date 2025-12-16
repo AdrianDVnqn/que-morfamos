@@ -717,36 +717,64 @@ async def clasificar_intencion(query, llm, last_entity=None):
         # Ante la duda, asumimos recomendación que es más seguro
         return {"intent": "RECOMMENDATION", "entity": None}
 async def consultar_estadisticas(query, df, llm):
-    """ USA LLM_MINI """
+    """
+    Fusión: Robustez técnica (ASCII) + Respuesta Inteligente (Listado).
+    """
     try:
-        prompt = f"Extrae palabra clave para filtrar (ej: 'pizzerias' -> 'pizza'). Query: {query}. Solo la palabra."
-        keyword_raw = await llm.ainvoke(prompt)
-        keyword_text = str(keyword_raw.content).strip().lower()
-        keyword_text = re.sub(r'[^\w\s]', '', keyword_text)
+        # 1. Extracción inteligente (Mejor que split simple)
+        # Le pedimos al LLM que normalice a singular y quite basura
+        prompt_extract = f"""
+        Analiza la query: "{query}"
+        Identifica la CATEGORÍA o PRODUCTO que el usuario quiere contar.
+        Ejemplos: 
+        - "Cuantas pizzerias hay" -> "pizzeria"
+        - "Lugares de sushi" -> "sushi"
+        - "Total de bares" -> "bar"
         
-        klist = get_keywords_from_topic(keyword_text)
-        keyword = klist[0] if klist else (keyword_text.split()[0] if keyword_text else "")
-        if not keyword:
-            qk = get_keywords_from_topic(query)
-            keyword = qk[0] if qk else (query.split()[0] if query else "")
-        keyword = keyword.strip()
+        Responde SOLO la palabra clave en singular y minúscula. Si pregunta por todo, responde "total".
+        """
+        keyword_raw = await llm.ainvoke(prompt_extract)
+        keyword = str(keyword_raw.content).strip().lower().replace('"', '').replace('.', '')
         
-        total = df['restaurante'].nunique()
-        if "total" in keyword or len(keyword) < 2:
-            return f"Tengo registrados **{total}** restaurantes.", []
-            
+        # 2. Caso "Total"
+        if keyword in ["total", "todo", "restaurantes", "lugares"]:
+            total = df['restaurante'].nunique()
+            return f"Tengo registrados un total de **{total}** locales en la base de datos.", []
+
+        # 3. Normalización ASCII (Tu lógica ganadora)
+        # Quitamos acentos de la keyword para matchear con tus columnas ASCII
         keyword_ascii = unicodedata.normalize('NFD', keyword)
         keyword_ascii = ''.join(ch for ch in keyword_ascii if unicodedata.category(ch) != 'Mn')
         keyword_ascii = re.sub(r'[^\w\s]', '', keyword_ascii)
         
-        mask = (df['restaurante_ascii'].str.contains(keyword_ascii, na=False) | 
-                df['texto_ascii'].str.contains(keyword_ascii, na=False))
-        locales_filtrados = df[mask]['restaurante'].unique().tolist()
+        # 4. Filtrado (Usando tus columnas optimizadas)
+        # Asumimos que df ya tiene 'restaurante_ascii' y 'texto_ascii'
+        mask = (df['restaurante_ascii'].str.contains(keyword_ascii, case=False, na=False) | 
+                df['texto_ascii'].str.contains(keyword_ascii, case=False, na=False))
         
-        return f"Encontré **{len(locales_filtrados)}** lugares relacionados con '{keyword}'.", locales_filtrados
+        matches = df[mask]['restaurante'].unique().tolist()
+        total_count = len(matches)
+
+        # 5. Generación de Respuesta "Humana" (Mi lógica ganadora)
+        if total_count == 0:
+            return f"No encontré lugares registrados bajo la categoría **'{keyword}'**.", []
+        
+        elif total_count == 1:
+            return f"Encontré solo uno: **{matches[0]}**.", matches
+            
+        elif total_count <= 10:
+            # Si son pocos, los nombramos todos
+            lista_str = ", ".join(matches)
+            return f"Encontré **{total_count}** lugares de {keyword}: {lista_str}.", matches
+            
+        else:
+            # Si son muchos, damos el total y ejemplos
+            ejemplos = ", ".join(matches[:5])
+            return f"¡Un montón! Encontré **{total_count}** lugares de {keyword}. Algunos son: {ejemplos}, entre otros.", matches
+
     except Exception as e:
         logger.error(f"Error consultar_estadisticas: {e}")
-        return "No pude calcular esa estadística.", []
+        return "Tuve un problema calculando esa estadística.", []
 
 async def resumir_opiniones_local(query_str, df, llm, topic=None, tone='cordial', es_seleccion_directa=False):
     # 1. Validación básica
@@ -965,12 +993,25 @@ async def procesar_consulta(query, df, vectorstore, llm_mini, llm_smart, ctx=Non
     intent = clasificacion.get("intent")
     entity_detected = clasificacion.get("entity")
 
-    # --- CAMINO A: ESTADÍSTICAS ---
+# --- CAMINO A: ESTADÍSTICAS ---
     if intent == "STATS":
-        resp, locales = await consultar_estadisticas(query, df, llm_mini)
-        cards = obtener_restaurant_cards_simple(locales, df)
-        locs = obtener_coordenadas(locales, df)
-        return resp, "estadisticas", None, locs, cards, ""
+        # 1. Obtenemos dato numérico y lista
+        resp_texto, lista_locales = await consultar_estadisticas(query, df, llm_mini)
+        
+        cards = []
+        # Siempre mostramos los puntos en el mapa (el mapa se banca 50 pines)
+        locs = obtener_coordenadas(lista_locales, df)
+        
+        # 2. LÓGICA DE VISUALIZACIÓN INTELIGENTE
+        # Solo generamos tarjetas visuales si son poquitas (Top 5)
+        # para no spammear el chat.
+        if 0 < len(lista_locales) <= 5:
+            # Usamos la versión FULL (con LLM) porque son pocas y vale la pena que se vean lindas
+            cards = await obtener_restaurant_cards(
+                lista_locales, df, llm_mini, query_context=query, tone=tone, strict_mode=False
+            )
+        
+        return resp_texto, "estadisticas", None, locs, cards, ""
 
     # --- CAMINO B: INFO ESPECÍFICA (UN LUGAR) ---
     if intent == "SPECIFIC_INFO":
