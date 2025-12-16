@@ -4,8 +4,8 @@ import re
 import unicodedata
 import asyncio
 import logging
+import math
 from contextlib import asynccontextmanager
-
 import pandas as pd
 import numpy as np
 from typing import List, Optional
@@ -583,35 +583,39 @@ def detectar_mencion_exacta(query, df):
                     
     return None
 
-async def clasificar_intencion(query, llm, match_db=None):
-    """ USA LLM_SMART """
-    pista_contexto = ""
-    if match_db:
-        pista_contexto = (
-            f"⚠️ DATO: Existe un comercio real llamado '{match_db}'. "
-            f"Prioriza 'SPECIFIC_INFO' si la query parece referirse a él."
-        )
+async def clasificar_intencion(query, llm, last_entity=None):
+    """
+    USA LLM_SMART. 
+    Define si el usuario quiere info de UN lugar específico o una LISTA de opciones.
+    """
+    pista_contexto = f"Contexto anterior: '{last_entity}'" if last_entity else "Sin contexto previo."
 
     template = f"""
-    Eres el MODERADOR de una App de Comida. Query: "{{query}}"
+    Eres el ROUTER de una IA Gastronómica. Tu trabajo es clasificar la query.
+    Query: "{{query}}"
     {pista_contexto}
 
-    REGLAS DE INTENCIÓN:
-    - "Mejores cervecerias" -> "RECOMMENDATION".
-    - "Opiniones de Antares" -> "SPECIFIC_INFO".
-    - "Donde comer pizza" -> "RECOMMENDATION".
-    - "Cuantos locales hay" -> "STATS".
+    REGLAS DE CLASIFICACIÓN:
+    1. SPECIFIC_INFO: El usuario pregunta por UN lugar específico por su nombre.
+       - Ej: "Que tal es Antares", "Opiniones de La Nonna", "Precio en Atu", "Donde queda Growler".
+       - Ej: "y es caro?" (Refiere al contexto anterior).
+    
+    2. RECOMMENDATION: El usuario busca opciones, categorías o características (Plural o Genérico).
+       - Ej: "Lugares para ir con familia", "Donde comer pizza", "Mejores cervecerias", "Algo con pelotero".
+       - Ej: "Heladerias", "Cafeterias", "Lugares lindos".
+       
+    3. STATS: Preguntas de cantidad.
+       - Ej: "Cuantos locales tenes", "Total de parrillas".
 
-    Responde JSON: {{"intent": "...", "entity": "..."}} 
+    Responde JSON: {{"intent": "SPECIFIC_INFO" | "RECOMMENDATION" | "STATS", "entity": "NombreDetectado" | "LAST_ENTITY" | null}}
     """
     try:
-        chain = ChatPromptTemplate.from_template(template) | llm | StrOutputParser()
-        res_str = await chain.ainvoke({"query": query})
-        clean_json = res_str.strip().replace("```json", "").replace("```", "")
-        return json.loads(clean_json)
-    except:
+        res = await llm.ainvoke(template)
+        clean = res.content.strip().replace("```json", "").replace("```", "")
+        return json.loads(clean)
+    except: 
+        # Ante la duda, asumimos recomendación que es más seguro
         return {"intent": "RECOMMENDATION", "entity": None}
-
 async def consultar_estadisticas(query, df, llm):
     """ USA LLM_MINI """
     try:
@@ -748,130 +752,106 @@ async def procesar_consulta(query, df, vectorstore, llm_mini, llm_smart, ctx=Non
     if ctx is None: ctx = {}
     tone = sanitize_tone(ctx.get('tone'))
     
-    if user_ip:
-        ban_key = f"ban:{user_ip}"
-        if cache.get_value(ban_key): return "⛔ Sistema bloqueado temporalmente.", "blocked", None, [], [], ""
-
+    # ==========================================
+    # 1. CAPA DE SEGURIDAD (NUCLEAR)
+    # ==========================================
+    if user_ip and cache.get_value(f"ban:{user_ip}"): 
+        return "⛔ Sistema bloqueado.", "blocked", None, [], [], ""
+    
     strikes = ctx.get('strikes', 0)
-    if strikes >= 5: return "⛔ Bloqueado por seguridad.", "blocked", None, [], [], ""
+    if strikes >= 5: return "⛔ Bloqueado.", "blocked", None, [], [], ""
 
-    # === SEGURIDAD HARDCODED (Capa 0 - Nuclear) ===
     if check_keyword_ban(query):
-        strikes += 1
-        ctx['strikes'] = strikes
-        logger.warning(f"🚫 Query bloqueada por Hard Ban: '{query}'")
-        return f"Epa, esa búsqueda no va. Preguntame sobre comida o lugares. (Aviso {strikes}/5)", "rag", None, [], [], ""
+        ctx['strikes'] = strikes + 1
+        return f"Epa, esa búsqueda no va. ({strikes+1}/5)", "rag", None, [], [], ""
 
+    # ==========================================
+    # 2. CONTEXTO NUMÉRICO (MENÚS)
+    # ==========================================
     if 'pending_options' in ctx and query.strip().isdigit():
         num = int(query.strip())
         pending = ctx['pending_options']
-        opciones = pending.get('options', []) if isinstance(pending, dict) else pending
+        opciones = pending.get('options', [])
         if 1 <= num <= len(opciones):
             seleccion = opciones[num - 1]
             ctx['last_entity'] = seleccion
-            original_topic = ctx.get('original_query', seleccion) 
-            resp, nombre_real, det, _ = await resumir_opiniones_local(
-                seleccion, df, llm_mini, original_topic, tone, es_seleccion_directa=True
-            )
+            original_topic = ctx.get('original_query', seleccion)
+            resp, nombre_real, det, _ = await resumir_opiniones_local(seleccion, df, llm_mini, original_topic, tone, True)
             cards = await obtener_restaurant_cards([nombre_real], df, llm_mini, original_topic, tone)
             locs = obtener_coordenadas([nombre_real], df)
             return resp, "resumen", None, locs, cards, det
         return f"Elegí entre 1 y {len(opciones)}", "resumen", pending, [], [], ""
 
-    posible_match = detectar_mencion_exacta(query, df)
+    # ==========================================
+    # 3. SMART ROUTING (EL CEREBRO V8)
+    # ==========================================
+    last_ent = ctx.get('last_entity')
+    # El LLM decide qué quiere el usuario
+    clasificacion = await clasificar_intencion(query, llm_smart, last_entity=last_ent)
+    intent = clasificacion.get("intent")
+    entity_detected = clasificacion.get("entity")
 
-    ranking_triggers = ["mejores", "mejor", "top", "ranking", "cuales son"]
-    es_ranking = any(t in query.lower() for t in ranking_triggers)
-    intent = ""
-    entity = None
-
-    if es_ranking:
-        if posible_match and posible_match.lower() in query.lower():
-            pass 
-        else:
-            intent = "RECOMMENDATION"
-            posible_match = None 
-
-    stats_triggers = ["cuantos", "cuántos", "cantidad", "total de", "numero de"]
-    es_pregunta_stats = any(trigger in query.lower() for trigger in stats_triggers)
-
-    if not intent:
-        if es_pregunta_stats:
-            intent = "STATS"
-        else:
-            clasificacion = await clasificar_intencion(query, llm_smart, match_db=posible_match)
-            intent = clasificacion.get("intent")
-            entity = clasificacion.get("entity")
-
-    if intent == "IRRELEVANT":
-        strikes += 1
-        ctx['strikes'] = strikes 
-        if strikes >= 5:
-             if user_ip: cache.set_value(f"ban:{user_ip}", "true", expire=7200)
-             return "⛔ Has alcanzado el límite. Chau.", "blocked", None, [], [], ""
-        return "Mmm, no entendí o eso no tiene que ver con comida. Probá otra cosa.", "rag", None, [], [], ""
-
-    if intent == "RECOMMENDATION" and posible_match:
-        intent = "SPECIFIC_INFO"
-        entity = posible_match
-
+    # --- CAMINO A: ESTADÍSTICAS ---
     if intent == "STATS":
         resp, locales = await consultar_estadisticas(query, df, llm_mini)
         cards = obtener_restaurant_cards_simple(locales, df)
         locs = obtener_coordenadas(locales, df)
         return resp, "estadisticas", None, locs, cards, ""
 
+    # --- CAMINO B: INFO ESPECÍFICA (UN LUGAR) ---
     if intent == "SPECIFIC_INFO":
-        # LÓGICA CORREGIDA: NO USAR LAST_ENTITY SI NO FUE SOLICITADO
         target = None
-        
-        # 1. Si el LLM dice explícitamente "LAST_ENTITY" (ej: "y es caro?")
-        if entity == "LAST_ENTITY":
-            target = ctx.get('last_entity')
-        # 2. Si el LLM extrajo un nombre nuevo (ej: "Growler"), ÚSALO.
-        elif entity and entity != "LAST_ENTITY":
-            target = entity
-        # 3. Si Regex encontró algo (Match exacto), usalo como fallback fuerte.
-        elif posible_match:
-            target = posible_match
-        
-        # (Aquí eliminamos el 'else: target = ctx.get(last_entity)' que causaba el error)
+        if entity_detected == "LAST_ENTITY": target = last_ent
+        elif entity_detected: target = entity_detected
+        else: target = query # Fallback
 
         if target:
-            target_clean = target.lower().strip()
-            match_exists = df['restaurante'].str.lower().str.contains(target_clean, na=False, regex=False).any()
-            
+            # Intentamos resolver el nombre real
+            # Usamos una búsqueda simple primero para validar existencia
+            match_exists = False
+            nombre_candidato = detectar_mencion_exacta(target, df) # Usamos regex helper
+            if nombre_candidato:
+                target = nombre_candidato
+                match_exists = True
+            else:
+                # Busqueda laxa si regex falló
+                mask = df['restaurante'].str.lower().str.contains(target.lower().strip(), na=False, regex=False)
+                if mask.any(): match_exists = True
+
             if match_exists:
                 ctx['original_query'] = query
-                resp, nombre_real, det, opciones = await resumir_opiniones_local(target, df, llm_mini, query, tone)
+                resp, nombre_final, det, opciones = await resumir_opiniones_local(target, df, llm_mini, query, tone)
+                
                 if opciones: return resp, "resumen", opciones, [], [], ""
-                if nombre_real:
-                    ctx['last_entity'] = nombre_real
-                    cards = await obtener_restaurant_cards([nombre_real], df, llm_mini, query, tone)
-                    locs = obtener_coordenadas([nombre_real], df)
+                
+                if nombre_final:
+                    ctx['last_entity'] = nombre_final
+                    cards = await obtener_restaurant_cards([nombre_final], df, llm_mini, query, tone)
+                    locs = obtener_coordenadas([nombre_final], df)
                     return resp, "resumen", None, locs, cards, det
-            else:
-                # Si el target era explícito ("Growler") y no existe en DF, avisar en lugar de inventar.
-                if entity and entity != "LAST_ENTITY":
-                     return f"No tengo info sobre **{entity}** en Neuquén. ¿Se llama así el lugar?", "rag", None, [], [], ""
+            
+            # Si era específico pero no existe, avisamos (salvo que sea recomendación disfrazada)
+            if entity_detected and entity_detected != "LAST_ENTITY":
+                 # Fallback inteligente: si no encontramos "Mc Donalds", capaz Pinecone encuentra algo similar
+                 pass 
         
-        # Si no hay target válido, pasamos a recomendación general
+        # Si falló lo específico, pasamos a Recomendación
         intent = "RECOMMENDATION"
 
+    # --- CAMINO C: RECOMENDACIÓN (RAG + PONDERACIÓN) ---
     if intent == "RECOMMENDATION":
         try:
-            # 1. ANÁLISIS SEMÁNTICO
+            # 1. Análisis Semántico
             analisis = await analizar_query_semantica(query, llm_smart)
-            
             if analisis.get("tipo") == "BLOCK":
-                # ... (bloqueo de seguridad igual que antes) ...
-                return "Epa, esa búsqueda no va...", "rag", None, [], [], ""
+                ctx['strikes'] = strikes + 1
+                return f"Epa, esa búsqueda no va. ({strikes+1}/5)", "rag", None, [], [], ""
 
             keywords = analisis.get("keywords", [])
             tipo_busqueda = analisis.get("tipo", "VIBE")
             
-            # 2. BÚSQUEDA VECTORIAL (Aumentamos K para tener más tela para cortar)
-            docs = vectorstore.similarity_search(query, k=50) # Subimos de 25 a 50
+            # 2. Búsqueda Vectorial (Pinecone)
+            docs = vectorstore.similarity_search(query, k=50) # Traemos 50 candidatos
             seen = set()
             locales_preliminares = []
             for d in docs:
@@ -880,7 +860,7 @@ async def procesar_consulta(query, df, vectorstore, llm_mini, llm_smart, ctx=Non
                     seen.add(nom)
                     locales_preliminares.append(nom)
 
-            # 3. FILTRADO POR KEYWORDS (Igual que antes)
+            # 3. Filtrado por Keywords
             locales_filtrados = []
             if tipo_busqueda == "PRODUCTO":
                 for local in locales_preliminares:
@@ -894,20 +874,8 @@ async def procesar_consulta(query, df, vectorstore, llm_mini, llm_smart, ctx=Non
             else:
                 locales_filtrados = locales_preliminares
 
-            if not locales_filtrados:
-                 return "No encontré lugares...", "rag", None, [], [], ""
-
-            # ==============================================================================
-            # 4. ORDENAMIENTO PONDERADO (NUEVA LÓGICA)
-            # ==============================================================================
-            # Fórmula: Score = Rating + (Log10(Reviews + 1) * 0.3)
-            # Esto hace que las reviews pesen, pero no opaquen totalmente al rating.
-            # Ejemplo: 
-            # - Local A (4.8, 200 reviews) -> 4.8 + (2.3 * 0.3) = 5.49 (GANA)
-            # - Local B (5.0, 10 reviews)  -> 5.0 + (1.0 * 0.3) = 5.30 (PIERDE)
-            
-            import math 
-
+            # 4. RANKING PONDERADO (LA FORMULA MÁGICA)
+            # -------------------------------------------------------
             def calcular_score_calidad(nombre_local):
                 mask = df['restaurante'].str.lower() == nombre_local.lower()
                 if not mask.any(): return 0
@@ -916,45 +884,37 @@ async def procesar_consulta(query, df, vectorstore, llm_mini, llm_smart, ctx=Non
                 rat = safe_float(row.get('rating_gral'))
                 revs = safe_int(row.get('total_reviews_google'))
                 
-                if revs < 5: return 0 # Filtro anti-fantasmas
+                # Filtro anti-fantasmas (menos de 10 reviews no rankean)
+                if revs < 10: return 0 
                 
-                # Logaritmo base 10 suaviza la cantidad (1000 reviews no valen 100 veces más que 10)
-                score = rat + (math.log10(revs + 1) * 0.3) 
-                return score
+                # FÓRMULA: Rating + (Log10(Reviews) * 0.3)
+                # Esto hace que 4.8 con 1000 reviews le gane a 5.0 con 10 reviews.
+                return rat + (math.log10(revs + 1) * 0.3)
+            # -------------------------------------------------------
 
-            # Ordenamos la lista filtrada por este score de mayor a menor
+            # Ordenamos y cortamos el Top 5
             locales_filtrados.sort(key=calcular_score_calidad, reverse=True)
-
-            # AHORA SÍ, recortamos los 5 mejores
             locales_confirmados = locales_filtrados[:5]
-            # ==============================================================================
 
-            es_estricto = (tipo_busqueda == "PRODUCTO")
-            
+            if not locales_confirmados: 
+                return "No encontré lugares que coincidan con tu búsqueda.", "rag", None, [], [], ""
+
+            # 5. Generación de Respuesta
             cards = await obtener_restaurant_cards(
                 locales_confirmados, df, llm_mini, query, tone, 
-                strict_mode=es_estricto, keywords_list=keywords
+                (tipo_busqueda == "PRODUCTO"), keywords
             )
-            
             nombres_finales = [c.nombre for c in cards]
-            
-            if not nombres_finales:
-                 return "Encontré referencias pero no pude confirmar la info detallada.", "rag", None, [], [], ""
-
             locs = obtener_coordenadas(nombres_finales, df)
             
-            # 4. RESPUESTA PERSONALIZADA
             detalles_lugares = "\n".join([f"- {c.nombre}: {c.descripcion}" for c in cards])
             prefix = tone_system_instruction(tone)
             prompt_rag = (
-                f"{prefix}\n"
-                f"El usuario buscó: '{query}'.\n\n"
-                f"He seleccionado estos lugares:\n{detalles_lugares}\n\n"
-                "INSTRUCCIONES DE RESPUESTA:\n"
-                f"1. Tu saludo inicial DEBE SER: 'Si estás buscando {query}, te recomiendo estas opciones:' (OJO: Si '{query}' es grosero o raro, ignora esto y di 'Acá tenés opciones:').\n"
-                "2. Genera una lista de viñetas.\n"
-                "3. En cada viñeta, poné el **Nombre del Lugar** en negrita (Markdown).\n"
-                "4. Agregá AL LADO una frase muy breve (1 línea) explicando por qué está bueno, basada en la info que te pasé arriba."
+                f"{prefix}\nEl usuario buscó: '{query}'.\n"
+                f"Lugares seleccionados (ordenados por calidad/relevancia):\n{detalles_lugares}\n"
+                f"INSTRUCCIONES:\n1. Saluda: 'Si estás buscando {query}, te recomiendo...'.\n"
+                "2. Si la query es rara, saluda genérico.\n"
+                "3. Genera la lista."
             )
             rag_resp = await llm_mini.ainvoke(prompt_rag)
             return rag_resp.content, "rag", None, locs, cards, ""
@@ -963,7 +923,7 @@ async def procesar_consulta(query, df, vectorstore, llm_mini, llm_smart, ctx=Non
             logger.error(f"Error RAG: {e}")
             return "Tuve un problema técnico buscando eso.", "rag", None, [], [], ""
 
-    return "No entendí bien qué buscás, ¿podés reformular?", "rag", None, [], [], ""
+    return "No entendí, ¿podés reformular?", "rag", None, [], [], ""
 
 # ==========================================
 # 7. ENDPOINTS
