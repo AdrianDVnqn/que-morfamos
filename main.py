@@ -478,11 +478,20 @@ def obtener_restaurant_cards_simple(nombres_restaurantes, df):
 
 async def analizar_query_semantica(query, llm):
     """ USA LLM_SMART. Retorna: {tipo, keywords} """
-    # 0. BYPASS MANUAL DE SEGURIDAD (White-list absoluta para términos problemáticos pero seguros)
-    # Si la query habla de helados, ES SEGURA y es VIBE. Cortamos acá.
     q_lower = query.lower()
-    if "helad" in q_lower: 
-        return {"tipo": "VIBE", "keywords": ["heladeria"]}
+    
+    # ==============================================================================
+    # 0. BYPASS DE SEGURIDAD (LISTA BLANCA ABSOLUTA)
+    # ==============================================================================
+    # Si la query contiene alguna de estas palabras, ES SEGURA y es VIBE.
+    # Esto evita que el LLM confunda "pelotero" (niños) con "pelotas" (sexual)
+    # o bloquee helados/cremas por error.
+    whitelist = ["helad", "crema", "pelotero", "juego", "niñ", "chic", "infantil"]
+    
+    for safe_word in whitelist:
+        if safe_word in q_lower:
+            # Retornamos VIBE inmediatamente, sin gastar tokens ni arriesgar bloqueo
+            return {"tipo": "VIBE", "keywords": [q_lower]}
 
     cache_key = f"analysis_{q_lower.strip()}"
     cached = cache.get_json("analysis", cache_key)
@@ -490,13 +499,16 @@ async def analizar_query_semantica(query, llm):
 
     template = """
     Analiza la intención del usuario. Query: "{query}"
+    
     1. SEGURIDAD:
-       - Si contiene términos sexuales, insultos o violencia ("tetas", "pito", "travesti", "culo", "puta"), MARCA "tipo": "BLOCK".
-       - EXCEPCIONES (NO BLOQUEAR): "Crema", "Leche", "Pechuga", "Chorizo", "Huevos", "Salchicha".
+       - Si contiene términos sexuales explícitos, insultos o violencia, MARCA "tipo": "BLOCK".
+       - EXCEPCIONES (NO BLOQUEAR): "Pechuga", "Chorizo", "Huevos", "Salchicha", "Bolas de fraile".
+    
     2. CLASIFICACIÓN (Si es seguro):
-       - "PRODUCTO": Plato o ingrediente concreto (Pizza, Sushi, Flan).
-       - "VIBE": Tipo de local (Cerveceria, Parrilla), ocasión o Bebida.
-    3. KEYWORDS: Extrae sustantivos en SINGULAR. Ignora "mejores", "top".
+       - "PRODUCTO": Plato o ingrediente concreto (Pizza, Sushi).
+       - "VIBE": Tipo de local, ocasión o Bebida.
+    
+    3. KEYWORDS: Extrae sustantivos en SINGULAR.
     Responde SOLO JSON: {{"tipo": "PRODUCTO" | "VIBE" | "BLOCK", "keywords": ["k1"]}}
     """
     try:
@@ -504,6 +516,7 @@ async def analizar_query_semantica(query, llm):
         clean = res.content.strip().replace("```json", "").replace("```", "")
         data = json.loads(clean)
         
+        # Limpieza de keywords
         stopwords_ranking = ["mejores", "mejor", "top", "ranking", "los", "las", "el", "la", "de", "en", "neuquen"]
         words = q_lower.split()
         for w in words:
@@ -511,12 +524,16 @@ async def analizar_query_semantica(query, llm):
                 w_sing = w
                 if w.endswith('es') and len(w) > 4: w_sing = w[:-2]
                 elif w.endswith('s') and len(w) > 3: w_sing = w[:-1]
+                
                 if w_sing not in data.get('keywords', []):
                     if 'keywords' not in data: data['keywords'] = []
                     data['keywords'].append(w_sing)
+                    
         cache.set_json("analysis", cache_key, data)
         return data
-    except: return {"tipo": "VIBE", "keywords": [q_lower]}
+    except: 
+        # Si el LLM falla, ante la duda dejamos pasar como VIBE (Fail-Open para usabilidad)
+        return {"tipo": "VIBE", "keywords": [q_lower]}
 
 def detectar_mencion_exacta(query, df):
     """
