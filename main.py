@@ -683,39 +683,59 @@ def detectar_mencion_exacta(query, df):
                     
     return None
 
-async def clasificar_intencion(query, llm, last_entity=None):
+async def clasificar_intencion(query, llm):
     """
-    USA LLM_SMART. 
-    Define si el usuario quiere info de UN lugar específico o una LISTA de opciones.
+    Router Inteligente V2.
+    Detecta insultos semánticamente sin listas hardcodeadas.
     """
-    pista_contexto = f"Contexto anterior: '{last_entity}'" if last_entity else "Sin contexto previo."
-
-    template = f"""
-    Eres el ROUTER de una IA Gastronómica. Tu trabajo es clasificar la query.
-    Query: "{{query}}"
-    {pista_contexto}
-
-    REGLAS DE CLASIFICACIÓN:
-    1. SPECIFIC_INFO: El usuario pregunta por UN lugar específico por su nombre.
-       - Ej: "Que tal es Antares", "Opiniones de La Nonna", "Precio en Atu", "Donde queda Growler".
-       - Ej: "y es caro?" (Refiere al contexto anterior).
     
-    2. RECOMMENDATION: El usuario busca opciones, categorías o características (Plural o Genérico).
-       - Ej: "Lugares para ir con familia", "Donde comer pizza", "Mejores cervecerias", "Algo con pelotero".
-       - Ej: "Heladerias", "Cafeterias", "Lugares lindos".
-       
-    3. STATS: Preguntas de cantidad de restaurantes que ofrecen un determinado producto (sushi, pizza, asado, panchos, etc.).
-       - Ej: "Cuantos lugares de sushi hay", "cuantas pizzerias hay", "total de parrillas".
-
-    Responde JSON: {{"intent": "SPECIFIC_INFO" | "RECOMMENDATION" | "STATS", "entity": "NombreDetectado" | "LAST_ENTITY" | null}}
+    system_prompt = """
+    Eres el cerebro clasificador de un asistente gastronómico.
+    Analiza la frase del usuario y clasifícala en UNA de estas 5 categorías.
+    
+    PRIORIDAD 1: BLOCK (Seguridad y Ofensas)
+    - Si la frase contiene INSULTOS, agresiones, palabras obscenas o falta de respeto directa.
+    - Ejemplos: "pelotudo", "bobo", "andate a cagar", "hijo de p*", "chupala", "idiota".
+    - Cualquier ataque al bot cae acá.
+    
+    PRIORIDAD 2: STATS (Estadísticas)
+    - Preguntas explícitas sobre CANTIDADES o CONTEOS.
+    - Clave: Empieza con "Cuantos", "Total de", "Numero de", "Que cantidad".
+    - Ejemplos: "¿Cuantas pizzerias hay?", "Total de bares".
+    
+    PRIORIDAD 3: SPECIFIC (Info puntual)
+    - Preguntas sobre un lugar específico por su nombre.
+    - Ejemplos: "¿Donde queda Rancho Grande?", "Horario de Atila".
+    
+    PRIORIDAD 4: RECOMMENDATION (Búsqueda)
+    - Busca opciones para comer o lugares con características.
+    - Ejemplos: "Lugares con pelotero", "Quiero sushi", "Parrilla barata".
+    - Si dice "Lugares con X", es esta categoría.
+    
+    PRIORIDAD 5: GENERAL (Charla y Otros)
+    - Saludos, agradecimientos, incoherencias o temas off-topic (política, fútbol).
+    - Ejemplos: "Hola", "Gracias", "asdfg", "Aguante Boca".
+    
+    Responde SOLO la palabra de la categoría (ej: BLOCK).
     """
+    
     try:
-        res = await llm.ainvoke(template)
-        clean = res.content.strip().replace("```json", "").replace("```", "")
-        return json.loads(clean)
-    except: 
-        # Ante la duda, asumimos recomendación que es más seguro
-        return {"intent": "RECOMMENDATION", "entity": None}
+        # Temperature 0 para que no sea creativo clasificando
+        res = await llm.ainvoke(system_prompt + f"\nQUERY USUARIO: '{query}'")
+        intent = res.content.strip().upper().replace('"', '').replace('.', '')
+        
+        validos = ["BLOCK", "STATS", "SPECIFIC", "RECOMMENDATION", "GENERAL"]
+        
+        # Limpieza básica
+        for v in validos:
+            if v in intent: return v
+            
+        return "GENERAL" # Fallback ante duda
+        
+    except Exception as e:
+        logger.error(f"Error Router: {e}")
+        return "GENERAL"
+    
 async def consultar_estadisticas(query, df, llm):
     """
     Fusión: Robustez técnica (ASCII) + Respuesta Inteligente (Listado).
@@ -1174,6 +1194,38 @@ async def procesar_consulta(query, df, vectorstore, llm_mini, llm_smart, ctx=Non
         except Exception as e:
             logger.error(f"Error RAG: {e}")
             return "Tuve un problema técnico buscando eso.", "rag", None, [], [], ""
+        
+       
+    # 1. Manejo de Bloqueo por LLM
+    if intent == "BLOCK":
+        ctx['strikes'] = strikes + 1
+        return "Epa, bajemos un cambio. Mantené el respeto, estoy acá para ayudar. (Strike sumado)", "general", None, [], [], ""
+    
+    if intent == "GENERAL":
+        try:
+            # 1. Usamos la personalidad que ya definiste
+            prefix = tone_system_instruction(tone)
+            
+            # 2. Prompt simple: "Sé educado pero volvé a la comida"
+            prompt_chat = (
+                f"{prefix}\n"
+                f"SITUACIÓN: El usuario dijo: '{query}'.\n"
+                f"INSTRUCCIONES:\n"
+                "1. Responde de forma natural y breve (máximo 2 oraciones).\n"
+                "2. Si es un saludo, devolvé el saludo con onda.\n"
+                "3. Si es un agradecimiento, decí 'de nada'.\n"
+                "4. IMPORTANTE: SIEMPRE terminá invitando a buscar comida (ej: '¿Buscamos algo para cenar?', '¿Tenés hambre?').\n"
+                "5. No inventes lugares ni datos, es solo charla."
+            )
+            
+            resp_chat = await llm_mini.ainvoke(prompt_chat)
+            
+            # Retornamos tipo "general" para que el frontend no dibuje mapas ni cards
+            return resp_chat.content, "general", None, [], [], ""
+            
+        except Exception as e:
+            logger.error(f"Error General: {e}")
+            return "¡Buenas! ¿En qué te puedo ayudar para comer hoy?", "general", None, [], [], ""
         
 # ==========================================
 # 7. ENDPOINTS
