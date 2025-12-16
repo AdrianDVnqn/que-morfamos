@@ -1006,31 +1006,33 @@ async def procesar_consulta(query, df, vectorstore, llm_mini, llm_smart, ctx=Non
                     candidatos_crudos.append(nom)
 
             # 3. FILTRADO POR EVIDENCIA (Hard Filter)
-            # Separamos la paja del trigo ANTES de mirar las estrellas
             grupo_alta_relevancia = []
             grupo_baja_relevancia = []
 
             if filtro_terms:
+                # Preparamos el patrón Regex una sola vez (ej: "pelotero|juegos|niños")
+                import re
+                patron_regex = '|'.join([re.escape(t) for t in filtro_terms])
+                
                 for local in candidatos_crudos:
                     mask = df['restaurante'] == local
                     if not mask.any(): continue
                     
-                    # Leemos un snippet generoso de reviews (primeras 30) para buscar la palabra
-                    # Esto es rápido porque es Python puro, no LLM.
-                    texto_dump = " ".join(df[mask]['texto'].fillna("").astype(str).head(30).tolist()).lower()
+                    # === CAMBIO CLAVE ===
+                    # No usamos head(30). Buscamos en TODA la columna de texto de este local.
+                    # str.contains es vectorizado y ultra rápido, incluso con 2000 reseñas.
                     
-                    tiene_match = False
-                    for term in filtro_terms:
-                        if term in texto_dump:
-                            tiene_match = True
-                            break
+                    # Obtenemos la serie de textos de este restaurante
+                    series_textos = df[mask]['texto'].fillna("").astype(str).str.lower()
+                    
+                    # Verificamos si ALGUNA fila contiene CUALQUIERA de los términos
+                    tiene_match = series_textos.str.contains(patron_regex, regex=True).any()
                     
                     if tiene_match:
                         grupo_alta_relevancia.append(local)
                     else:
                         grupo_baja_relevancia.append(local)
             else:
-                # Si no hay keywords (búsqueda vaga), todos son "alta relevancia"
                 grupo_alta_relevancia = candidatos_crudos
 
             # 4. SELECCIÓN PARA EL JUEZ
