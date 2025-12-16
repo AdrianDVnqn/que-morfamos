@@ -866,6 +866,101 @@ async def procesar_consulta(query, df, vectorstore, llm_mini, llm_smart, ctx=Non
 
     return "No entendí bien qué buscás, ¿podés reformular?", "rag", None, [], [], ""
 
+# ==========================================
+# 7. ENDPOINTS
+# ==========================================
+
+@app.get("/")
+def read_root(): return {"status": "online", "message": "API OK v6.7"}
+
+@app.get("/health")
+def health_check(): return {"status": "healthy", "df_size": len(df) if df is not None else 0}
+
+@app.get("/restaurant/{nombre}", response_model=RestaurantDetail)
+async def get_restaurant_detail(nombre: str, topic: Optional[str] = None, tone: Optional[str] = None):
+    global df, llm_mini
+    if not nombre: raise HTTPException(status_code=404)
+    mask = df['restaurante'].str.lower() == nombre.lower()
+    if not mask.any(): raise HTTPException(status_code=404, detail="No encontrado")
+    
+    rest_df = df[mask]
+    row = rest_df.iloc[0]
+    nombre_real = safe_str(row['restaurante'])
+    
+    sorted_reviews = rankear_reviews_por_topico(rest_df, topic)
+    reviews_list = []
+    for _, r in sorted_reviews.head(8).iterrows():
+        if len(safe_str(r.get('texto'))) > 10:
+            reviews_list.append(ReviewDetail(
+                autor=formatear_autor(r.get('autor')),
+                rating=safe_int(r.get('rating_user')),
+                texto=safe_str(r.get('texto'))[:2000],
+                fecha=safe_str(r.get('fecha'))
+            ))
+
+    tone = sanitize_tone(tone)
+    cache_key = f"{nombre_real}_{topic}_{tone}" if topic else f"{nombre_real}__{tone}"
+    analisis = cache.get_json("detail_topic", cache_key)
+    if not analisis:
+        sample = " | ".join([r.texto[:150] for r in reviews_list[:5]])
+        contexto_tema = f"IMPORTANTE: El usuario busca '{topic}'. Resalta qué dicen las reseñas sobre eso." if topic else ""
+        prefix = tone_system_instruction(tone)
+        prompt_txt = f"""{prefix}\nAnaliza "{nombre_real}". {contexto_tema}
+        Responde SOLO JSON válido:
+        {{"resumen": "descripción de 2 oraciones...", "positivos": ["p1", "p2"], "negativos": ["n1"]}}
+        Reviews: {sample}"""
+        try:
+            res = await llm_mini.ainvoke(prompt_txt)
+            clean = res.content.strip().replace("```json","").replace("```","")
+            analisis = json.loads(clean)
+            cache.set_json("detail_topic", cache_key, analisis)
+        except: 
+            analisis = {"resumen": "Info no disponible momentáneamente.", "positivos": [], "negativos": []}
+
+    return RestaurantDetail(
+        nombre=nombre_real,
+        rating=safe_float(row.get('rating_gral')),
+        total_reviews=safe_int(row.get('total_reviews_google')),
+        direccion=safe_str(row.get('direccion')),
+        barrio=safe_str(row.get('barrio')),
+        zona=safe_str(row.get('zona')),
+        lat=safe_float(row.get('latitud')),
+        lng=safe_float(row.get('longitud')),
+        resumen_general=safe_str(analisis.get("resumen")),
+        aspectos_positivos=analisis.get("positivos", []),
+        aspectos_negativos=analisis.get("negativos", []),
+        reviews=reviews_list
+    )
+
+@app.post("/chat", response_model=QueryResponse)
+async def chat(req: QueryRequest, request: Request):
+    try:
+        ctx = req.conversation_context.copy() if req.conversation_context else {}
+        if req.tone: ctx['tone'] = sanitize_tone(req.tone)
+        
+        client_ip = request.client.host
+        
+        resp, mode, pend, locs, cards, det = await procesar_consulta(
+            req.query, df, vectorstore, llm_mini, llm_smart, ctx, user_ip=client_ip
+        )
+        
+        new_ctx = ctx.copy() if ctx else {}
+        if pend: new_ctx['pending_options'] = pend
+        elif 'pending_options' in new_ctx: del new_ctx['pending_options']
+        
+        if req.conversation_context and 'last_entity' in req.conversation_context and 'last_entity' not in new_ctx:
+             new_ctx['last_entity'] = req.conversation_context['last_entity']
+        if 'original_query' in req.conversation_context and 'original_query' not in new_ctx:
+             new_ctx['original_query'] = req.conversation_context['original_query']
+
+        return QueryResponse(
+            response=resp, mode=mode, conversation_context=new_ctx,
+            locations=locs, restaurant_cards=cards, detail_content=det
+        )
+    except Exception as e:
+        logger.error(f"Error Chat: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
