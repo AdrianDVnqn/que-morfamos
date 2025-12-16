@@ -384,40 +384,45 @@ async def generar_descripcion_async(llm, nombre, sample, tone='cordial'):
         return "Restaurante popular en Neuquén."
     
     
-def obtener_reviews_tematicas(df_local, keywords, limit=5):
+def obtener_reviews_tematicas(df_local, keywords, limit=8):
     """
     Busca en TODAS las reviews del local aquellas que contengan las keywords.
-    Si encuentra, devuelve esas. Si no, devuelve las más recientes/relevantes.
     """
-    if not keywords:
-        return df_local.head(limit)
+    if not keywords: return df_local.head(limit)
     
-    # Filtramos las reviews que contengan alguna de las keywords
-    # Usamos una expresión regular para buscar cualquiera de las palabras
-    pattern = '|'.join([re.escape(k) for k in keywords if len(k) > 3])
+    # Creamos un patrón Regex: (pelotero|juegos|niños)
+    # Re.escape asegura que caracteres raros no rompan el regex
+    pattern = '|'.join([re.escape(k) for k in keywords if len(k) > 2])
     
-    if not pattern:
-        return df_local.head(limit)
+    if not pattern: return df_local.head(limit)
         
-    mask = df_local['texto'].str.lower().str.contains(pattern, regex=True)
+    mask = df_local['texto'].str.lower().str.contains(pattern, regex=True, na=False)
     reviews_tematicas = df_local[mask]
     
     if not reviews_tematicas.empty:
-        # Priorizamos las positivas si hay muchas (para evitar quejas viejas)
-        # Ordenamos por fecha o rating si es posible
+        # Priorizamos estas reviews específicas
         return reviews_tematicas.head(limit)
     else:
-        # Fallback: Si no hay mención explícita (raro si Pinecone lo trajo), devolvemos las generales
+        # Si no hay mención explícita, devolvemos las generales
         return df_local.head(limit)
 
-async def obtener_restaurant_cards(nombres_restaurantes, df, llm, query_context=None, tone='cordial', strict_mode=True, keywords_list=None):
+async def obtener_restaurant_cards(nombres_restaurantes, df, llm, query_context=None, tone='cordial', strict_mode=True, keywords_list=None, synonyms_list=None):
     cards = []
     tasks = [] 
     
-    # Definimos keywords de búsqueda (si no vienen en lista, usamos la query)
-    search_keywords = keywords_list if keywords_list else ([query_context] if query_context else [])
-    # Limpiamos keywords cortas
-    search_keywords = [k.lower() for k in search_keywords if len(k) > 3]
+    # 1. Armamos la lista completa de términos de búsqueda
+    search_terms = set()
+    if keywords_list:
+        for k in keywords_list: search_terms.add(k.lower())
+    if synonyms_list:
+        for s in synonyms_list: search_terms.add(s.lower())
+    
+    # Si la lista vino vacía, usamos la query original
+    if not search_terms and query_context:
+        search_terms.add(query_context.lower())
+
+    # Filtramos palabras muy cortas
+    final_search_terms = [k for k in search_terms if len(k) > 3]
 
     for nombre in nombres_restaurantes:
         if not nombre: continue
@@ -427,26 +432,28 @@ async def obtener_restaurant_cards(nombres_restaurantes, df, llm, query_context=
             row = rest_df.iloc[0]
             nombre_real = safe_str(row['restaurante'])
 
-            # === CAMBIO CLAVE AQUÍ ===
-            # En lugar de tomar las primeras 5 al azar, buscamos las que hablan del tema
-            if search_keywords:
-                reviews_filtradas = obtener_reviews_tematicas(rest_df, search_keywords, limit=6)
-                # Si encontramos reviews temáticas, las usamos para armar el 'sample'
-                sample_text = " ... ".join([safe_str(t) for t in reviews_filtradas['texto']])[:3000]
+            # 2. BÚSQUEDA DE EVIDENCIA
+            # Aquí es donde encontramos las reseñas de "pelotero"
+            if final_search_terms:
+                reviews_filtradas = obtener_reviews_tematicas(rest_df, final_search_terms, limit=8)
                 
-                # También extraemos la mejor review temática para la "frase destacada"
-                best_review = reviews_filtradas.iloc[0] if not reviews_filtradas.empty else rest_df.iloc[0]
+                if not reviews_filtradas.empty:
+                    # Unimos hasta 3000 chars para asegurar contexto completo
+                    sample_text = " ... ".join([safe_str(t) for t in reviews_filtradas['texto']])[:3000]
+                    best_review = reviews_filtradas.iloc[0]
+                else:
+                    sample_text = " ".join([safe_str(t) for t in rest_df['texto'].head(5)])[:1000]
+                    best_review = rest_df.iloc[0]
             else:
-                sample_text = " ".join([safe_str(t) for t in rest_df['texto'].head(5)])[:800]
+                sample_text = " ".join([safe_str(t) for t in rest_df['texto'].head(5)])[:1000]
                 best_review = rest_df.iloc[0]
-            # =========================
 
             frase = safe_str(best_review['texto'])[:200] + "..."
             autor = formatear_autor(best_review.get('autor'))
 
-            # Cache key incluye el tema para que la descripción cambie según la búsqueda
-            # (Ej: Descripción para "Pizza" vs Descripción para "Pelotero")
-            topic_key = "-".join(search_keywords) if search_keywords else "general"
+            # 3. GENERACIÓN CON LLM
+            # Cache key única por tema de búsqueda
+            topic_key = "-".join(sorted(list(search_terms))) if search_terms else "general"
             cache_key = f"desc_{nombre_real}_{topic_key}_{sanitize_tone(tone)}"
             
             desc = cache.get_json("desc", cache_key)
@@ -454,9 +461,10 @@ async def obtener_restaurant_cards(nombres_restaurantes, df, llm, query_context=
             if desc:
                 tasks.append({"type": "cached", "val": desc, "row": row, "frase": frase, "autor": autor, "nombre_real": nombre_real})
             else:
-                # Prompt mejorado para forzar la mención del tema
-                contexto_extra = f"El usuario busca específicamente: '{', '.join(search_keywords)}'. SI EL TEXTO LO MENCIONA, DESTAÇALO." if search_keywords else ""
+                # El prompt le dice al LLM qué buscar
+                contexto_extra = f"El usuario busca conceptos relacionados con: '{', '.join(final_search_terms)}'. Si aparecen en las reviews, MENCIONALO."
                 
+                # Reutilizamos la función helper que ya tenías o la definimos abajo
                 task_coro = generar_descripcion_async_tematica(llm, nombre_real, sample_text, tone, contexto_extra)
                 tasks.append({"type": "generate", "val": task_coro, "row": row, "frase": frase, "autor": autor, "nombre_real": nombre_real, "cache_key": cache_key})
 
@@ -525,23 +533,17 @@ def obtener_restaurant_cards_simple(nombres_restaurantes, df):
 # ==========================================
 
 async def analizar_query_semantica(query, llm):
-    """ USA LLM_SMART. Retorna: {tipo, keywords} """
+    """ USA LLM_SMART. Retorna: {tipo, keywords, synonyms} """
     q_lower = query.lower()
     
-    # ==============================================================================
-    # 0. BYPASS DE SEGURIDAD (LISTA BLANCA ABSOLUTA)
-    # ==============================================================================
-    # Si la query contiene alguna de estas palabras, ES SEGURA y es VIBE.
-    # Esto evita que el LLM confunda "pelotero" (niños) con "pelotas" (sexual)
-    # o bloquee helados/cremas por error.
+    # Bypass para evitar falsos positivos de seguridad, 
+    # pero igual dejamos que el LLM genere los sinónimos.
+    is_safe_bypass = False
     whitelist = ["helad", "crema", "pelotero", "juego", "niñ", "chic", "infantil"]
-    
-    for safe_word in whitelist:
-        if safe_word in q_lower:
-            # Retornamos VIBE inmediatamente, sin gastar tokens ni arriesgar bloqueo
-            return {"tipo": "VIBE", "keywords": [q_lower]}
+    for safe in whitelist:
+        if safe in q_lower: is_safe_bypass = True
 
-    cache_key = f"analysis_{q_lower.strip()}"
+    cache_key = f"analysis_v82_{q_lower.strip()}"
     cached = cache.get_json("analysis", cache_key)
     if cached: return cached
 
@@ -549,39 +551,38 @@ async def analizar_query_semantica(query, llm):
     Analiza la intención del usuario. Query: "{query}"
     
     1. SEGURIDAD:
-       - Si contiene términos sexuales explícitos, insultos o violencia, MARCA "tipo": "BLOCK".
-       - EXCEPCIONES (NO BLOQUEAR): "Pechuga", "Chorizo", "Huevos", "Salchicha", "Bolas de fraile".
+       - Si es sexual/insulto -> "BLOCK".
+       - Excepciones: Comida/Infantil es seguro.
     
-    2. CLASIFICACIÓN (Si es seguro):
-       - "PRODUCTO": Plato o ingrediente concreto (Pizza, Sushi).
-       - "VIBE": Tipo de local, ocasión o Bebida.
+    2. CLASIFICACIÓN: "PRODUCTO" (Pizza) o "VIBE" (Pelotero, Romántico).
     
-    3. KEYWORDS: Extrae sustantivos en SINGULAR.
-    Responde SOLO JSON: {{"tipo": "PRODUCTO" | "VIBE" | "BLOCK", "keywords": ["k1"]}}
+    3. EXTRAER KEYWORDS Y SINÓNIMOS (CRÍTICO):
+       - "keywords": La palabra exacta buscada (singular).
+       - "synonyms": Lista de 3 o 4 palabras relacionadas semánticamente que sirvan para buscar evidencia en reseñas.
+       
+       EJEMPLOS:
+       - Query: "Lugar con pelotero" -> keywords: ["pelotero"], synonyms: ["juegos", "niños", "infantil", "tobogan"]
+       - Query: "Para celiacos" -> keywords: ["celiaco"], synonyms: ["sin tacc", "gluten", "intolerante"]
+       - Query: "Con terraza" -> keywords: ["terraza"], synonyms: ["afuera", "aire libre", "patio", "vereda"]
+    
+    Responde SOLO JSON: {{"tipo": "PRODUCTO" | "VIBE" | "BLOCK", "keywords": ["k1"], "synonyms": ["s1"]}}
     """
     try:
         res = await llm.ainvoke(template)
         clean = res.content.strip().replace("```json", "").replace("```", "")
         data = json.loads(clean)
         
-        # Limpieza de keywords
-        stopwords_ranking = ["mejores", "mejor", "top", "ranking", "los", "las", "el", "la", "de", "en", "neuquen"]
-        words = q_lower.split()
-        for w in words:
-            if w not in stopwords_ranking:
-                w_sing = w
-                if w.endswith('es') and len(w) > 4: w_sing = w[:-2]
-                elif w.endswith('s') and len(w) > 3: w_sing = w[:-1]
-                
-                if w_sing not in data.get('keywords', []):
-                    if 'keywords' not in data: data['keywords'] = []
-                    data['keywords'].append(w_sing)
-                    
+        # Si entró por bypass, forzamos VIBE aunque el LLM diga BLOCK
+        if is_safe_bypass and data.get("tipo") == "BLOCK":
+            data["tipo"] = "VIBE"
+
+        if 'synonyms' not in data: data['synonyms'] = []
+        
         cache.set_json("analysis", cache_key, data)
         return data
     except: 
-        # Si el LLM falla, ante la duda dejamos pasar como VIBE (Fail-Open para usabilidad)
-        return {"tipo": "VIBE", "keywords": [q_lower]}
+        # Fallback básico
+        return {"tipo": "VIBE", "keywords": [q_lower], "synonyms": []}
 
 def detectar_mencion_exacta(query, df):
     """
