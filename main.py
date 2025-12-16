@@ -764,43 +764,67 @@ async def resumir_opiniones_local(query_str, df, llm, topic=None, tone='cordial'
 
 async def verificar_candidatos_con_llm(candidatos, df, query, llm):
     """
-    JUEZ SEMÁNTICO: Toma una lista de candidatos y verifica si el contexto
-    de las reseñas coincide con la intención del usuario.
-    Elimina casos como: "Deberían tener pelotero" cuando se busca "Con pelotero".
+    JUEZ SEMÁNTICO (V2 - CON BÚSQUEDA DE EVIDENCIA):
+    En lugar de leer las primeras 5 reseñas al azar, busca específicamente
+    las reseñas que contienen las palabras clave de la query.
     """
     if not candidatos: return []
     
+    # 1. Extraemos keywords relevantes de la query (ej: "pelotero")
+    stop_short = ["que", "los", "las", "con", "para", "donde", "hay", "lugar"]
+    words = query.lower().split()
+    keywords = [w for w in words if len(w) > 3 and w not in stop_short]
+    
     texto_validacion = ""
-    # Analizamos máximo 10 candidatos para no saturar al LLM
+    
+    # Analizamos Top 10
     for local in candidatos[:10]:
         mask = df['restaurante'] == local
         if not mask.any(): continue
         
-        # Tomamos las primeras 5 reseñas completas (o hasta 1000 caracteres)
-        # No filtramos por palabra clave, dejamos que el LLM lea todo el contexto.
-        reviews_texto = " ".join(df[mask]['texto'].fillna("").astype(str).head(5).tolist())
-        snippet = reviews_texto[:800] # Recortamos para ahorrar tokens
+        all_reviews = df[mask]['texto'].fillna("").astype(str)
         
-        texto_validacion += f"- LOCAL: {local}\n  RESEÑAS: \"...{snippet}...\"\n\n"
+        # 2. BÚSQUEDA DE EVIDENCIA
+        # Buscamos reseñas que contengan ALGUNA de las keywords
+        evidence_reviews = []
+        found_evidence = False
+        
+        if keywords:
+            for k in keywords:
+                # Buscamos filas que contengan la keyword 'k'
+                matches = all_reviews[all_reviews.str.lower().str.contains(k, regex=False)]
+                if not matches.empty:
+                    # Tomamos hasta 2 reseñas que hablen del tema
+                    evidence_reviews.extend(matches.head(2).tolist())
+                    found_evidence = True
+        
+        # 3. ARMADO DEL CONTEXTO
+        if found_evidence:
+            # Si encontramos evidencia, se la mostramos al Juez
+            snippet = " ... ".join(evidence_reviews)[:900]
+            prefix = "EVIDENCIA ENCONTRADA:"
+        else:
+            # Si es búsqueda semántica pura (sin keyword exacta), mandamos las generales
+            snippet = " ... ".join(all_reviews.head(5).tolist())[:900]
+            prefix = "RESEÑAS GENERALES:"
+            
+        texto_validacion += f"- LOCAL: {local}\n  {prefix} \"...{snippet}...\"\n\n"
 
     prompt = f"""
-    Eres un JUEZ DE CALIDAD para un buscador de restaurantes.
-    El usuario busca: "{query}"
+    Eres un JUEZ DE CALIDAD. Query usuario: "{query}"
     
-    Tu tarea: Analizar las reseñas de los siguientes locales y DECIDIR si realmente cumplen con la búsqueda.
+    Analiza la EVIDENCIA de los locales y decide cuáles aprobar.
     
-    CRITERIOS DE ELIMINACIÓN (FALSOS POSITIVOS):
-    1. La reseña menciona el término NEGATIVAMENTE (ej: "No tiene pelotero", "Debería tener juegos").
-    2. El término aparece en un contexto que NO es el que busca el usuario (ej: "Parece un pelotero de lo ruidoso", "No es un lugar para niños").
-    
-    CRITERIOS DE ACEPTACIÓN:
-    1. El local TIENE lo que se pide o es relevante semánticamente (ej: Busca "pelotero", reseña dice "juegos para chicos").
+    REGLAS:
+    1. APROBAR si la evidencia confirma que tiene lo que se pide (ej: "Lindo pelotero").
+    2. ELIMINAR si la mención es NEGATIVA (ej: "No tiene pelotero", "Sacaron el pelotero").
+    3. ELIMINAR si el contexto es irónico (ej: "Parece un pelotero de tanto ruido").
+    4. Si la evidencia es vaga pero positiva, APROBAR.
     
     CANDIDATOS:
     {texto_validacion}
     
-    Responde SOLO un JSON con la lista de nombres de los locales APROBADOS.
-    Ejemplo: ["Local A", "Local B"]
+    Responde SOLO un JSON: ["Local A", "Local B"]
     """
     
     try:
@@ -810,7 +834,6 @@ async def verificar_candidatos_con_llm(candidatos, df, query, llm):
         return validos
     except Exception as e:
         logger.error(f"Error Juez LLM: {e}")
-        # Si falla el juez, ante la duda dejamos pasar a los originales (Fail-Open)
         return candidatos
 
 # ==========================================
@@ -950,11 +973,15 @@ async def procesar_consulta(query, df, vectorstore, llm_mini, llm_smart, ctx=Non
                 top_candidatos, df, query, llm_mini
             )
 
-            # Si el juez fue muy estricto y borró todo, usamos los matemáticos como fallback
+            # === FALLBACK DE SEGURIDAD ===
+            # Si el Juez eliminó TODOS los candidatos (lista vacía),
+            # volvemos a usar los candidatos originales de Pinecone/Math.
+            # Preferimos mostrar un resultado "quizás erróneo" a decir "No encontré nada".
             if not locales_confirmados and top_candidatos:
+                logger.warning("El Juez eliminó todos los candidatos. Usando Fallback.")
                 locales_confirmados = top_candidatos[:3]
 
-            # Recorte final a Top 5
+            # Recorte final
             locales_finales = locales_confirmados[:5]
 
             if not locales_finales: 
