@@ -477,23 +477,26 @@ def obtener_restaurant_cards_simple(nombres_restaurantes, df):
 # ==========================================
 
 async def analizar_query_semantica(query, llm):
-    cache_key = f"analysis_{query.lower().strip()}"
+    """ USA LLM_SMART. Retorna: {tipo, keywords} """
+    # 0. BYPASS MANUAL DE SEGURIDAD (White-list absoluta para términos problemáticos pero seguros)
+    # Si la query habla de helados, ES SEGURA y es VIBE. Cortamos acá.
+    q_lower = query.lower()
+    if "helad" in q_lower: 
+        return {"tipo": "VIBE", "keywords": ["heladeria"]}
+
+    cache_key = f"analysis_{q_lower.strip()}"
     cached = cache.get_json("analysis", cache_key)
     if cached: return cached
 
     template = """
     Analiza la intención del usuario. Query: "{query}"
-    
-    1. SEGURIDAD (CRÍTICO):
-       - Si contiene términos sexuales explícitos, insultos graves o violencia ("tetas", "pito", "travesti", "culo", "puta", "verga"), MARCA "tipo": "BLOCK".
-       - EXCEPCIONES ABSOLUTAS (ESTO ES COMIDA, NO BLOQUEAR): "Helado", "Heladeria", "Crema", "Leche", "Pechuga", "Chorizo", "Huevos", "Salchicha", "Bolas de fraile".
-    
+    1. SEGURIDAD:
+       - Si contiene términos sexuales, insultos o violencia ("tetas", "pito", "travesti", "culo", "puta"), MARCA "tipo": "BLOCK".
+       - EXCEPCIONES (NO BLOQUEAR): "Crema", "Leche", "Pechuga", "Chorizo", "Huevos", "Salchicha".
     2. CLASIFICACIÓN (Si es seguro):
-       - "PRODUCTO": Plato o ingrediente concreto (Pizza, Sushi, Flan, Helado).
-       - "VIBE": Tipo de local (Cerveceria, Parrilla, Heladeria), ocasión o Bebida.
-    
-    3. KEYWORDS: Extrae sustantivos en SINGULAR. Ignora "mejores", "top", "quiero".
-    
+       - "PRODUCTO": Plato o ingrediente concreto (Pizza, Sushi, Flan).
+       - "VIBE": Tipo de local (Cerveceria, Parrilla), ocasión o Bebida.
+    3. KEYWORDS: Extrae sustantivos en SINGULAR. Ignora "mejores", "top".
     Responde SOLO JSON: {{"tipo": "PRODUCTO" | "VIBE" | "BLOCK", "keywords": ["k1"]}}
     """
     try:
@@ -501,25 +504,19 @@ async def analizar_query_semantica(query, llm):
         clean = res.content.strip().replace("```json", "").replace("```", "")
         data = json.loads(clean)
         
-        # Limpieza extra de keywords
-        stopwords_ranking = ["mejores", "mejor", "top", "ranking", "los", "las", "el", "la", "de", "en", "neuquen", "buenos", "buen", "heladerias"]
-        words = query.lower().split()
+        stopwords_ranking = ["mejores", "mejor", "top", "ranking", "los", "las", "el", "la", "de", "en", "neuquen"]
+        words = q_lower.split()
         for w in words:
             if w not in stopwords_ranking:
                 w_sing = w
                 if w.endswith('es') and len(w) > 4: w_sing = w[:-2]
                 elif w.endswith('s') and len(w) > 3: w_sing = w[:-1]
-                
-                # Fix especifico para "heladerias" -> "heladeria"
-                if "heladeri" in w: w_sing = "heladeria"
-                
                 if w_sing not in data.get('keywords', []):
                     if 'keywords' not in data: data['keywords'] = []
                     data['keywords'].append(w_sing)
-                    
         cache.set_json("analysis", cache_key, data)
         return data
-    except: return {"tipo": "VIBE", "keywords": [query.lower()]}
+    except: return {"tipo": "VIBE", "keywords": [q_lower]}
 
 def detectar_mencion_exacta(query, df):
     """
@@ -648,51 +645,65 @@ async def consultar_estadisticas(query, df, llm):
         return "No pude calcular esa estadística.", []
 
 async def resumir_opiniones_local(query_str, df, llm, topic=None, tone='cordial', es_seleccion_directa=False):
-    """ USA LLM_MINI - Ahora prioriza match exacto para no equivocarse de lugar """
+    # 1. Validación básica
     if not query_str: return "Nombre vacío.", None, "", None
     q_clean = query_str.lower().strip()
     encontrados = []
     
-    # 1. Intentamos MATCH EXACTO primero
+    # 2. Búsqueda de coincidencias
     mask_exact = df['restaurante'].str.lower() == q_clean
     if mask_exact.any():
-        row = df[mask_exact].iloc[0]
-        encontrados = [row['restaurante']]
-    # 2. Si no, match parcial
+        encontrados = [df[mask_exact].iloc[0]['restaurante']]
     else:
-        if es_seleccion_directa: 
-             mask_exact = df['restaurante'].str.lower() == q_clean
-             if mask_exact.any():
-                encontrados = [df[mask_exact].iloc[0]['restaurante']]
+        if es_seleccion_directa:
+             if mask_exact.any(): encontrados = [df[mask_exact].iloc[0]['restaurante']]
         else:
             mask = df['restaurante'].str.lower().str.contains(q_clean, na=False, regex=False)
             candidatos = df[mask]['restaurante'].unique().tolist()
-            if len(candidatos) == 1:
+            
+            if len(candidatos) == 1: 
                 encontrados = candidatos
             elif len(candidatos) > 1:
                 encontrados = candidatos
                 encontrados.sort()
+                # Menú de opciones
                 labels = []
-                keys = []
                 for r in encontrados:
-                    keys.append(r)
                     mask_r = df['restaurante'] == r
                     rowr = df[mask_r].iloc[0]
-                    ubi = safe_str(rowr.get('zona')) or safe_str(rowr.get('barrio')) or safe_str(rowr.get('direccion'))
-                    display = f"**{r}**" + (f" ({ubi})" if ubi else "")
-                    labels.append(display)
+                    ubi = safe_str(rowr.get('direccion')) or safe_str(rowr.get('zona')) or "Ubicación desconocida"
+                    labels.append(f"**{r}** ({ubi})")
                 lista_txt = "\n".join([f"{i+1}. {lbl}" for i, lbl in enumerate(labels)])
-                prefix = "Encontré varios lugares con ese nombre. ¿A cuál te referís?"
-                return f"{prefix}\n\n{lista_txt}\n\n*(Escribí el número)*", None, "", {"options": keys}
+                return f"Encontré varios lugares con ese nombre. ¿Cuál decís?\n\n{lista_txt}\n\n*(Escribí el número)*", None, "", {"options": encontrados}
 
+    # 3. Si no encontró nada
     if not encontrados: 
-        return "No conozco ese lugar che, disculpá.", None, "", None
+        return f"No tengo info de **{query_str}**. Probá con otro nombre.", None, "", None
     
+    # 4. Chequeo de Caché
     restaurante = encontrados[0]
     cache_key = f"{restaurante}_{topic}_{sanitize_tone(tone)}" if topic else f"{restaurante}__{sanitize_tone(tone)}"
     cached_text = cache.get_json("resumen_texto", cache_key)
-    if cached_text:
+    if cached_text: 
         return f"Acá te paso la data de **{restaurante}**:", restaurante, cached_text, None
+
+    # 5. Preparación de Datos para el Prompt
+    # Obtenemos la fila de datos para sacar la ubicación real
+    row_data = df[df['restaurante'] == restaurante].iloc[0]
+    
+    zona_str = safe_str(row_data.get('zona')).lower()
+    dir_str = safe_str(row_data.get('direccion')).lower()
+    
+    # Lógica para determinar la ciudad correcta
+    ubicacion_real = "Neuquén Capital" # Default
+    if "cipolletti" in zona_str or "cipolletti" in dir_str:
+        ubicacion_real = "Cipolletti, Río Negro"
+    elif "plottier" in zona_str or "plottier" in dir_str:
+        ubicacion_real = "Plottier, Neuquén"
+    elif "centenario" in zona_str or "centenario" in dir_str:
+        ubicacion_real = "Centenario, Neuquén"
+    elif safe_str(row_data.get('zona')): # Si tiene zona pero no es otra ciudad (ej: "Alta Barda")
+        ubicacion_real = f"Neuquén Capital (Zona {safe_str(row_data.get('zona'))})"
 
     sorted_reviews = rankear_reviews_por_topico(df[df['restaurante'] == restaurante], topic)
     reviews_txt = "\n".join([safe_str(r.get('texto'))[:200] for _, r in sorted_reviews.head(10).iterrows()])
@@ -700,15 +711,17 @@ async def resumir_opiniones_local(query_str, df, llm, topic=None, tone='cordial'
     contexto_tema = f"El usuario pregunta específicamente sobre: '{topic}'. Resalta eso." if topic else ""
     tone_prefix = tone_system_instruction(tone)
     
+    # 6. Prompt Dinámico con ubicación real
     tpl = f"""{tone_prefix}\n
-    Analiza el restaurante: {{rest}} (Ubicado en NEUQUÉN CAPITAL).
+    Analiza el restaurante: {{rest}}.
+    UBICACIÓN REAL: {ubicacion_real}.
     Rating: {{rat}}. 
     {contexto_tema}
     
     Reviews de usuarios: {{revs}}
     
     Generá un resumen en Markdown con acento Argentino.
-    REGLA: NO digas que está en Buenos Aires. Es Neuquén.
+    REGLA: NO digas que está en Buenos Aires. Respetá la ubicación: {ubicacion_real}.
     
     Estructura:
     ## 📊 La onda
@@ -719,13 +732,14 @@ async def resumir_opiniones_local(query_str, df, llm, topic=None, tone='cordial'
     try:
         res = await (ChatPromptTemplate.from_template(tpl) | llm | StrOutputParser()).ainvoke({
             "rest": restaurante, 
-            "rat": safe_float(df[df['restaurante'] == restaurante].iloc[0].get('rating_gral')),
+            "rat": safe_float(row_data.get('rating_gral')),
             "revs": reviews_txt
         })
     except: res = "No pude generar el resumen."
     
+    # 7. Guardado y Retorno final
     cache.set_json("resumen_texto", cache_key, res)
-    return f"¡Dale! Acá la data de **{restaurante}**:", restaurante, res, None
+    return f"Acá la data de **{restaurante}**:", restaurante, res, None
 
 # ==========================================
 # 6. ROUTER PRINCIPAL
@@ -746,7 +760,7 @@ async def procesar_consulta(query, df, vectorstore, llm_mini, llm_smart, ctx=Non
         strikes += 1
         ctx['strikes'] = strikes
         logger.warning(f"🚫 Query bloqueada por Hard Ban: '{query}'")
-        return "Epa, esa búsqueda no va. Preguntame sobre comida o lugares.", "rag", None, [], [], ""
+        return f"Epa, esa búsqueda no va. Preguntame sobre comida o lugares. (Aviso {strikes}/5)", "rag", None, [], [], ""
 
     if 'pending_options' in ctx and query.strip().isdigit():
         num = int(query.strip())
