@@ -969,6 +969,15 @@ async def verificar_candidatos_con_llm(candidatos, df, query, llm):
 # ==========================================
 async def procesar_consulta(query, df, vectorstore, llm_mini, llm_smart, ctx=None, user_ip=None):
     if ctx is None: ctx = {}
+    
+    # ==============================================================================
+    # 🐛 DEBUG DE ENTRADA (Pegalo acá)
+    # ==============================================================================
+    print(f"\n[DEBUG] 🟢 ENTRADA A CEREBRO | Query: '{query}'", flush=True)
+    print(f"[DEBUG]    -> last_entity: '{ctx.get('last_entity')}'", flush=True)
+    print(f"[DEBUG]    -> original_query: '{ctx.get('original_query')}'\n", flush=True)
+    # ==============================================================================
+    
     tone = sanitize_tone(ctx.get('tone'))
     
     # ==========================================
@@ -1114,6 +1123,10 @@ async def procesar_consulta(query, df, vectorstore, llm_mini, llm_smart, ctx=Non
         for var in vars_to_kill:
             if var in ctx: 
                 del ctx[var]
+                
+        # 🐛 DEBUG DE LIMPIEZA (Para confirmar que se borró)
+        print(f"[DEBUG] 🧹 LIMPIEZA RECOMENDACION | last_entity ahora es: '{ctx.get('last_entity')}' (Debería ser None)", flush=True)      
+        
         try:
             # 1. Análisis Semántico
             analisis = await analizar_query_semantica(query, llm_smart)
