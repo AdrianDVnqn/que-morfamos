@@ -477,28 +477,22 @@ def obtener_restaurant_cards_simple(nombres_restaurantes, df):
 # ==========================================
 
 async def analizar_query_semantica(query, llm):
-    """ USA LLM_SMART. Retorna: {tipo, keywords} """
     cache_key = f"analysis_{query.lower().strip()}"
     cached = cache.get_json("analysis", cache_key)
     if cached: return cached
 
     template = """
-    Analiza la intención del usuario para una app de restaurantes FAMILIAR.
-    Query: "{query}"
+    Analiza la intención del usuario. Query: "{query}"
     
-    1. SEGURIDAD (CRÍTICO - BLOCK):
-       - Si contiene términos sexuales, insultos, violencia o conceptos grotescos (ej: "tetas", "pito", "travesti", "culo", "matar", "sexo", "caca", "puta"), MARCA "tipo": "BLOCK".
-       - NO IMPORTA si dice "mejores", "donde hay". Si la palabra clave es ofensiva, ES BLOCK.
-       - EXCEPCIONES VÁLIDAS: "Pechuga", "Cerveza", "Chorizo", "Salchicha", "Huevos", "Pebete".
+    1. SEGURIDAD (CRÍTICO):
+       - Si contiene términos sexuales explícitos, insultos graves o violencia ("tetas", "pito", "travesti", "culo", "puta", "verga"), MARCA "tipo": "BLOCK".
+       - EXCEPCIONES ABSOLUTAS (ESTO ES COMIDA, NO BLOQUEAR): "Helado", "Heladeria", "Crema", "Leche", "Pechuga", "Chorizo", "Huevos", "Salchicha", "Bolas de fraile".
     
     2. CLASIFICACIÓN (Si es seguro):
-       - "PRODUCTO": Plato o ingrediente concreto (Pizza, Sushi, Flan).
-       - "VIBE": Busca un TIPO de local (Cerveceria, Pizzeria, Parrilla), ocasión (Cita, Amigos, Niños, Cumpleaños) o Bebida (Birra, Vino).
+       - "PRODUCTO": Plato o ingrediente concreto (Pizza, Sushi, Flan, Helado).
+       - "VIBE": Tipo de local (Cerveceria, Parrilla, Heladeria), ocasión o Bebida.
     
-    3. KEYWORDS:
-       - Extrae sustantivos.
-       - Devuélvelos en SINGULAR (ej: "cervecerias" -> "cerveceria").
-       - IGNORA adjetivos de ranking ("mejores", "top", "buenos").
+    3. KEYWORDS: Extrae sustantivos en SINGULAR. Ignora "mejores", "top", "quiero".
     
     Responde SOLO JSON: {{"tipo": "PRODUCTO" | "VIBE" | "BLOCK", "keywords": ["k1"]}}
     """
@@ -507,26 +501,31 @@ async def analizar_query_semantica(query, llm):
         clean = res.content.strip().replace("```json", "").replace("```", "")
         data = json.loads(clean)
         
-        stopwords_ranking = ["mejores", "mejor", "top", "ranking", "los", "las", "el", "la", "de", "en", "neuquen", "buenos", "buen"]
+        # Limpieza extra de keywords
+        stopwords_ranking = ["mejores", "mejor", "top", "ranking", "los", "las", "el", "la", "de", "en", "neuquen", "buenos", "buen", "heladerias"]
         words = query.lower().split()
         for w in words:
             if w not in stopwords_ranking:
                 w_sing = w
                 if w.endswith('es') and len(w) > 4: w_sing = w[:-2]
                 elif w.endswith('s') and len(w) > 3: w_sing = w[:-1]
+                
+                # Fix especifico para "heladerias" -> "heladeria"
+                if "heladeri" in w: w_sing = "heladeria"
+                
                 if w_sing not in data.get('keywords', []):
                     if 'keywords' not in data: data['keywords'] = []
                     data['keywords'].append(w_sing)
-            
+                    
         cache.set_json("analysis", cache_key, data)
         return data
-    except Exception as e:
-        return {"tipo": "VIBE", "keywords": [query.lower()]}
+    except: return {"tipo": "VIBE", "keywords": [query.lower()]}
 
 def detectar_mencion_exacta(query, df):
     """
     Detecta si el usuario nombró un lugar exacto.
-    FIX v7.3: STOPWORDS AGRESIVAS para evitar match con 'Que Pesto' cuando preguntan 'Que tal'.
+    FIX v7.5: Agregados 'helado', 'heladeria' a la blacklist para evitar matches falsos.
+    FIX v7.4: Devuelve el NÚCLEO para permitir menús de opciones.
     """
     if df is None or df.empty: return None
     q_norm = query.lower().strip()
@@ -534,15 +533,18 @@ def detectar_mencion_exacta(query, df):
     venue_prefixes = {
         "restaurante", "parrilla", "bar", "confiteria", "pizzeria", "bodegon", 
         "cerveceria", "hamburgueseria", "heladeria", "cafe", "bistro", "resto", 
-        "rotiseria", "panaderia", "sushi", "casa"
+        "rotiseria", "panaderia", "sushi", "casa", "local", "negocio"
     }
-    # AGREGADO: "que", "tal", "es", "como", "onda" a las palabras ignoradas
+    
     stopwords = {"el", "la", "los", "las", "de", "del", "lo", "al", "y", "en", "que", "qué", "tal", "como", "es", "onda", "son"}
     
+    # AQUI ESTÁ LA CLAVE: Agregamos helado/heladeria/postres para que no matcheen nombres parciales
     generic_blocklist = {
-        "sushi", "pizza", "pizzas", "burger", "hamburguesa", "helado", "birra", 
-        "cerveza", "cafe", "café", "parrilla", "pasta", "milanesa", 
-        "ensalada", "comida", "postre", "resto", "bar", "almuerzo", "cena"
+        "sushi", "pizza", "pizzas", "burger", "hamburguesa", "hamburguesas", 
+        "helado", "helados", "heladeria", "heladerias", "crema", "cremas", 
+        "birra", "cerveza", "cervezas", "birra", "birras", "cafe", "café", "parrilla", "pasta", 
+        "pastas", "milanesa", "milanesas", "ensalada", "comida", "postre", 
+        "postres", "resto", "bar", "almuerzo", "cena", "menu"
     }
 
     nombres = df['restaurante'].unique().tolist()
@@ -551,31 +553,37 @@ def detectar_mencion_exacta(query, df):
     for nombre_real in nombres:
         nombre_lower = nombre_real.lower().strip()
         
-        # 1. Match Exacto Total (Siempre gana, aunque sea corto)
-        if nombre_lower == q_norm: return nombre_real
+        # 1. Match Exacto Total (Solo si es idéntico)
+        if nombre_lower == q_norm: 
+            return nombre_real
 
-        # 2. Match Núcleo (Ej: "Antares" en "Antares Neuquen")
+        # Análisis de partes
         parts = nombre_lower.split()
         core_parts = [p for p in parts if re.sub(r'[^\w]', '', p) not in venue_prefixes]
         if not core_parts: continue 
         core_name = " ".join(core_parts) 
         
-        # FIX: Solo matcheamos nucleo si es > 3 letras (evita matches falsos con "Que", "Sur", "Bar")
+        # 2. Match de Núcleo
         if len(core_name) > 3:
             pattern = r'(?<!\w)' + re.escape(core_name) + r'(?!\w)'
-            if re.search(pattern, q_norm): return nombre_real
+            if re.search(pattern, q_norm):
+                # Si el núcleo detectado está en la lista negra (ej: "Helados"), LO IGNORAMOS.
+                if core_name in generic_blocklist:
+                    continue
+                return core_name.title() 
 
         # 3. Match Palabra Distintiva
         distinctive_parts = [p for p in core_parts if p not in stopwords]
         if distinctive_parts:
             for part in distinctive_parts:
                 clean_part = re.sub(r'[^\w]', '', part)
-                # FIX: Solo matcheamos palabras sueltas si son > 3 letras
                 if len(clean_part) <= 3: continue
                 if clean_part in generic_blocklist: continue
                 
                 pattern_dist = r'(?<!\w)' + re.escape(clean_part) + r'(?!\w)'
-                if re.search(pattern_dist, q_norm): return nombre_real
+                if re.search(pattern_dist, q_norm):
+                    return clean_part.title()
+                    
     return None
 
 async def clasificar_intencion(query, llm, match_db=None):
