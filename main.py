@@ -1019,6 +1019,10 @@ async def procesar_consulta(query, df, vectorstore, llm_mini, llm_smart, ctx=Non
 
 # --- CAMINO A: ESTADÍSTICAS ---
     if intent == "STATS":
+        
+        # Si pregunto estadísticas, rompo la charla sobre un lugar específico
+        if 'last_entity' in ctx: del ctx['last_entity'] # <--- LIMPIEZA
+        
         resp, locales = await consultar_estadisticas(query, df, llm_mini)
         cards = obtener_restaurant_cards_simple(locales, df)
         locs = obtener_coordenadas(locales, df)
@@ -1067,6 +1071,8 @@ async def procesar_consulta(query, df, vectorstore, llm_mini, llm_smart, ctx=Non
 
 # --- CAMINO C: RECOMENDACIÓN (PIPELINE ESTRICTO) ---
     if intent == "RECOMMENDATION":
+        # Si busco recomendaciones nuevas, olvido el lugar anterior
+        if 'last_entity' in ctx: del ctx['last_entity'] # <--- LIMPIEZA
         try:
             # 1. Análisis Semántico
             analisis = await analizar_query_semantica(query, llm_smart)
@@ -1300,6 +1306,8 @@ async def get_restaurant_detail(nombre: str, topic: Optional[str] = None, tone: 
 @app.post("/chat", response_model=QueryResponse)
 async def chat(req: QueryRequest, request: Request):
     try:
+        # LOG DE ENTRADA: ¿Qué contexto me manda el frontend?
+        logger.info(f"📥 Contexto Recibido: {req.conversation_context}")
         ctx = req.conversation_context.copy() if req.conversation_context else {}
         if req.tone: ctx['tone'] = sanitize_tone(req.tone)
         
@@ -1313,10 +1321,13 @@ async def chat(req: QueryRequest, request: Request):
         if pend: new_ctx['pending_options'] = pend
         elif 'pending_options' in new_ctx: del new_ctx['pending_options']
         
-        if req.conversation_context and 'last_entity' in req.conversation_context and 'last_entity' not in new_ctx:
-             new_ctx['last_entity'] = req.conversation_context['last_entity']
+        # if req.conversation_context and 'last_entity' in req.conversation_context and 'last_entity' not in new_ctx:
+        #      new_ctx['last_entity'] = req.conversation_context['last_entity']
         if 'original_query' in req.conversation_context and 'original_query' not in new_ctx:
              new_ctx['original_query'] = req.conversation_context['original_query']
+
+        # LOG DE SALIDA: ¿Qué contexto le devuelvo?
+        logger.info(f"📤 Contexto Saliente: {new_ctx}")
 
         return QueryResponse(
             response=resp, mode=mode, conversation_context=new_ctx,
