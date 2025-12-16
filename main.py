@@ -683,10 +683,10 @@ def detectar_mencion_exacta(query, df):
                     
     return None
 
-async def clasificar_intencion(query, llm):
+# Agregá "last_entity=None" en los argumentos
+async def clasificar_intencion(query, llm, last_entity=None): 
     """
-    Router Inteligente V2.
-    Detecta insultos semánticamente sin listas hardcodeadas.
+    Router Inteligente V2 (Corregido para aceptar last_entity)
     """
     
     system_prompt = """
@@ -696,41 +696,38 @@ async def clasificar_intencion(query, llm):
     PRIORIDAD 1: BLOCK (Seguridad y Ofensas)
     - Si la frase contiene INSULTOS, agresiones, palabras obscenas o falta de respeto directa.
     - Ejemplos: "pelotudo", "bobo", "andate a cagar", "hijo de p*", "chupala", "idiota".
-    - Cualquier ataque al bot cae acá.
     
     PRIORIDAD 2: STATS (Estadísticas)
     - Preguntas explícitas sobre CANTIDADES o CONTEOS.
     - Clave: Empieza con "Cuantos", "Total de", "Numero de", "Que cantidad".
-    - Ejemplos: "¿Cuantas pizzerias hay?", "Total de bares".
     
     PRIORIDAD 3: SPECIFIC (Info puntual)
     - Preguntas sobre un lugar específico por su nombre.
-    - Ejemplos: "¿Donde queda Rancho Grande?", "Horario de Atila".
+    - Ejemplos: "Que opinas de Saluzzo?", "Que tal es Growler?", "Que sabes de Panino"?, "¿Donde queda Rancho Grande?", "Horario de Atila".
     
     PRIORIDAD 4: RECOMMENDATION (Búsqueda)
     - Busca opciones para comer o lugares con características.
-    - Ejemplos: "Lugares con pelotero", "Quiero sushi", "Parrilla barata".
-    - Si dice "Lugares con X", es esta categoría.
+    - Ejemplos: "mejores cervecerías", "mejores helados", "Lugares con pelotero", "Quiero sushi", "Parrilla barata".
     
     PRIORIDAD 5: GENERAL (Charla y Otros)
-    - Saludos, agradecimientos, incoherencias o temas off-topic (política, fútbol).
-    - Ejemplos: "Hola", "Gracias", "asdfg", "Aguante Boca".
+    - Saludos, agradecimientos, incoherencias o temas off-topic.
     
     Responde SOLO la palabra de la categoría (ej: BLOCK).
     """
     
     try:
-        # Temperature 0 para que no sea creativo clasificando
-        res = await llm.ainvoke(system_prompt + f"\nQUERY USUARIO: '{query}'")
+        # Usamos last_entity en el prompt si existe, ayuda al contexto
+        context_str = f" (Contexto previo: Hablábamos de {last_entity})" if last_entity else ""
+        
+        res = await llm.ainvoke(system_prompt + f"\nQUERY USUARIO: '{query}'{context_str}")
         intent = res.content.strip().upper().replace('"', '').replace('.', '')
         
         validos = ["BLOCK", "STATS", "SPECIFIC", "RECOMMENDATION", "GENERAL"]
         
-        # Limpieza básica
         for v in validos:
             if v in intent: return v
             
-        return "GENERAL" # Fallback ante duda
+        return "GENERAL"
         
     except Exception as e:
         logger.error(f"Error Router: {e}")
