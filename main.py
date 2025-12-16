@@ -1005,10 +1005,17 @@ async def procesar_consulta(query, df, vectorstore, llm_mini, llm_smart, ctx=Non
     # 3. SMART ROUTING (EL CEREBRO V8)
     # ==========================================
     last_ent = ctx.get('last_entity')
-    # El LLM decide qué quiere el usuario
-    clasificacion = await clasificar_intencion(query, llm_smart, last_entity=last_ent)
-    intent = clasificacion.get("intent")
-    entity_detected = clasificacion.get("entity")
+# --- CORRECCIÓN INICIO ---
+    # El router ahora devuelve un STRING directo ("STATS", "SPECIFIC", etc.)
+    intent_raw = await clasificar_intencion(query, llm_smart, last_entity=last_ent)
+    
+    intent = intent_raw
+    entity_detected = None # La versión actual de tu router no extrae entidades, solo intención.
+
+    # Ajuste de compatibilidad: Tu router devuelve "SPECIFIC", pero tu lógica abajo busca "SPECIFIC_INFO"
+    if intent == "SPECIFIC":
+        intent = "SPECIFIC_INFO"
+    # --- CORRECCIÓN FIN ---
 
 # --- CAMINO A: ESTADÍSTICAS ---
     if intent == "STATS":
