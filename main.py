@@ -704,8 +704,8 @@ async def clasificar_intencion(query, llm, last_entity=None):
        - Ej: "Lugares para ir con familia", "Donde comer pizza", "Mejores cervecerias", "Algo con pelotero".
        - Ej: "Heladerias", "Cafeterias", "Lugares lindos".
        
-    3. STATS: Preguntas de cantidad.
-       - Ej: "Cuantos locales tenes", "Total de parrillas".
+    3. STATS: Preguntas de cantidad de restaurantes que ofrecen un determinado producto (sushi, pizza, asado, panchos, etc.).
+       - Ej: "Cuantos lugares de sushi hay", "cuantas pizzerias hay", "total de parrillas".
 
     Responde JSON: {{"intent": "SPECIFIC_INFO" | "RECOMMENDATION" | "STATS", "entity": "NombreDetectado" | "LAST_ENTITY" | null}}
     """
