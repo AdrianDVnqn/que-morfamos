@@ -577,7 +577,7 @@ async def analizar_query_semantica(query, llm):
     for safe in whitelist:
         if safe in q_lower: is_safe_bypass = True
 
-    cache_key = f"analysis_v82_{q_lower.strip()}"
+    cache_key = f"analysis_v84_{q_lower.strip()}"
     cached = cache.get_json("analysis", cache_key)
     if cached: return cached
 
@@ -599,7 +599,19 @@ async def analizar_query_semantica(query, llm):
        - Query: "Para celiacos" -> keywords: ["celiaco"], synonyms: ["sin tacc", "gluten", "intolerante"]
        - Query: "Con terraza" -> keywords: ["terraza"], synonyms: ["afuera", "aire libre", "patio", "vereda"]
     
-    Responde SOLO JSON: {{"tipo": "PRODUCTO" | "VIBE" | "BLOCK", "keywords": ["k1"], "synonyms": ["s1"]}}
+    
+    4. UBICACIÓN GEOGRÁFICA (Opcional):
+       - Si el usuario menciona una zona, barrio o referencia espacial.
+       - Ejemplos: "en el centro", "zona alto", "cerca del rio", "cipolletti", "plottier".
+       - Si no menciona nada, devuelve null.
+    
+    Responde SOLO JSON: 
+    {{
+        "tipo": "...", 
+        "keywords": [...], 
+        "synonyms": [...],
+        "donde": "centro" (o null)
+    }}
     """
     try:
         res = await llm.ainvoke(template)
@@ -967,6 +979,44 @@ async def verificar_candidatos_con_llm(candidatos, df, query, llm):
 # ==========================================
 # 6. ROUTER PRINCIPAL
 # ==========================================
+
+
+def aplicar_filtro_zona(candidatos, df, zona_buscada):
+    """
+    Filtra la lista de nombres de restaurantes según si coinciden con la zona buscada.
+    Busca en las columnas: 'zona', 'barrio' y 'direccion'.
+    """
+    if not zona_buscada: return candidatos
+    
+    z_clean = zona_buscada.lower().strip()
+    
+    # Mapeo de sinónimos comunes de Neuquén (Opcional pero recomendado)
+    if "rio" in z_clean or "paseo" in z_clean: z_clean = "rio"
+    if "alto" in z_clean: z_clean = "alto"
+    # "centro" suele ser tal cual "centro"
+
+    candidatos_filtrados = []
+    
+    for local in candidatos:
+        mask = df['restaurante'] == local
+        if not mask.any(): continue
+        
+        row = df[mask].iloc[0]
+        
+        # Juntamos toda la info geográfica del local en un solo string
+        geo_data = f"{safe_str(row.get('zona'))} {safe_str(row.get('barrio'))} {safe_str(row.get('direccion'))}".lower()
+        
+        # Chequeamos si la zona buscada está en la data del local
+        if z_clean in geo_data:
+            candidatos_filtrados.append(local)
+            
+    # Si el filtro fue muy agresivo y no quedó nadie, devolvemos los originales (Soft Filter)
+    # O podés devolver [] si querés ser estricto. Yo prefiero soft para no dar respuesta vacía.
+    if not candidatos_filtrados:
+        return candidatos
+        
+    return candidatos_filtrados
+
 async def procesar_consulta(query, df, vectorstore, llm_mini, llm_smart, ctx=None, user_ip=None):
     if ctx is None: ctx = {}
     
@@ -1136,6 +1186,14 @@ async def procesar_consulta(query, df, vectorstore, llm_mini, llm_smart, ctx=Non
 
             keywords = analisis.get("keywords", [])
             synonyms = analisis.get("synonyms", [])
+            zona_detectada = analisis.get("donde") # <--- NUEVO DATO
+            # ==========================================================
+            # 🐛 DEBUG DE ZONA (LOG PARA RENDER)
+            # ==========================================================
+            if zona_detectada:
+                print(f"\n[DEBUG] 🌍 ZONA DETECTADA POR LLM: '{zona_detectada}'", flush=True)
+            else:
+                print(f"\n[DEBUG] 🌍 ZONA: No se detectó ubicación específica.", flush=True)
             
             # Preparamos los términos de filtrado estricto
             filtro_terms = set(keywords)
@@ -1151,6 +1209,17 @@ async def procesar_consulta(query, df, vectorstore, llm_mini, llm_smart, ctx=Non
                 if nom and nom not in seen:
                     seen.add(nom)
                     candidatos_crudos.append(nom)
+
+            # ==========================================================
+            # 🌍 APLICACIÓN DEL FILTRO DE ZONA
+            # ==========================================================
+            if zona_detectada:
+                cant_antes = len(candidatos_crudos)
+                candidatos_crudos = aplicar_filtro_zona(candidatos_crudos, df, zona_detectada)
+                cant_despues = len(candidatos_crudos)
+                
+                print(f"[DEBUG] 📉 FILTRO ZONA APLICADO: {cant_antes} -> {cant_despues} candidatos restantes.", flush=True)
+            # ==========================================================
 
             # 3. FILTRADO POR EVIDENCIA (Hard Filter)
             grupo_alta_relevancia = []
