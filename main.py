@@ -581,7 +581,7 @@ async def analizar_query_semantica(query, llm):
     cached = cache.get_json("analysis", cache_key)
     if cached: return cached
 
-    template = """
+    template = f"""
     Analiza la intención del usuario. Query: "{query}"
     
     1. SEGURIDAD:
