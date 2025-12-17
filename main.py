@@ -1182,25 +1182,33 @@ async def procesar_consulta(query, df, vectorstore, llm_mini, llm_smart, ctx=Non
             else:
                 grupo_alta_relevancia = candidatos_crudos
 
-            # 4. SELECCIÓN PARA EL JUEZ
-            # Si encontramos lugares con la palabra clave, SOLO procesamos esos.
-            # Ignoramos el resto (aunque tengan 5 estrellas, si no dicen "pelotero", no sirven).
+            # 4. SELECCIÓN PARA EL JUEZ (Lógica de Relleno V2)
+            
+            # Definimos la función de calidad para ordenar
+            def sort_by_quality(nombre):
+                mask = df['restaurante'] == nombre
+                if not mask.any(): return 0
+                row = df[mask].iloc[0]
+                return safe_float(row.get('rating_gral'))
+
+            # Ordenamos ambos grupos por calidad (estrellas)
+            grupo_alta_relevancia.sort(key=sort_by_quality, reverse=True)
+            grupo_baja_relevancia.sort(key=sort_by_quality, reverse=True)
             
             candidatos_a_verificar = []
+
+            # ESTRATEGIA MIXTA:
+            # 1. Primero metemos todos los que tienen MATCH EXACTO (hasta 10)
+            candidatos_a_verificar.extend(grupo_alta_relevancia[:10])
             
-            if grupo_alta_relevancia:
-                # Si hay muchos con la palabra, ahí sí desempatamos por calidad para no saturar al LLM
-                def sort_by_quality(nombre):
-                    mask = df['restaurante'] == nombre
-                    row = df[mask].iloc[0]
-                    return safe_float(row.get('rating_gral'))
-                
-                grupo_alta_relevancia.sort(key=sort_by_quality, reverse=True)
-                # Tomamos el Top 10 de los que TIENEN la palabra
-                candidatos_a_verificar = grupo_alta_relevancia[:10]
-            else:
-                # Fallback: Si nadie dice la palabra, usamos los mejores del vector search
-                candidatos_a_verificar = grupo_baja_relevancia[:10]
+            # 2. Si nos quedamos cortos (menos de 8 candidatos), rellenamos con los de búsqueda vectorial
+            # Esto asegura variedad aunque no tengan la palabra exacta
+            faltan = 8 - len(candidatos_a_verificar)
+            if faltan > 0:
+                candidatos_a_verificar.extend(grupo_baja_relevancia[:faltan])
+            
+            # (Opcional) Limitar el total final a 10 para no saturar al LLM Juez
+            candidatos_a_verificar = candidatos_a_verificar[:10]
 
             # 5. EL JUEZ LLM (Verificación de Contexto)
             # Ahora el juez recibe una lista de lugares que YA sabemos que contienen la palabra.
