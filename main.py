@@ -175,6 +175,21 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import RedirectResponse
+
+class DoubleSlashMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        path = request.url.path
+        if path.startswith("//"):
+            # Si viene con // lo corregimos internamente
+            new_path = path.replace("//", "/", 1)
+            scope = request.scope
+            scope["path"] = new_path
+        return await call_next(request)
+
+app.add_middleware(DoubleSlashMiddleware)
+
 class RestaurantCard(BaseModel):
     nombre: str
     rating: float = 0

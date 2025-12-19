@@ -14,8 +14,8 @@ primary_region = "gru"  # <--- CAMBIADO de 'gru' a 'eze' (Buenos Aires)
     hard_limit = 25
 
   [[http_service.checks]]
-    grace_period = "180s"   # <--- Aumentado a 60s por las dudas (Pandas es pesado)
-    interval = "15s"
+    grace_period = "60s"   # <--- Aumentado a 60s por las dudas (Pandas es pesado)
+    interval = "30s"
     method = "get"
     path = "/health"
     timeout = "10s"
