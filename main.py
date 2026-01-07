@@ -5,7 +5,10 @@ import unicodedata
 import asyncio
 import logging
 import math
+from datetime import datetime, timezone
 from contextlib import asynccontextmanager
+from dotenv import load_dotenv
+from zoneinfo import ZoneInfo
 import pandas as pd
 import numpy as np
 from typing import List, Optional
@@ -27,10 +30,13 @@ logger = logging.getLogger("QueMorfamos")
 # ==========================================
 # 1. CONFIGURACIÓN DE ENTORNO
 # ==========================================
+load_dotenv("mis_claves.env")
+
 PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "que-morfamos-nqn")
 ARCHIVO_DATASET = "dataset_reviews.parquet"
 UPSTASH_REDIS_REST_URL = os.getenv("UPSTASH_REDIS_REST_URL")
 UPSTASH_REDIS_REST_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN")
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 
 class RedisCacheManager:
     def __init__(self, url, token):
@@ -246,6 +252,74 @@ def safe_float(val):
 def safe_int(val):
     try: return int(float(val)) if pd.notna(val) else 0
     except: return 0
+
+def _truncate_text(text: str, max_len: int) -> str:
+    text = safe_str(text)
+    return (text[: max_len - 1] + "…") if len(text) > max_len else text
+
+def extract_client_ip(request: Request) -> str:
+    try:
+        headers = request.headers
+        for key in ("cf-connecting-ip", "true-client-ip", "x-real-ip", "fly-client-ip", "x-forwarded-for"):
+            val = headers.get(key)
+            if not val:
+                continue
+            if key == "x-forwarded-for":
+                ip = val.split(",")[0].strip()
+            else:
+                ip = val.strip()
+            if ip:
+                return ip
+        if request.client and request.client.host:
+            return request.client.host
+    except Exception:
+        pass
+    return "unknown"
+
+async def _send_discord_webhook(content: str) -> None:
+    if not DISCORD_WEBHOOK_URL:
+        return
+
+    payload = {"content": content}
+
+    def _post_sync():
+        import urllib.request
+
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        req = urllib.request.Request(
+            DISCORD_WEBHOOK_URL,
+            data=data,
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent": "QueMorfamosBot/1.0",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=6) as resp:
+            resp.read()
+
+    try:
+        await asyncio.to_thread(_post_sync)
+    except Exception as e:
+        logger.warning(f"⚠️ No se pudo enviar log a Discord: {e}")
+
+async def log_user_query_to_discord(request: Request, query: str) -> None:
+    try:
+        ts = datetime.now(ZoneInfo("America/Argentina/Buenos_Aires")).isoformat()
+        ts_label = "Hora (Argentina)"
+    except Exception:
+        ts = datetime.now(timezone.utc).isoformat()
+        ts_label = "Hora (UTC)"
+    ip = extract_client_ip(request)
+    q = _truncate_text(query, 1700).replace("```", "`")
+
+    content = (
+        "📝 Nueva consulta\n"
+        f"{ts_label}: {ts}\n"
+        f"IP: {ip}\n"
+        f"Consulta: {q}"
+    )
+    await _send_discord_webhook(content)
 
 def formatear_autor(nombre):
     nombre = safe_str(nombre)
@@ -1456,8 +1530,10 @@ async def chat(req: QueryRequest, request: Request):
         logger.info(f"📥 Contexto Recibido: {req.conversation_context}")
         ctx = req.conversation_context.copy() if req.conversation_context else {}
         if req.tone: ctx['tone'] = sanitize_tone(req.tone)
-        
-        client_ip = request.client.host
+
+        asyncio.create_task(log_user_query_to_discord(request, req.query))
+
+        client_ip = extract_client_ip(request)
         
         resp, mode, pend, locs, cards, det = await procesar_consulta(
             req.query, df, vectorstore, llm_mini, llm_smart, ctx, user_ip=client_ip
