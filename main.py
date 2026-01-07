@@ -37,6 +37,7 @@ ARCHIVO_DATASET = "dataset_reviews.parquet"
 UPSTASH_REDIS_REST_URL = os.getenv("UPSTASH_REDIS_REST_URL")
 UPSTASH_REDIS_REST_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN")
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
+THEIPAPI_KEY = os.getenv("THEIPAPI_KEY")
 
 class RedisCacheManager:
     def __init__(self, url, token):
@@ -336,7 +337,7 @@ def parse_user_agent(user_agent: str) -> dict:
     }
 
 async def get_ip_location(ip: str) -> dict:
-    """Obtiene país y ciudad desde IP usando ip-api.com (gratis, 45 req/min)"""
+    """Obtiene país y ciudad desde IP usando theipapi.com"""
     # Detectar IPs locales/privadas (IPv4 e IPv6)
     if not ip or ip == "unknown":
         logger.info(f"🏠 IP desconocida, usando ubicación por defecto")
@@ -354,38 +355,39 @@ async def get_ip_location(ip: str) -> dict:
         logger.info(f"🏠 IP privada IPv6 detectada: {ip}")
         return {"country": "Local/LAN", "city": "", "flag": "🏠"}
     
+    if not THEIPAPI_KEY:
+        logger.warning("⚠️ THEIPAPI_KEY no configurada, usando ubicación por defecto")
+        return {"country": "Desconocido", "city": "", "flag": "🌍"}
+    
     try:
         logger.info(f"🌍 Consultando geolocalización para IP: {ip}")
         
         def _fetch_sync():
-            url = f"http://ip-api.com/json/{ip}?fields=status,country,city,countryCode,message"
-            logger.info(f"📡 URL geolocalización: {url}")
+            url = f"https://api.theipapi.com/v1/{ip}?apiKey={THEIPAPI_KEY}"
+            logger.info(f"📡 Consultando theipapi.com")
             req = urllib.request.Request(url, headers={"User-Agent": "QueMorfamosBot/1.0"})
             with urllib.request.urlopen(req, timeout=5) as resp:
                 raw = resp.read().decode('utf-8')
-                logger.info(f"📥 Respuesta API: {raw}")
+                logger.info(f"📥 Respuesta API: {raw[:200]}...")  # Log truncado
                 return json.loads(raw)
         
         data = await asyncio.to_thread(_fetch_sync)
         
-        if data.get('status') == 'success':
-            country = data.get('country', 'Desconocido')
-            city = data.get('city', '')
-            code = data.get('countryCode', '')
-            
-            # Emojis de banderas (offset desde 🇦 = U+1F1E6)
-            flag = "🌍"
-            if code and len(code) == 2:
-                try:
-                    flag = "".join(chr(0x1F1E6 + ord(c) - ord('A')) for c in code.upper())
-                except:
-                    flag = "🌍"
-            
-            logger.info(f"✅ Geolocalización exitosa: {flag} {country} ({city})")
-            return {"country": country, "city": city, "flag": flag}
-        else:
-            error_msg = data.get('message', 'Unknown error')
-            logger.warning(f"⚠️ API geolocalización falló: {error_msg}")
+        # theipapi.com devuelve datos en 'location' o directamente en root
+        country = data.get('country', data.get('location', {}).get('country', 'Desconocido'))
+        city = data.get('city', data.get('location', {}).get('city', ''))
+        code = data.get('country_code', data.get('location', {}).get('country_code', ''))
+        
+        # Emojis de banderas (offset desde 🇦 = U+1F1E6)
+        flag = "🌍"
+        if code and len(code) == 2:
+            try:
+                flag = "".join(chr(0x1F1E6 + ord(c) - ord('A')) for c in code.upper())
+            except:
+                flag = "🌍"
+        
+        logger.info(f"✅ Geolocalización exitosa: {flag} {country} ({city})")
+        return {"country": country, "city": city, "flag": flag}
             
     except Exception as e:
         logger.error(f"❌ Error obteniendo geolocalización de IP {ip}: {e}", exc_info=True)
