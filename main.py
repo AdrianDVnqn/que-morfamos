@@ -288,6 +288,83 @@ def extract_client_ip(request: Request) -> str:
         pass
     return "unknown"
 
+def parse_user_agent(user_agent: str) -> dict:
+    """Extrae info del User-Agent sin librerías externas"""
+    ua = user_agent.lower() if user_agent else ""
+    
+    # Detectar dispositivo
+    if any(x in ua for x in ['mobile', 'android', 'iphone', 'ipod', 'blackberry', 'windows phone']):
+        device = "📱 Mobile"
+    elif 'tablet' in ua or 'ipad' in ua:
+        device = "📱 Tablet"
+    else:
+        device = "💻 Desktop"
+    
+    # Detectar navegador
+    if 'edg' in ua:
+        browser = "Edge"
+    elif 'chrome' in ua and 'chromium' not in ua:
+        browser = "Chrome"
+    elif 'firefox' in ua:
+        browser = "Firefox"
+    elif 'safari' in ua and 'chrome' not in ua:
+        browser = "Safari"
+    elif 'opera' in ua or 'opr' in ua:
+        browser = "Opera"
+    else:
+        browser = "Otro"
+    
+    # Detectar SO
+    if 'windows' in ua:
+        os_name = "Windows"
+    elif 'mac os' in ua or 'macos' in ua:
+        os_name = "macOS"
+    elif 'android' in ua:
+        os_name = "Android"
+    elif 'iphone' in ua or 'ipad' in ua or 'ipod' in ua:
+        os_name = "iOS"
+    elif 'linux' in ua:
+        os_name = "Linux"
+    else:
+        os_name = "Desconocido"
+    
+    return {
+        "device": device,
+        "browser": browser,
+        "os": os_name,
+        "raw": user_agent[:100] if user_agent else "Unknown"
+    }
+
+async def get_ip_location(ip: str) -> dict:
+    """Obtiene país y ciudad desde IP usando ip-api.com (gratis, 45 req/min)"""
+    if not ip or ip == "unknown" or ip.startswith("127.") or ip.startswith("192.168."):
+        return {"country": "Local/VPN", "city": "", "flag": "🏠"}
+    
+    try:
+        def _fetch_sync():
+            url = f"http://ip-api.com/json/{ip}?fields=status,country,city,countryCode"
+            req = urllib.request.Request(url, headers={"User-Agent": "QueMorfamosBot/1.0"})
+            with urllib.request.urlopen(req, timeout=3) as resp:
+                return json.loads(resp.read().decode('utf-8'))
+        
+        data = await asyncio.to_thread(_fetch_sync)
+        
+        if data.get('status') == 'success':
+            country = data.get('country', 'Desconocido')
+            city = data.get('city', '')
+            code = data.get('countryCode', '')
+            
+            # Emojis de banderas (offset desde 🇦 = U+1F1E6)
+            flag = ""
+            if code and len(code) == 2:
+                flag = "".join(chr(0x1F1E6 + ord(c) - ord('A')) for c in code.upper())
+            
+            return {"country": country, "city": city, "flag": flag}
+    except Exception as e:
+        logger.warning(f"No se pudo obtener geolocalización de IP: {e}")
+    
+    return {"country": "Desconocido", "city": "", "flag": "🌍"}
+
 async def _send_discord_webhook(content: str) -> None:
     if not DISCORD_WEBHOOK_URL:
         return
@@ -319,22 +396,54 @@ async def log_user_query_to_discord(request: Request, query: str, tone: str = No
     try:
         dt = datetime.now(ZoneInfo("America/Argentina/Buenos_Aires"))
         ts = dt.strftime("%d/%m/%Y %H:%M:%S (ART)")
+        ts_iso = dt.isoformat()
     except Exception:
         dt = datetime.now(timezone.utc)
         ts = dt.strftime("%d/%m/%Y %H:%M:%S (UTC)")
+        ts_iso = dt.isoformat()
     
     ip = extract_client_ip(request)
+    ua_info = parse_user_agent(request.headers.get("user-agent", ""))
+    location = await get_ip_location(ip)
     q = _truncate_text(query, 1700).replace("```", "`")
     tone_display = sanitize_tone(tone).title() if tone else "Cordial"
 
+    # Formato de ubicación
+    loc_str = f"{location['flag']} {location['country']}"
+    if location['city']:
+        loc_str += f" ({location['city']})"
+
+    # Mensaje Discord
     content = (
         "📝 **Nueva consulta**\n"
         f"🕒 Hora: {ts}\n"
+        f"📍 Ubicación: {loc_str}\n"
         f"🌐 IP: `{ip}`\n"
+        f"{ua_info['device']} {ua_info['browser']} ({ua_info['os']})\n"
         f"🎭 Tono: {tone_display}\n"
         f"💬 Consulta: {q}"
     )
     await _send_discord_webhook(content)
+    
+    # Log a archivo JSON
+    log_entry = {
+        "timestamp": ts_iso,
+        "ip": ip,
+        "country": location['country'],
+        "city": location['city'],
+        "device": ua_info['device'].replace("📱 ", "").replace("💻 ", ""),
+        "browser": ua_info['browser'],
+        "os": ua_info['os'],
+        "tone": tone_display,
+        "query": query,
+        "user_agent": ua_info['raw']
+    }
+    
+    try:
+        with open("user_queries.log", "a", encoding="utf-8") as f:
+            f.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
+    except Exception as e:
+        logger.warning(f"⚠️ No se pudo guardar log a archivo: {e}")
 
 def formatear_autor(nombre):
     nombre = safe_str(nombre)
