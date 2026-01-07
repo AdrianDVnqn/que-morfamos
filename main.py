@@ -373,21 +373,27 @@ async def get_ip_location(ip: str) -> dict:
         
         data = await asyncio.to_thread(_fetch_sync)
         
-        # theipapi.com devuelve datos en 'location' o directamente en root
-        country = data.get('country', data.get('location', {}).get('country', 'Desconocido'))
-        city = data.get('city', data.get('location', {}).get('city', ''))
-        code = data.get('country_code', data.get('location', {}).get('country_code', ''))
-        
-        # Emojis de banderas (offset desde 🇦 = U+1F1E6)
-        flag = "🌍"
-        if code and len(code) == 2:
-            try:
-                flag = "".join(chr(0x1F1E6 + ord(c) - ord('A')) for c in code.upper())
-            except:
-                flag = "🌍"
-        
-        logger.info(f"✅ Geolocalización exitosa: {flag} {country} ({city})")
-        return {"country": country, "city": city, "flag": flag}
+        # theipapi.com devuelve datos en body.location
+        if data.get('status') == 'OK' and 'body' in data:
+            body = data['body']
+            location = body.get('location', {})
+            
+            country = location.get('country', 'Desconocido')
+            city = location.get('city', '')
+            code = location.get('country_code', '')
+            
+            # Emojis de banderas (offset desde 🇦 = U+1F1E6)
+            flag = "🌍"
+            if code and len(code) == 2:
+                try:
+                    flag = "".join(chr(0x1F1E6 + ord(c) - ord('A')) for c in code.upper())
+                except:
+                    flag = "🌍"
+            
+            logger.info(f"✅ Geolocalización exitosa: {flag} {country} ({city})")
+            return {"country": country, "city": city, "flag": flag}
+        else:
+            logger.warning(f"⚠️ API theipapi.com respuesta inesperada: {data.get('status')}")
             
     except Exception as e:
         logger.error(f"❌ Error obteniendo geolocalización de IP {ip}: {e}", exc_info=True)
