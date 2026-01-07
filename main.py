@@ -97,6 +97,12 @@ async def lifespan(app: FastAPI):
     global df, vectorstore, llm_mini, llm_smart
     logger.info("☁️ Iniciando servidor (Lifespan v6.8)...")
     
+    # Notificar activación del backend
+    try:
+        await _send_discord_webhook("🟢 **Backend ACTIVADO** - Servidor iniciado en Fly.io")
+    except Exception as e:
+        logger.warning(f"No se pudo notificar startup a Discord: {e}")
+    
     if os.path.exists(ARCHIVO_DATASET):
         try:
             df = pd.read_parquet(ARCHIVO_DATASET)
@@ -166,7 +172,13 @@ async def lifespan(app: FastAPI):
         llm_smart = ChatOpenAI(model="gpt-4o-mini", temperature=0)
 
     yield
+    
+    # Notificar desactivación del backend
     logger.info("🛑 Apagando servidor...")
+    try:
+        await _send_discord_webhook("🔴 **Backend DETENIDO** - Servidor apagado por inactividad (Fly.io)")
+    except Exception as e:
+        logger.warning(f"No se pudo notificar shutdown a Discord: {e}")
 
 # ==========================================
 # 3. APP & MODELS
