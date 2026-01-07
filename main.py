@@ -337,15 +337,34 @@ def parse_user_agent(user_agent: str) -> dict:
 
 async def get_ip_location(ip: str) -> dict:
     """Obtiene país y ciudad desde IP usando ip-api.com (gratis, 45 req/min)"""
-    if not ip or ip == "unknown" or ip.startswith("127.") or ip.startswith("192.168."):
-        return {"country": "Local/VPN", "city": "", "flag": "🏠"}
+    # Detectar IPs locales/privadas (IPv4 e IPv6)
+    if not ip or ip == "unknown":
+        logger.info(f"🏠 IP desconocida, usando ubicación por defecto")
+        return {"country": "Desconocido", "city": "", "flag": "❓"}
+    
+    # IPs privadas IPv4
+    if ip.startswith(("127.", "192.168.", "10.", "172.16.", "172.17.", "172.18.", "172.19.", 
+                       "172.20.", "172.21.", "172.22.", "172.23.", "172.24.", "172.25.", 
+                       "172.26.", "172.27.", "172.28.", "172.29.", "172.30.", "172.31.")):
+        logger.info(f"🏠 IP privada IPv4 detectada: {ip}")
+        return {"country": "Local/LAN", "city": "", "flag": "🏠"}
+    
+    # IPs privadas/locales IPv6
+    if ip.startswith(("::1", "fc00:", "fd00:", "fe80:")):
+        logger.info(f"🏠 IP privada IPv6 detectada: {ip}")
+        return {"country": "Local/LAN", "city": "", "flag": "🏠"}
     
     try:
+        logger.info(f"🌍 Consultando geolocalización para IP: {ip}")
+        
         def _fetch_sync():
-            url = f"http://ip-api.com/json/{ip}?fields=status,country,city,countryCode"
+            url = f"http://ip-api.com/json/{ip}?fields=status,country,city,countryCode,message"
+            logger.info(f"📡 URL geolocalización: {url}")
             req = urllib.request.Request(url, headers={"User-Agent": "QueMorfamosBot/1.0"})
-            with urllib.request.urlopen(req, timeout=3) as resp:
-                return json.loads(resp.read().decode('utf-8'))
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                raw = resp.read().decode('utf-8')
+                logger.info(f"📥 Respuesta API: {raw}")
+                return json.loads(raw)
         
         data = await asyncio.to_thread(_fetch_sync)
         
@@ -355,13 +374,21 @@ async def get_ip_location(ip: str) -> dict:
             code = data.get('countryCode', '')
             
             # Emojis de banderas (offset desde 🇦 = U+1F1E6)
-            flag = ""
+            flag = "🌍"
             if code and len(code) == 2:
-                flag = "".join(chr(0x1F1E6 + ord(c) - ord('A')) for c in code.upper())
+                try:
+                    flag = "".join(chr(0x1F1E6 + ord(c) - ord('A')) for c in code.upper())
+                except:
+                    flag = "🌍"
             
+            logger.info(f"✅ Geolocalización exitosa: {flag} {country} ({city})")
             return {"country": country, "city": city, "flag": flag}
+        else:
+            error_msg = data.get('message', 'Unknown error')
+            logger.warning(f"⚠️ API geolocalización falló: {error_msg}")
+            
     except Exception as e:
-        logger.warning(f"No se pudo obtener geolocalización de IP: {e}")
+        logger.error(f"❌ Error obteniendo geolocalización de IP {ip}: {e}", exc_info=True)
     
     return {"country": "Desconocido", "city": "", "flag": "🌍"}
 
