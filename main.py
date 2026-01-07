@@ -392,7 +392,19 @@ async def _send_discord_webhook(content: str) -> None:
     except Exception as e:
         logger.warning(f"⚠️ No se pudo enviar log a Discord: {e}")
 
-async def log_user_query_to_discord(request: Request, query: str, tone: str = None) -> None:
+async def log_user_query_to_discord(
+    request: Request, 
+    query: str, 
+    tone: str = None,
+    response_time: float = None,
+    mode: str = None,
+    restaurants: list = None,
+    keywords: list = None,
+    used_cache: bool = False,
+    ai_provider: str = None,
+    context_info: dict = None,
+    strikes: int = 0
+) -> None:
     try:
         dt = datetime.now(ZoneInfo("America/Argentina/Buenos_Aires"))
         ts = dt.strftime("%d/%m/%Y %H:%M:%S (ART)")
@@ -407,25 +419,42 @@ async def log_user_query_to_discord(request: Request, query: str, tone: str = No
     location = await get_ip_location(ip)
     q = _truncate_text(query, 1700).replace("```", "`")
     tone_display = sanitize_tone(tone).title() if tone else "Cordial"
+    referer = request.headers.get("referer", "Directo")
+    language = request.headers.get("accept-language", "es").split(",")[0]
 
     # Formato de ubicación
     loc_str = f"{location['flag']} {location['country']}"
     if location['city']:
         loc_str += f" ({location['city']})"
 
-    # Mensaje Discord
-    content = (
-        "📝 **Nueva consulta**\n"
-        f"🕒 Hora: {ts}\n"
-        f"📍 Ubicación: {loc_str}\n"
-        f"🌐 IP: `{ip}`\n"
-        f"{ua_info['device']} {ua_info['browser']} ({ua_info['os']})\n"
-        f"🎭 Tono: {tone_display}\n"
-        f"💬 Consulta: {q}"
-    )
+    # Mensaje Discord (compacto, solo info clave)
+    discord_parts = [
+        "📝 **Nueva consulta**",
+        f"🕒 {ts}",
+        f"📍 {loc_str}",
+        f"{ua_info['device']} {ua_info['browser']} ({ua_info['os']})",
+        f"🎭 {tone_display}"
+    ]
+    
+    if response_time:
+        discord_parts.append(f"⏱️ {response_time:.2f}s")
+    
+    if mode:
+        mode_emoji = {"rag": "🔍", "resumen": "📋", "estadisticas": "📊", "blocked": "🚫"}.get(mode, "💬")
+        discord_parts.append(f"{mode_emoji} Modo: {mode}")
+    
+    if restaurants:
+        rest_str = ", ".join(restaurants[:3])
+        if len(restaurants) > 3:
+            rest_str += f" (+{len(restaurants)-3} más)"
+        discord_parts.append(f"🏪 {rest_str}")
+    
+    discord_parts.append(f"💬 {q}")
+    
+    content = "\n".join(discord_parts)
     await _send_discord_webhook(content)
     
-    # Log a archivo JSON
+    # Log a archivo JSON (TODA la info detallada)
     log_entry = {
         "timestamp": ts_iso,
         "ip": ip,
@@ -434,8 +463,19 @@ async def log_user_query_to_discord(request: Request, query: str, tone: str = No
         "device": ua_info['device'].replace("📱 ", "").replace("💻 ", ""),
         "browser": ua_info['browser'],
         "os": ua_info['os'],
+        "language": language,
+        "referer": referer,
         "tone": tone_display,
         "query": query,
+        "response_time_seconds": response_time,
+        "mode": mode,
+        "restaurants_returned": restaurants or [],
+        "keywords_detected": keywords or [],
+        "used_cache": used_cache,
+        "ai_provider": ai_provider,
+        "has_context": bool(context_info),
+        "last_entity": context_info.get('last_entity') if context_info else None,
+        "strikes": strikes,
         "user_agent": ua_info['raw']
     }
     
@@ -1649,19 +1689,47 @@ async def get_restaurant_detail(nombre: str, topic: Optional[str] = None, tone: 
 
 @app.post("/chat", response_model=QueryResponse)
 async def chat(req: QueryRequest, request: Request):
+    start_time = asyncio.get_event_loop().time()
+    
     try:
         # LOG DE ENTRADA: ¿Qué contexto me manda el frontend?
         logger.info(f"📥 Contexto Recibido: {req.conversation_context}")
         ctx = req.conversation_context.copy() if req.conversation_context else {}
         if req.tone: ctx['tone'] = sanitize_tone(req.tone)
 
-        asyncio.create_task(log_user_query_to_discord(request, req.query, req.tone))
-
         client_ip = extract_client_ip(request)
         
         resp, mode, pend, locs, cards, det = await procesar_consulta(
             req.query, df, vectorstore, llm_mini, llm_smart, ctx, user_ip=client_ip
         )
+        
+        # Calcular tiempo de respuesta
+        response_time = asyncio.get_event_loop().time() - start_time
+        
+        # Extraer nombres de restaurantes retornados
+        restaurants = [c.nombre for c in cards] if cards else []
+        
+        # Determinar proveedor de IA usado
+        ai_provider = None
+        if llm_mini:
+            ai_provider = f"Mini:{llm_mini.model_name}"
+        if llm_smart and mode in ["rag", "resumen"]:
+            ai_provider = f"Smart:{llm_smart.model_name}"
+        
+        # Log asíncrono con todas las métricas
+        asyncio.create_task(log_user_query_to_discord(
+            request, 
+            req.query, 
+            tone=req.tone,
+            response_time=response_time,
+            mode=mode,
+            restaurants=restaurants,
+            keywords=None,  # Se podría extraer del análisis semántico
+            used_cache=False,  # Se podría detectar si vino de caché
+            ai_provider=ai_provider,
+            context_info=ctx,
+            strikes=ctx.get('strikes', 0)
+        ))
         
         new_ctx = ctx.copy() if ctx else {}
         if pend: new_ctx['pending_options'] = pend
