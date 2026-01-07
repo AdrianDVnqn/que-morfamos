@@ -315,21 +315,24 @@ async def _send_discord_webhook(content: str) -> None:
     except Exception as e:
         logger.warning(f"⚠️ No se pudo enviar log a Discord: {e}")
 
-async def log_user_query_to_discord(request: Request, query: str) -> None:
+async def log_user_query_to_discord(request: Request, query: str, tone: str = None) -> None:
     try:
-        ts = datetime.now(ZoneInfo("America/Argentina/Buenos_Aires")).isoformat()
-        ts_label = "Hora (Argentina)"
+        dt = datetime.now(ZoneInfo("America/Argentina/Buenos_Aires"))
+        ts = dt.strftime("%d/%m/%Y %H:%M:%S (ART)")
     except Exception:
-        ts = datetime.now(timezone.utc).isoformat()
-        ts_label = "Hora (UTC)"
+        dt = datetime.now(timezone.utc)
+        ts = dt.strftime("%d/%m/%Y %H:%M:%S (UTC)")
+    
     ip = extract_client_ip(request)
     q = _truncate_text(query, 1700).replace("```", "`")
+    tone_display = sanitize_tone(tone).title() if tone else "Cordial"
 
     content = (
-        "📝 Nueva consulta\n"
-        f"{ts_label}: {ts}\n"
-        f"IP: {ip}\n"
-        f"Consulta: {q}"
+        "📝 **Nueva consulta**\n"
+        f"🕒 Hora: {ts}\n"
+        f"🌐 IP: `{ip}`\n"
+        f"🎭 Tono: {tone_display}\n"
+        f"💬 Consulta: {q}"
     )
     await _send_discord_webhook(content)
 
@@ -1543,7 +1546,7 @@ async def chat(req: QueryRequest, request: Request):
         ctx = req.conversation_context.copy() if req.conversation_context else {}
         if req.tone: ctx['tone'] = sanitize_tone(req.tone)
 
-        asyncio.create_task(log_user_query_to_discord(request, req.query))
+        asyncio.create_task(log_user_query_to_discord(request, req.query, req.tone))
 
         client_ip = extract_client_ip(request)
         
