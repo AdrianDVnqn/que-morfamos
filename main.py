@@ -1609,50 +1609,85 @@ async def procesar_consulta(query, df, vectorstore, llm_mini, llm_smart, ctx=Non
             print(f"[DEBUG] ⚖️ Juez LLM aprobó: {len(locales_verificados)} de {len(candidatos_a_verificar)}", flush=True)
             print(f"[DEBUG] ⚖️ Aprobados: {locales_verificados}", flush=True)
             
-            # Si el Juez mata a muchos pero tenemos lugares con keyword confirmado, usamos esos
-            # El juez a veces es muy estricto buscando "ES un pelotero" vs "TIENE pelotero"
-            if len(locales_verificados) < 3 and len(grupo_alta_relevancia) >= 3:
-                print(f"[DEBUG] ⚖️ Juez muy estricto, usando grupo ALTA relevancia como fallback", flush=True)
-                locales_verificados = grupo_alta_relevancia[:5]
+            # Separar EXACTOS (aprobados por juez) y RELACIONADOS (alta relevancia no aprobados)
+            exactos = locales_verificados[:3]  # Máximo 3 exactos
+            relacionados = [loc for loc in grupo_alta_relevancia if loc not in exactos][:4]  # Máximo 4 relacionados
+            
+            print(f"[DEBUG] 🎯 Exactos: {exactos}", flush=True)
+            print(f"[DEBUG] 🔗 Relacionados: {relacionados}", flush=True)
 
             # 6. RANKING FINAL (Ahora sí, por calidad)
-            # De los que pasaron TODAS las pruebas, mostramos los mejores.
             def calcular_score_final(nombre_local):
                 mask = df['restaurante'] == nombre_local
                 if not mask.any(): return 0
                 row = df[mask].iloc[0]
                 rat = safe_float(row.get('rating_gral'))
                 revs = safe_int(row.get('total_reviews_google'))
-                return rat + (math.log10(revs + 1) * 0.2) # Logaritmo suave
+                return rat + (math.log10(revs + 1) * 0.2)
 
-            locales_verificados.sort(key=calcular_score_final, reverse=True)
-            locales_finales = locales_verificados[:5]
+            exactos.sort(key=calcular_score_final, reverse=True)
+            relacionados.sort(key=calcular_score_final, reverse=True)
 
-            if not locales_finales: 
+            # Si no hay exactos ni relacionados, no hay resultado
+            if not exactos and not relacionados: 
                 return "No encontré lugares que cumplan con ese requisito específico.", "rag", None, [], [], ""
 
-            # 7. Generación de Cards y Respuesta
+            # 7. Generación de Cards y Respuesta diferenciada
+            todos_los_locales = exactos + relacionados
             cards = await obtener_restaurant_cards(
-                locales_finales, df, llm_mini, query, tone, 
+                todos_los_locales, df, llm_mini, query, tone, 
                 strict_mode=False, 
                 keywords_list=keywords,
                 synonyms_list=synonyms
             )
+            
+            # Separar cards en exactos y relacionados
+            cards_exactos = [c for c in cards if c.nombre in exactos]
+            cards_relacionados = [c for c in cards if c.nombre in relacionados]
+            
             nombres_finales = [c.nombre for c in cards]
             locs = obtener_coordenadas(nombres_finales, df)
             
-            detalles_lugares = "\n".join([f"- {c.nombre}: {c.descripcion}" for c in cards])
+            # Construir prompt diferenciado
             prefix = tone_system_instruction(tone)
             
-            prompt_rag = (
-                f"{prefix}\n"
-                f"SITUACIÓN: El usuario buscó '{query}'.\n"
-                f"Resultados VERIFICADOS:\n{detalles_lugares}\n\n"
-                f"INSTRUCCIONES:\n"
-                "1. Basate EXCLUSIVAMENTE en las descripciones provistas.\n"
-                "2. Confirmale al usuario que estos lugares cumplen con su búsqueda.\n"
-                "3. Genera una recomendación útil."
-            )
+            detalles_exactos = "\n".join([f"- {c.nombre}: {c.descripcion}" for c in cards_exactos]) if cards_exactos else ""
+            detalles_relacionados = "\n".join([f"- {c.nombre}: {c.descripcion}" for c in cards_relacionados]) if cards_relacionados else ""
+            
+            if cards_exactos and cards_relacionados:
+                # Tenemos ambos: exactos y relacionados
+                prompt_rag = (
+                    f"{prefix}\n"
+                    f"SITUACIÓN: El usuario buscó '{query}'.\n\n"
+                    f"LUGARES EXACTOS (cumplen específicamente con lo pedido):\n{detalles_exactos}\n\n"
+                    f"LUGARES RELACIONADOS (tienen algo similar pero no exactamente lo que pidió):\n{detalles_relacionados}\n\n"
+                    f"INSTRUCCIONES:\n"
+                    "1. Primero recomienda los lugares EXACTOS diciendo algo como 'Si buscás específicamente [lo que pidió], te recomiendo...'\n"
+                    "2. Luego menciona los RELACIONADOS diciendo 'Ahora, si lo que querés es un lugar con [concepto más amplio], también podés considerar...'\n"
+                    "3. Sé honesto sobre la diferencia entre ambos grupos.\n"
+                    "4. Basate EXCLUSIVAMENTE en las descripciones provistas."
+                )
+            elif cards_exactos:
+                # Solo exactos
+                prompt_rag = (
+                    f"{prefix}\n"
+                    f"SITUACIÓN: El usuario buscó '{query}'.\n"
+                    f"Resultados VERIFICADOS:\n{detalles_exactos}\n\n"
+                    f"INSTRUCCIONES:\n"
+                    "1. Confirmale al usuario que estos lugares cumplen específicamente con su búsqueda.\n"
+                    "2. Genera una recomendación útil basada en las descripciones."
+                )
+            else:
+                # Solo relacionados (no hay exactos)
+                prompt_rag = (
+                    f"{prefix}\n"
+                    f"SITUACIÓN: El usuario buscó '{query}'.\n"
+                    f"No encontré lugares que cumplan EXACTAMENTE con eso, pero sí estos RELACIONADOS:\n{detalles_relacionados}\n\n"
+                    f"INSTRUCCIONES:\n"
+                    "1. Sé honesto: decile que no encontraste algo específico para su búsqueda.\n"
+                    "2. Pero ofrecele las alternativas relacionadas que podrían servirle.\n"
+                    "3. Explicá brevemente por qué cada uno podría ser útil."
+                )
             
             rag_resp = await llm_mini.ainvoke(prompt_rag)
             return rag_resp.content, "rag", None, locs, cards, ""
