@@ -16,7 +16,8 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
-from langchain_pinecone import PineconeVectorStore
+from langchain_postgres import PGVector
+from sqlalchemy import create_engine
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from upstash_redis import Redis
@@ -32,8 +33,8 @@ logger = logging.getLogger("QueMorfamos")
 # ==========================================
 load_dotenv("mis_claves.env")
 
-PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "que-morfamos-nqn")
-ARCHIVO_DATASET = "dataset_reviews.parquet"
+DATABASE_URL = os.getenv("DATABASE_URL")
+COLLECTION_NAME = os.getenv("COLLECTION_NAME", "reviews_embeddings")
 UPSTASH_REDIS_REST_URL = os.getenv("UPSTASH_REDIS_REST_URL")
 UPSTASH_REDIS_REST_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN")
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
@@ -104,14 +105,34 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"No se pudo notificar startup a Discord: {e}")
     
-    if os.path.exists(ARCHIVO_DATASET):
+    if DATABASE_URL:
         try:
-            df = pd.read_parquet(ARCHIVO_DATASET)
+            engine = create_engine(DATABASE_URL)
+            
+            # Cargar reviews con datos del lugar (JOIN)
+            query = """
+                SELECT 
+                    r.restaurante, r.autor, r.rating_user, r.texto, 
+                    r.fecha_aproximada as fecha, r.review_id,
+                    l.rating_gral, l.total_reviews_google, l.direccion,
+                    l.latitud, l.longitud, l.barrio, l.zona, l.categoria
+                FROM reviews r
+                LEFT JOIN lugares l ON r.restaurante = l.nombre
+            """
+            df = pd.read_sql(query, engine)
+            logger.info(f"📊 Datos cargados desde PostgreSQL: {len(df)} filas")
+            
             cols = ['restaurante', 'texto', 'direccion', 'barrio', 'zona', 'autor', 'fecha']
             for col in cols:
                 if col in df.columns:
                     df[col] = df[col].fillna("").astype(str).str.strip()
-            df['rating_gral'] = pd.to_numeric(df['rating_gral'], errors='coerce').fillna(0.0)
+            
+            # Convertir rating_gral (puede venir como "4,5")
+            if 'rating_gral' in df.columns:
+                df['rating_gral'] = df['rating_gral'].astype(str).str.replace(',', '.', regex=False)
+                df['rating_gral'] = pd.to_numeric(df['rating_gral'], errors='coerce').fillna(0.0)
+            else:
+                df['rating_gral'] = 0.0
             
             def _norm(s):
                 if pd.isna(s) or s is None: return ""
@@ -124,15 +145,18 @@ async def lifespan(app: FastAPI):
             df['texto_ascii'] = df['texto'].apply(_norm)
             logger.info(f"✅ DataFrame cargado: {len(df)} filas.")
         except Exception as e:
-            logger.error(f"❌ Error Parquet: {e}")
+            logger.error(f"❌ Error cargando datos: {e}")
             df = pd.DataFrame()
     else:
         df = pd.DataFrame()
 
     try:
         embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
-        vectorstore = PineconeVectorStore.from_existing_index(
-            index_name=PINECONE_INDEX_NAME, embedding=embeddings
+        vectorstore = PGVector(
+            connection=DATABASE_URL,
+            embeddings=embeddings,
+            collection_name=COLLECTION_NAME,
+            use_jsonb=True
         )
         
         provider_mode = os.getenv("AI_PROVIDER", "hybrid").lower()
@@ -1538,6 +1562,13 @@ async def procesar_consulta(query, df, vectorstore, llm_mini, llm_smart, ctx=Non
                         grupo_baja_relevancia.append(local)
             else:
                 grupo_alta_relevancia = candidatos_crudos
+            
+            # DEBUG: Ver cuántos candidatos hay en cada grupo
+            print(f"[DEBUG] 📊 Vectorstore trajo: {len(candidatos_crudos)} candidatos únicos", flush=True)
+            print(f"[DEBUG] 📊 Grupo ALTA relevancia (tienen keyword): {len(grupo_alta_relevancia)}", flush=True)
+            print(f"[DEBUG] 📊 Grupo BAJA relevancia (sin keyword): {len(grupo_baja_relevancia)}", flush=True)
+            if grupo_alta_relevancia:
+                print(f"[DEBUG] 📊 Alta relevancia: {grupo_alta_relevancia[:5]}", flush=True)
 
             # 4. SELECCIÓN PARA EL JUEZ (Lógica de Relleno V2)
             
@@ -1574,9 +1605,15 @@ async def procesar_consulta(query, df, vectorstore, llm_mini, llm_smart, ctx=Non
                 candidatos_a_verificar, df, query, llm_mini
             )
             
-            # Si el Juez mata a todos (muy estricto), fallback a los candidatos con palabra clave
-            if not locales_verificados and grupo_alta_relevancia:
-                locales_verificados = candidatos_a_verificar[:3]
+            # DEBUG: Ver qué aprobó el juez
+            print(f"[DEBUG] ⚖️ Juez LLM aprobó: {len(locales_verificados)} de {len(candidatos_a_verificar)}", flush=True)
+            print(f"[DEBUG] ⚖️ Aprobados: {locales_verificados}", flush=True)
+            
+            # Si el Juez mata a muchos pero tenemos lugares con keyword confirmado, usamos esos
+            # El juez a veces es muy estricto buscando "ES un pelotero" vs "TIENE pelotero"
+            if len(locales_verificados) < 3 and len(grupo_alta_relevancia) >= 3:
+                print(f"[DEBUG] ⚖️ Juez muy estricto, usando grupo ALTA relevancia como fallback", flush=True)
+                locales_verificados = grupo_alta_relevancia[:5]
 
             # 6. RANKING FINAL (Ahora sí, por calidad)
             # De los que pasaron TODAS las pruebas, mostramos los mejores.
@@ -1772,7 +1809,7 @@ async def chat(req: QueryRequest, request: Request):
         
         # if req.conversation_context and 'last_entity' in req.conversation_context and 'last_entity' not in new_ctx:
         #      new_ctx['last_entity'] = req.conversation_context['last_entity']
-        if 'original_query' in req.conversation_context and 'original_query' not in new_ctx:
+        if req.conversation_context and 'original_query' in req.conversation_context and 'original_query' not in new_ctx:
              new_ctx['original_query'] = req.conversation_context['original_query']
 
         # LOG DE SALIDA: ¿Qué contexto le devuelvo?

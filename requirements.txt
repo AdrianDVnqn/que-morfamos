@@ -3,8 +3,10 @@ uvicorn
 pandas
 pydantic
 langchain-openai
-langchain-pinecone
-pinecone-client
+langchain-postgres
+psycopg[binary]
+psycopg2-binary
+sqlalchemy
 python-dotenv
 upstash-redis
 pyarrow
