@@ -219,7 +219,34 @@ app.add_middleware(
 )
 
 from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.responses import RedirectResponse
+from starlette.responses import RedirectResponse, StreamingResponse
+from langchain_core.messages import BaseMessage
+
+# ==========================================
+# HELPER: STREAM BUFFER
+# ==========================================
+async def astream_buffer(llm, prompt, cache_key=None, cache_instance=None):
+    """
+    Yields tokens from LLM stream and buffers the full response.
+    Returns the full text at the end via a special event or just side-effect?
+    Actually, we just yield the tokens. The caller accumulates.
+    But to handle caching, we can do it here if provided.
+    """
+    buffer = ""
+    async for chunk in llm.astream(prompt):
+        if isinstance(chunk, str):
+            token = chunk
+        elif isinstance(chunk, BaseMessage):
+            token = chunk.content
+        else:
+            token = str(chunk)
+            
+        buffer += token
+        yield token
+
+    if cache_key and cache_instance:
+        cache_instance.set_json("resumen_texto", cache_key, buffer)
+
 
 class DoubleSlashMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request, call_next):
@@ -1117,9 +1144,19 @@ async def consultar_estadisticas(query, df, llm):
         logger.error(f"Error consultar_estadisticas: {e}")
         return "Tuve un problema calculando esa estadística.", []
 
-async def resumir_opiniones_local(query_str, df, llm, topic=None, tone='cordial', es_seleccion_directa=False):
+async def resumir_opiniones_local_gen(query_str, df, llm, topic=None, tone='cordial', es_seleccion_directa=False):
+    """
+    Generator version of resumir_opiniones_local.
+    Yields:
+      - {"type": "token", "content": "..."}
+      - {"type": "meta", "restaurante": "...", "found": True}
+      - {"type": "menu", "text": "...", "options": [...]}
+      - {"type": "error", "text": "..."}
+    """
     # 1. Validación básica
-    if not query_str: return "Nombre vacío.", None, "", None
+    if not query_str: 
+        yield {"type": "error", "text": "Nombre vacío."}
+        return
     q_clean = query_str.lower().strip()
     encontrados = []
     
@@ -1147,18 +1184,32 @@ async def resumir_opiniones_local(query_str, df, llm, topic=None, tone='cordial'
                     ubi = safe_str(rowr.get('direccion')) or safe_str(rowr.get('zona')) or "Ubicación desconocida"
                     labels.append(f"**{r}** ({ubi})")
                 lista_txt = "\n".join([f"{i+1}. {lbl}" for i, lbl in enumerate(labels)])
-                return f"Encontré varios lugares con ese nombre. ¿Cuál decís?\n\n{lista_txt}\n\n*(Escribí el número)*", None, "", {"options": encontrados}
+                yield {
+                    "type": "menu", 
+                    "text": f"Encontré varios lugares con ese nombre. ¿Cuál decís?\n\n{lista_txt}\n\n*(Escribí el número)*", 
+                    "options": encontrados
+                }
+                return
 
     # 3. Si no encontró nada
     if not encontrados: 
-        return f"No tengo info de **{query_str}**. Probá con otro nombre.", None, "", None
+        yield {"type": "error", "text": f"No tengo info de **{query_str}**. Probá con otro nombre."}
+        return
     
     # 4. Chequeo de Caché
     restaurante = encontrados[0]
+    yield {"type": "meta", "restaurante": restaurante, "found": True}
+
     cache_key = f"{restaurante}_{topic}_{sanitize_tone(tone)}" if topic else f"{restaurante}__{sanitize_tone(tone)}"
     cached_text = cache.get_json("resumen_texto", cache_key)
     if cached_text: 
-        return f"Acá te paso la data de **{restaurante}**:", restaurante, cached_text, None
+        msg = f"Acá te paso la data de **{restaurante}**:"
+        yield {"type": "token", "content": msg}
+        # Yield the rest as one big token or separate? One is fine.
+        # But wait, we want to simulate stream? No, if cached just return fast.
+        # However, for the endpoint consuming this, it expects tokens.
+        yield {"type": "token", "content": "\n\n" + cached_text}
+        return
 
     # 5. Preparación de Datos para el Prompt
     # Obtenemos la fila de datos para sacar la ubicación real
@@ -1203,16 +1254,42 @@ async def resumir_opiniones_local(query_str, df, llm, topic=None, tone='cordial'
     ## 🎯 Veredicto"""
     
     try:
-        res = await (ChatPromptTemplate.from_template(tpl) | llm | StrOutputParser()).ainvoke({
+        chain = ChatPromptTemplate.from_template(tpl) | llm | StrOutputParser()
+        args = {
             "rest": restaurante, 
             "rat": safe_float(row_data.get('rating_gral')),
             "revs": reviews_txt
-        })
-    except: res = "No pude generar el resumen."
+        }
+        
+        # Stream dispatch
+        async for token in astream_buffer(chain, args, cache_key=cache_key, cache_instance=cache):
+            yield {"type": "token", "content": token}
+            
+    except Exception as e:
+        yield {"type": "error", "text": "No pude generar el resumen."}
+
+async def resumir_opiniones_local(query_str, df, llm, topic=None, tone='cordial', es_seleccion_directa=False):
+    """
+    Wrapper legacy for compatibility with non-streaming callers.
+    """
+    full_text = ""
+    restaurante = None
+    options = None
     
-    # 7. Guardado y Retorno final
-    cache.set_json("resumen_texto", cache_key, res)
-    return res, restaurante, res, None # ahora el resumen sale tanto en el chat como en la tarjeta
+    async for event in resumir_opiniones_local_gen(query_str, df, llm, topic, tone, es_seleccion_directa):
+        if event["type"] == "token":
+            full_text += event["content"]
+        elif event["type"] == "meta":
+            restaurante = event["restaurante"]
+        elif event["type"] == "menu":
+            full_text = event["text"]
+            options = event["options"]
+        elif event["type"] == "error":
+            full_text = event["text"]
+
+    # Original logic returned (text, restaurante, detail, options)
+    # Detail is usually same as text
+    return full_text, restaurante, full_text, options
 
 async def verificar_candidatos_con_llm(candidatos, df, query, llm):
     """
@@ -1329,31 +1406,41 @@ def aplicar_filtro_zona(candidatos, df, zona_buscada):
         
     return candidatos_filtrados
 
-async def procesar_consulta(query, df, vectorstore, llm_mini, llm_smart, ctx=None, user_ip=None):
+async def procesar_consulta_gen(query, df, vectorstore, llm_mini, llm_smart, ctx=None, user_ip=None):
+    """
+    Generator that handles the chat logic.
+    Yields:
+      - {"type": "token", "content": "..."}
+      - {"type": "meta", "mode": "...", "cards": [...], "locs": [...], "pending": ..., "intent": "..."}
+      - {"type": "debug", "message": "..."}
+      - {"type": "error", "message": "..."}
+    """
     if ctx is None: ctx = {}
     
-    # ==============================================================================
-    # 🐛 DEBUG DE ENTRADA (Pegalo acá)
-    # ==============================================================================
-    print(f"\n[DEBUG] 🟢 ENTRADA A CEREBRO | Query: '{query}'", flush=True)
-    print(f"[DEBUG]    -> last_entity: '{ctx.get('last_entity')}'", flush=True)
-    print(f"[DEBUG]    -> original_query: '{ctx.get('original_query')}'\n", flush=True)
-    # ==============================================================================
-    
+    # 🐛 DEBUG DE ENTRADA
+    yield {"type": "debug", "message": f"🟢 ENTRADA A CEREBRO | Query: '{query}'"}
+
     tone = sanitize_tone(ctx.get('tone'))
     
     # ==========================================
     # 1. CAPA DE SEGURIDAD (NUCLEAR)
     # ==========================================
     if user_ip and cache.get_value(f"ban:{user_ip}"): 
-        return "⛔ Sistema bloqueado.", "blocked", None, [], [], ""
+        yield {"type": "meta", "mode": "blocked"}
+        yield {"type": "token", "content": "⛔ Sistema bloqueado."}
+        return
     
     strikes = ctx.get('strikes', 0)
-    if strikes >= 5: return "⛔ Bloqueado.", "blocked", None, [], [], ""
+    if strikes >= 5: 
+        yield {"type": "meta", "mode": "blocked"}
+        yield {"type": "token", "content": "⛔ Bloqueado."}
+        return
 
     if check_keyword_ban(query):
         ctx['strikes'] = strikes + 1
-        return f"Epa, esa búsqueda no va. ({strikes+1}/5)", "rag", None, [], [], ""
+        yield {"type": "meta", "mode": "rag"} # Or 'blocked'? Logic said 'rag' before.
+        yield {"type": "token", "content": f"Epa, esa búsqueda no va. ({strikes+1}/5)"}
+        return
 
     # ==========================================
     # 2. CONTEXTO NUMÉRICO (MENÚS)
@@ -1366,154 +1453,128 @@ async def procesar_consulta(query, df, vectorstore, llm_mini, llm_smart, ctx=Non
             seleccion = opciones[num - 1]
             ctx['last_entity'] = seleccion
             original_topic = ctx.get('original_query', seleccion)
-            resp, nombre_real, det, _ = await resumir_opiniones_local(seleccion, df, llm_mini, original_topic, tone, True)
-            cards = await obtener_restaurant_cards([nombre_real], df, llm_mini, original_topic, tone)
-            locs = obtener_coordenadas([nombre_real], df)
-            return resp, "resumen", None, locs, cards, det
-        return f"Elegí entre 1 y {len(opciones)}", "resumen", pending, [], [], ""
+            
+            # Call generator
+            # Need to capture nombre_real from meta event
+            nombre_real = None
+            async for event in resumir_opiniones_local_gen(seleccion, df, llm_mini, original_topic, tone, True):
+                if event["type"] == "meta":
+                    if "restaurante" in event:
+                         nombre_real = event["restaurante"]
+                    # Propagate meta if relevant? internal meta might not match outer meta structure.
+                elif event["type"] == "token":
+                    yield event
+                elif event["type"] == "error":
+                     yield {"type": "token", "content": event["text"]}
+            
+            if nombre_real:
+                cards = await obtener_restaurant_cards([nombre_real], df, llm_mini, original_topic, tone)
+                locs = obtener_coordenadas([nombre_real], df)
+                # Yield meta at the end or when available
+                yield {"type": "meta", "mode": "resumen", "cards": cards, "locs": locs}
+            return
+            
+        yield {"type": "meta", "mode": "resumen", "pending": pending}
+        yield {"type": "token", "content": f"Elegí entre 1 y {len(opciones)}"}
+        return
 
     # ==========================================
     # 3. SMART ROUTING (EL CEREBRO V8)
     # ==========================================
     last_ent = ctx.get('last_entity')
-# --- CORRECCIÓN INICIO ---
-    # El router ahora devuelve un STRING directo ("STATS", "SPECIFIC", etc.)
-    intent_raw = await clasificar_intencion(query, llm_smart, last_entity=last_ent)
+    intent = await clasificar_intencion(query, llm_smart, last_entity=last_ent)
     
-    intent = intent_raw
-    entity_detected = None # La versión actual de tu router no extrae entidades, solo intención.
+    # Ajuste de compatibilidad
+    if intent == "SPECIFIC": intent = "SPECIFIC_INFO"
+    
+    yield {"type": "debug", "message": f"🧠 INTENCIÓN: {intent}"}
 
-    # Ajuste de compatibilidad: Tu router devuelve "SPECIFIC", pero tu lógica abajo busca "SPECIFIC_INFO"
-    if intent == "SPECIFIC":
-        intent = "SPECIFIC_INFO"
-    # --- CORRECCIÓN FIN ---
-
-# --- CAMINO A: ESTADÍSTICAS ---
+    # --- CAMINO A: ESTADÍSTICAS ---
     if intent == "STATS":
-        
-        # Si pregunto estadísticas, rompo la charla sobre un lugar específico
-        if 'last_entity' in ctx: del ctx['last_entity'] # <--- LIMPIEZA
+        if 'last_entity' in ctx: del ctx['last_entity']
         
         resp, locales = await consultar_estadisticas(query, df, llm_mini)
         cards = obtener_restaurant_cards_simple(locales, df)
         locs = obtener_coordenadas(locales, df)
-        return resp, "estadisticas", None, locs, cards, ""
         
+        yield {"type": "meta", "mode": "estadisticas", "cards": cards, "locs": locs}
+        yield {"type": "token", "content": resp}
+        return
 
     # --- CAMINO B: INFO ESPECÍFICA (UN LUGAR) ---
     if intent == "SPECIFIC_INFO":
-        target = None
-        if entity_detected == "LAST_ENTITY": target = last_ent
-        elif entity_detected: target = entity_detected
-        else: target = query # Fallback
+        target = last_ent if ctx.get('last_entity') else query
+        # Logic to resolve target name...
+        entity_detected = None # Simplified for now as per prev code
+        
+        # Resolve target
+        if target:
+            nombre_candidato = detectar_mencion_exacta(target, df)
+            if nombre_candidato: target = nombre_candidato
+            else:
+                # Lax search
+                mask = df['restaurante'].str.lower().str.contains(target.lower().strip(), na=False, regex=False)
+                if mask.any(): pass # Exists
+                else: target = None if not ctx.get('last_entity') else target # Attempt fallback
 
         if target:
-            # Intentamos resolver el nombre real
-            # Usamos una búsqueda simple primero para validar existencia
-            match_exists = False
-            nombre_candidato = detectar_mencion_exacta(target, df) # Usamos regex helper
-            if nombre_candidato:
-                target = nombre_candidato
-                match_exists = True
-            else:
-                # Busqueda laxa si regex falló
-                mask = df['restaurante'].str.lower().str.contains(target.lower().strip(), na=False, regex=False)
-                if mask.any(): match_exists = True
-
+            match_exists = True # Assume true if we resolved it or came from context
+            
             if match_exists:
-                # ---------------------------------------------------------
-                # 1. LOGICA DE LIMPIEZA DE TÓPICO (CRÍTICO)
-                # ---------------------------------------------------------
-                # Detectamos si es solo el nombre (ej: "Atila") o una pregunta (ej: "Atila tiene juegos?")
-                # Si la query es casi igual de larga que el nombre, asumimos que NO hay tópico específico.
-                
                 es_solo_navegacion = len(query.strip()) <= len(target.strip()) + 5
-                
-                # Si es solo navegación, el topic es None (para que haga un resumen general).
-                # Si hay pregunta, usamos la query completa como topic.
                 topic_actual = None if es_solo_navegacion else query
-
-                # ---------------------------------------------------------
-                # 2. GESTIÓN DEL CONTEXTO (Anti-Zombie)
-                # ---------------------------------------------------------
-                # Siempre borramos la búsqueda anterior (ej: "pelotero")
+                
                 if 'original_query' in ctx: del ctx['original_query']
-                
-                # Solo guardamos el nuevo topic si realmente es una pregunta específica
-                if topic_actual:
-                    ctx['original_query'] = topic_actual
+                if topic_actual: ctx['original_query'] = topic_actual
 
-                # ---------------------------------------------------------
-                # 3. LLAMADAS A FUNCIONES (Usando la variable limpia)
-                # ---------------------------------------------------------
-                # OJO ACÁ: Cambiamos 'query' por 'topic_actual'
-                resp, nombre_final, det, opciones = await resumir_opiniones_local(
-                    target, df, llm_mini, topic=topic_actual, tone=tone
-                )
+                # Generator Call
+                nombre_final = None
+                options_found = None
                 
-                if opciones: return resp, "resumen", opciones, [], [], ""
+                async for event in resumir_opiniones_local_gen(target, df, llm_mini, topic=topic_actual, tone=tone):
+                    if event["type"] == "token":
+                        yield event
+                    elif event["type"] == "meta":
+                        if "restaurante" in event: nombre_final = event["restaurante"]
+                    elif event["type"] == "menu":
+                        yield {"type": "token", "content": event["text"]}
+                        options_found = event["options"]
+                    elif event["type"] == "error":
+                         yield {"type": "token", "content": event["text"]}
+
+                if options_found:
+                    yield {"type": "meta", "mode": "resumen", "pending": {"options": options_found}}
+                    return
                 
                 if nombre_final:
                     ctx['last_entity'] = nombre_final
-                    
-                    # ACÁ TAMBIÉN: Usamos 'topic_actual' (que puede ser None)
-                    # Esto evita que busque "Atila" dentro de las reviews de "Atila"
-                    cards = await obtener_restaurant_cards(
-                        [nombre_final], df, llm_mini, query_context=topic_actual, tone=tone
-                    )
-                    
+                    cards = await obtener_restaurant_cards([nombre_final], df, llm_mini, query_context=topic_actual, tone=tone)
                     locs = obtener_coordenadas([nombre_final], df)
-                    return resp, "resumen", None, locs, cards, det
-            
-            # Si era específico pero no existe, avisamos (salvo que sea recomendación disfrazada)
-            if entity_detected and entity_detected != "LAST_ENTITY":
-                 # Fallback inteligente: si no encontramos "Mc Donalds", capaz Pinecone encuentra algo similar
-                 pass 
+                    yield {"type": "meta", "mode": "resumen", "cards": cards, "locs": locs}
+                    return
         
-        # Si falló lo específico, pasamos a Recomendación
+        # Fallback to RECOMMENDATION if specific fails
         intent = "RECOMMENDATION"
 
-# --- CAMINO C: RECOMENDACIÓN (PIPELINE ESTRICTO) ---
+    # --- CAMINO C: RECOMENDACIÓN (PIPELINE ESTRICTO) ---
     if intent == "RECOMMENDATION":
-# ====================================================
-        # 🛡️ FIX CRÍTICO: LIMPIEZA DE MEMORIA ZOMBIE
-        # ====================================================
-        # Si entramos acá, es una búsqueda nueva. Borramos
-        # cualquier rastro de la entidad o búsqueda anterior.
-        
         vars_to_kill = ['last_entity', 'original_query', 'pending_options']
         for var in vars_to_kill:
-            if var in ctx: 
-                del ctx[var]
-                
-        # 🐛 DEBUG DE LIMPIEZA (Para confirmar que se borró)
-        print(f"[DEBUG] 🧹 LIMPIEZA RECOMENDACION | last_entity ahora es: '{ctx.get('last_entity')}' (Debería ser None)", flush=True)      
-        
+            if var in ctx: del ctx[var]
+
         try:
-            # 1. Análisis Semántico
             analisis = await analizar_query_semantica(query, llm_smart)
             if analisis.get("tipo") == "BLOCK":
                 ctx['strikes'] = strikes + 1
-                return f"Epa, esa búsqueda no va. ({strikes+1}/5)", "rag", None, [], [], ""
+                yield {"type": "meta", "mode": "rag"}
+                yield {"type": "token", "content": f"Epa, esa búsqueda no va. ({strikes+1}/5)"}
+                return
 
             keywords = analisis.get("keywords", [])
             synonyms = analisis.get("synonyms", [])
-            zona_detectada = analisis.get("donde") # <--- NUEVO DATO
-            # ==========================================================
-            # 🐛 DEBUG DE ZONA (LOG PARA RENDER)
-            # ==========================================================
-            if zona_detectada:
-                print(f"\n[DEBUG] 🌍 ZONA DETECTADA POR LLM: '{zona_detectada}'", flush=True)
-            else:
-                print(f"\n[DEBUG] 🌍 ZONA: No se detectó ubicación específica.", flush=True)
-            
-            # Preparamos los términos de filtrado estricto
-            filtro_terms = set(keywords)
-            if synonyms: filtro_terms.update(synonyms)
-            filtro_terms = [t.lower() for t in filtro_terms if len(t) > 3]
+            zona_detectada = analisis.get("donde")
 
-            # 2. Búsqueda Vectorial (Pinecone) - El "Barrido Amplio"
-            docs = vectorstore.similarity_search(query, k=60) # Traemos bastantes para filtrar
+            docs = vectorstore.similarity_search(query, k=60)
             seen = set()
             candidatos_crudos = []
             for d in docs:
@@ -1522,101 +1583,51 @@ async def procesar_consulta(query, df, vectorstore, llm_mini, llm_smart, ctx=Non
                     seen.add(nom)
                     candidatos_crudos.append(nom)
 
-            # ==========================================================
-            # 🌍 APLICACIÓN DEL FILTRO DE ZONA
-            # ==========================================================
             if zona_detectada:
-                cant_antes = len(candidatos_crudos)
                 candidatos_crudos = aplicar_filtro_zona(candidatos_crudos, df, zona_detectada)
-                cant_despues = len(candidatos_crudos)
-                
-                print(f"[DEBUG] 📉 FILTRO ZONA APLICADO: {cant_antes} -> {cant_despues} candidatos restantes.", flush=True)
-            # ==========================================================
 
-            # 3. FILTRADO POR EVIDENCIA (Hard Filter)
+            # Filtering logic (same as original)
+            filtro_terms = set(keywords)
+            if synonyms: filtro_terms.update(synonyms)
+            filtro_terms = [t.lower() for t in filtro_terms if len(t) > 3]
+
             grupo_alta_relevancia = []
             grupo_baja_relevancia = []
 
             if filtro_terms:
-                # Preparamos el patrón Regex una sola vez (ej: "pelotero|juegos|niños")
                 import re
                 patron_regex = '|'.join([re.escape(t) for t in filtro_terms])
-                
                 for local in candidatos_crudos:
                     mask = df['restaurante'] == local
                     if not mask.any(): continue
-                    
-                    # === CAMBIO CLAVE ===
-                    # No usamos head(30). Buscamos en TODA la columna de texto de este local.
-                    # str.contains es vectorizado y ultra rápido, incluso con 2000 reseñas.
-                    
-                    # Obtenemos la serie de textos de este restaurante
                     series_textos = df[mask]['texto'].fillna("").astype(str).str.lower()
-                    
-                    # Verificamos si ALGUNA fila contiene CUALQUIERA de los términos
-                    tiene_match = series_textos.str.contains(patron_regex, regex=True).any()
-                    
-                    if tiene_match:
+                    if series_textos.str.contains(patron_regex, regex=True).any():
                         grupo_alta_relevancia.append(local)
                     else:
                         grupo_baja_relevancia.append(local)
             else:
                 grupo_alta_relevancia = candidatos_crudos
-            
-            # DEBUG: Ver cuántos candidatos hay en cada grupo
-            print(f"[DEBUG] 📊 Vectorstore trajo: {len(candidatos_crudos)} candidatos únicos", flush=True)
-            print(f"[DEBUG] 📊 Grupo ALTA relevancia (tienen keyword): {len(grupo_alta_relevancia)}", flush=True)
-            print(f"[DEBUG] 📊 Grupo BAJA relevancia (sin keyword): {len(grupo_baja_relevancia)}", flush=True)
-            if grupo_alta_relevancia:
-                print(f"[DEBUG] 📊 Alta relevancia: {grupo_alta_relevancia[:5]}", flush=True)
 
-            # 4. SELECCIÓN PARA EL JUEZ (Lógica de Relleno V2)
-            
-            # Definimos la función de calidad para ordenar
             def sort_by_quality(nombre):
                 mask = df['restaurante'] == nombre
                 if not mask.any(): return 0
                 row = df[mask].iloc[0]
                 return safe_float(row.get('rating_gral'))
 
-            # Ordenamos ambos grupos por calidad (estrellas)
             grupo_alta_relevancia.sort(key=sort_by_quality, reverse=True)
             grupo_baja_relevancia.sort(key=sort_by_quality, reverse=True)
             
             candidatos_a_verificar = []
-
-            # ESTRATEGIA MIXTA:
-            # 1. Primero metemos todos los que tienen MATCH EXACTO (hasta 10)
             candidatos_a_verificar.extend(grupo_alta_relevancia[:10])
-            
-            # 2. Si nos quedamos cortos (menos de 8 candidatos), rellenamos con los de búsqueda vectorial
-            # Esto asegura variedad aunque no tengan la palabra exacta
             faltan = 8 - len(candidatos_a_verificar)
-            if faltan > 0:
-                candidatos_a_verificar.extend(grupo_baja_relevancia[:faltan])
-            
-            # (Opcional) Limitar el total final a 10 para no saturar al LLM Juez
+            if faltan > 0: candidatos_a_verificar.extend(grupo_baja_relevancia[:faltan])
             candidatos_a_verificar = candidatos_a_verificar[:10]
 
-            # 5. EL JUEZ LLM (Verificación de Contexto)
-            # Ahora el juez recibe una lista de lugares que YA sabemos que contienen la palabra.
-            # Su único trabajo es filtrar los "No tiene..."
-            locales_verificados = await verificar_candidatos_con_llm(
-                candidatos_a_verificar, df, query, llm_mini
-            )
+            locales_verificados = await verificar_candidatos_con_llm(candidatos_a_verificar, df, query, llm_mini)
             
-            # DEBUG: Ver qué aprobó el juez
-            print(f"[DEBUG] ⚖️ Juez LLM aprobó: {len(locales_verificados)} de {len(candidatos_a_verificar)}", flush=True)
-            print(f"[DEBUG] ⚖️ Aprobados: {locales_verificados}", flush=True)
+            exactos = locales_verificados[:3]
+            relacionados = [loc for loc in grupo_alta_relevancia if loc not in exactos][:4]
             
-            # Separar EXACTOS (aprobados por juez) y RELACIONADOS (alta relevancia no aprobados)
-            exactos = locales_verificados[:3]  # Máximo 3 exactos
-            relacionados = [loc for loc in grupo_alta_relevancia if loc not in exactos][:4]  # Máximo 4 relacionados
-            
-            print(f"[DEBUG] 🎯 Exactos: {exactos}", flush=True)
-            print(f"[DEBUG] 🔗 Relacionados: {relacionados}", flush=True)
-
-            # 6. RANKING FINAL (Ahora sí, por calidad)
             def calcular_score_final(nombre_local):
                 mask = df['restaurante'] == nombre_local
                 if not mask.any(): return 0
@@ -1628,35 +1639,32 @@ async def procesar_consulta(query, df, vectorstore, llm_mini, llm_smart, ctx=Non
             exactos.sort(key=calcular_score_final, reverse=True)
             relacionados.sort(key=calcular_score_final, reverse=True)
 
-            # Si no hay exactos ni relacionados, no hay resultado
-            if not exactos and not relacionados: 
-                return "No encontré lugares que cumplan con ese requisito específico.", "rag", None, [], [], ""
+            if not exactos and not relacionados:
+                yield {"type": "meta", "mode": "rag", "cards": [], "locs": []}
+                yield {"type": "token", "content": "No encontré lugares que cumplan con ese requisito específico."}
+                return
 
-            # 7. Generación de Cards y Respuesta diferenciada
             todos_los_locales = exactos + relacionados
             cards = await obtener_restaurant_cards(
                 todos_los_locales, df, llm_mini, query, tone, 
-                strict_mode=False, 
-                keywords_list=keywords,
-                synonyms_list=synonyms
+                strict_mode=False, keywords_list=keywords, synonyms_list=synonyms
             )
             
-            # Separar cards en exactos y relacionados
             cards_exactos = [c for c in cards if c.nombre in exactos]
             cards_relacionados = [c for c in cards if c.nombre in relacionados]
             
             nombres_finales = [c.nombre for c in cards]
             locs = obtener_coordenadas(nombres_finales, df)
             
-            # Construir prompt diferenciado
+            # YIELD METADATA EARLY
+            yield {"type": "meta", "mode": "rag", "cards": cards, "locs": locs}
+
             prefix = tone_system_instruction(tone)
-            
             detalles_exactos = "\n".join([f"- {c.nombre}: {c.descripcion}" for c in cards_exactos]) if cards_exactos else ""
             detalles_relacionados = "\n".join([f"- {c.nombre}: {c.descripcion}" for c in cards_relacionados]) if cards_relacionados else ""
             
             if cards_exactos and cards_relacionados:
-                # Tenemos ambos: exactos y relacionados
-                prompt_rag = (
+                 prompt_rag = (
                     f"{prefix}\n"
                     f"SITUACIÓN: El usuario buscó '{query}'.\n\n"
                     f"LUGARES EXACTOS (cumplen específicamente con lo pedido):\n{detalles_exactos}\n\n"
@@ -1668,7 +1676,6 @@ async def procesar_consulta(query, df, vectorstore, llm_mini, llm_smart, ctx=Non
                     "4. Basate EXCLUSIVAMENTE en las descripciones provistas."
                 )
             elif cards_exactos:
-                # Solo exactos
                 prompt_rag = (
                     f"{prefix}\n"
                     f"SITUACIÓN: El usuario buscó '{query}'.\n"
@@ -1678,7 +1685,6 @@ async def procesar_consulta(query, df, vectorstore, llm_mini, llm_smart, ctx=Non
                     "2. Genera una recomendación útil basada en las descripciones."
                 )
             else:
-                # Solo relacionados (no hay exactos)
                 prompt_rag = (
                     f"{prefix}\n"
                     f"SITUACIÓN: El usuario buscó '{query}'.\n"
@@ -1689,44 +1695,71 @@ async def procesar_consulta(query, df, vectorstore, llm_mini, llm_smart, ctx=Non
                     "3. Explicá brevemente por qué cada uno podría ser útil."
                 )
             
-            rag_resp = await llm_mini.ainvoke(prompt_rag)
-            return rag_resp.content, "rag", None, locs, cards, ""
-            
+            # STREAMING THE RAG RESPONSE
+            async for token in astream_buffer(llm_mini, prompt_rag):
+                yield {"type": "token", "content": token}
+            return
+
         except Exception as e:
             logger.error(f"Error RAG: {e}")
-            return "Tuve un problema técnico buscando eso.", "rag", None, [], [], ""
-        
-       
-    # 1. Manejo de Bloqueo por LLM
+            yield {"type": "meta", "mode": "rag"}
+            yield {"type": "token", "content": "Tuve un problema técnico buscando eso."}
+            return
+
+    # --- CAMINO D: GENERAL ---
     if intent == "BLOCK":
         ctx['strikes'] = strikes + 1
-        return "Epa, bajemos un cambio. Mantené el respeto, estoy acá para ayudar. (Strike sumado)", "general", None, [], [], ""
+        yield {"type": "meta", "mode": "general"}
+        yield {"type": "token", "content": "Epa, bajemos un cambio. Mantené el respeto, estoy acá para ayudar. (Strike sumado)"}
+        return
     
-    if intent == "GENERAL":
-        try:
-            # 1. Usamos la personalidad que ya definiste
-            prefix = tone_system_instruction(tone)
+    # GENERAL
+    try:
+        prefix = tone_system_instruction(tone)
+        prompt_chat = (
+            f"{prefix}\n"
+            f"SITUACIÓN: El usuario dijo: '{query}'.\n"
+            f"INSTRUCCIONES:\n"
+            "1. Responde de forma natural y breve (máximo 2 oraciones).\n"
+            "2. Si es un saludo, devolvé el saludo con onda.\n"
+            "3. Si es un agradecimiento, decí 'de nada'.\n"
+            "4. IMPORTANTE: SIEMPRE terminá invitando a buscar comida (ej: '¿Buscamos algo para cenar?', '¿Tenés hambre?').\n"
+            "5. No inventes lugares ni datos, es solo charla."
+        )
+        
+        yield {"type": "meta", "mode": "general"}
+        async for token in astream_buffer(llm_mini, prompt_chat):
+            yield {"type": "token", "content": token}
             
-            # 2. Prompt simple: "Sé educado pero volvé a la comida"
-            prompt_chat = (
-                f"{prefix}\n"
-                f"SITUACIÓN: El usuario dijo: '{query}'.\n"
-                f"INSTRUCCIONES:\n"
-                "1. Responde de forma natural y breve (máximo 2 oraciones).\n"
-                "2. Si es un saludo, devolvé el saludo con onda.\n"
-                "3. Si es un agradecimiento, decí 'de nada'.\n"
-                "4. IMPORTANTE: SIEMPRE terminá invitando a buscar comida (ej: '¿Buscamos algo para cenar?', '¿Tenés hambre?').\n"
-                "5. No inventes lugares ni datos, es solo charla."
-            )
-            
-            resp_chat = await llm_mini.ainvoke(prompt_chat)
-            
-            # Retornamos tipo "general" para que el frontend no dibuje mapas ni cards
-            return resp_chat.content, "general", None, [], [], ""
-            
-        except Exception as e:
-            logger.error(f"Error General: {e}")
-            return "¡Buenas! ¿En qué te puedo ayudar para comer hoy?", "general", None, [], [], ""
+    except Exception as e:
+        logger.error(f"Error General: {e}")
+        yield {"type": "meta", "mode": "general"}
+        yield {"type": "token", "content": "¡Buenas! ¿En qué te puedo ayudar para comer hoy?"}
+
+async def procesar_consulta(query, df, vectorstore, llm_mini, llm_smart, ctx=None, user_ip=None):
+    """
+    Wrapper legacy that consumes the generator and returns the full response tuple.
+    Returns: (resp, mode, pend, locs, cards, det)
+    """
+    full_text = ""
+    mode = "general"
+    cards = []
+    locs = []
+    pend = None
+    det = "" # Not really used in gen yet, but kept for signature
+    
+    async for event in procesar_consulta_gen(query, df, vectorstore, llm_mini, llm_smart, ctx, user_ip):
+        if event["type"] == "token":
+            full_text += event["content"]
+        elif event["type"] == "meta":
+            if "mode" in event: mode = event["mode"]
+            if "cards" in event: cards = event["cards"]
+            if "locs" in event: locs = event["locs"]
+            if "pending" in event: pend = event["pending"]
+            # Intent is not returned in tuple
+    
+    return full_text, mode, pend, locs, cards, det
+
         
 # ==========================================
 # 7. ENDPOINTS
@@ -1793,6 +1826,82 @@ async def get_restaurant_detail(nombre: str, topic: Optional[str] = None, tone: 
         aspectos_negativos=analisis.get("negativos", []),
         reviews=reviews_list
     )
+
+@app.post("/chat/stream")
+async def chat_stream(req: QueryRequest, request: Request):
+    start_time = asyncio.get_event_loop().time()
+    
+    # 1. Setup Context
+    ctx = req.conversation_context.copy() if req.conversation_context else {}
+    if req.tone: ctx['tone'] = sanitize_tone(req.tone)
+    client_ip = extract_client_ip(request)
+
+    async def event_generator():
+        # Accumulators for Logging and Context
+        full_text = ""
+        mode = "general"
+        cards = []
+        locs = []
+        pend = None
+        
+        try:
+            async for event in procesar_consulta_gen(req.query, df, vectorstore, llm_mini, llm_smart, ctx, user_ip=client_ip):
+                # Update accumulators
+                if event["type"] == "token":
+                    full_text += event["content"]
+                elif event["type"] == "meta":
+                    if "mode" in event: mode = event["mode"]
+                    if "cards" in event: 
+                        cards = event["cards"]
+                        # Convert Pydantic models to dicts for JSON serialization
+                        event["cards"] = [c.model_dump() if hasattr(c, 'model_dump') else c.dict() for c in cards]
+                    if "locs" in event: locs = event["locs"]
+                    if "pending" in event: pend = event["pending"]
+                
+                # Encode and yield
+                # We use ensuring_ascii=False to minimize size and allow unicode
+                yield json.dumps(event, ensure_ascii=False) + "\n"
+
+            # === POST-STREAMING LOGIC ===
+            
+            # 1. Update Context (Same logic as sync chat)
+            new_ctx = ctx.copy()
+            if pend: new_ctx['pending_options'] = pend
+            elif 'pending_options' in new_ctx: del new_ctx['pending_options']
+            
+            if req.conversation_context and 'original_query' in req.conversation_context and 'original_query' not in new_ctx:
+                 new_ctx['original_query'] = req.conversation_context['original_query']
+
+            # Yield final context update event
+            yield json.dumps({"type": "context_update", "context": new_ctx}, ensure_ascii=False) + "\n"
+
+            # 2. Logging
+            response_time = asyncio.get_event_loop().time() - start_time
+            restaurants = [c.nombre for c in cards] if cards else []
+            
+            ai_provider = None
+            if llm_mini: ai_provider = f"Mini:{llm_mini.model_name}"
+            if llm_smart and mode in ["rag", "resumen"]: ai_provider = f"Smart:{llm_smart.model_name}"
+
+            asyncio.create_task(log_user_query_to_discord(
+                request, 
+                req.query, 
+                tone=req.tone,
+                response_time=response_time,
+                mode=mode,
+                restaurants=restaurants,
+                keywords=None,
+                used_cache=False,
+                ai_provider=ai_provider,
+                context_info=ctx,
+                strikes=ctx.get('strikes', 0)
+            ))
+
+        except Exception as e:
+            logger.error(f"Error Stream: {e}")
+            yield json.dumps({"type": "error", "message": "Stream interrupted"}, ensure_ascii=False) + "\n"
+
+    return StreamingResponse(event_generator(), media_type="application/x-ndjson")
 
 @app.post("/chat", response_model=QueryResponse)
 async def chat(req: QueryRequest, request: Request):
