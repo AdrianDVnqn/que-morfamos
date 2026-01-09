@@ -5,6 +5,7 @@ import unicodedata
 import asyncio
 import logging
 import math
+import time # Added for debugging
 from datetime import datetime, timezone
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
@@ -21,6 +22,7 @@ from sqlalchemy import create_engine
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from upstash_redis import Redis
+from rapidfuzz import process, fuzz
 
 # ==========================================
 # 0. CONFIGURACIÓN DE LOGS
@@ -126,6 +128,12 @@ async def lifespan(app: FastAPI):
             for col in cols:
                 if col in df.columns:
                     df[col] = df[col].fillna("").astype(str).str.strip()
+            
+            # --- FILTRO TEMPORAL: Solo Neuquén Capital (Q8300/1/2) ---
+            # El usuario pidió excluir Cipolletti/San Martín.
+            mask_neuquen = df['direccion'].str.contains('Q8300|Q8301|Q8302', case=False, na=False)
+            df = df[mask_neuquen]
+            logger.info(f"📊 Datos filtrados (Solo Neuquén): {len(df)} filas")
             
             # Convertir rating_gral (puede venir como "4,5")
             if 'rating_gral' in df.columns:
@@ -697,11 +705,11 @@ def get_keywords_from_topic(topic):
 
 def rankear_reviews_por_topico(df_reviews, topic=None):
     df_local = df_reviews.copy()
-    df_local['orden_fecha'] = df_local['fecha'].apply(fecha_a_orden)
+    df_local.loc[:, 'orden_fecha'] = df_local['fecha'].apply(fecha_a_orden)
     if 'rating_user' in df_local.columns:
-        df_local['rating_user'] = pd.to_numeric(df_local['rating_user'], errors='coerce').fillna(0).astype(int)
+        df_local.loc[:, 'rating_user'] = pd.to_numeric(df_local['rating_user'], errors='coerce').fillna(0).astype(int)
     else:
-        df_local['rating_user'] = 0
+        df_local.loc[:, 'rating_user'] = 0
 
     if not topic or len(topic) < 3:
         return df_local.sort_values(['orden_fecha', 'rating_user'], ascending=[True, False])
@@ -1053,11 +1061,16 @@ async def clasificar_intencion(query, llm, last_entity=None):
     - Clave: Empieza con "Cuantos", "Total de", "Numero de", "Que cantidad".
     
     PRIORIDAD 3: SPECIFIC (Info puntual)
-    - Preguntas sobre un lugar específico por su nombre.
-    - Ejemplos: "Que opinas de Saluzzo?", "Que tal es Growler?", "Que sabes de Panino"?, "¿Donde queda Rancho Grande?", "Horario de Atila".
+    - Preguntas sobre un lugar específico por su nombre (PRIMERA VEZ).
+    - Ejemplos: "Que opinas de Saluzzo?", "Que tal es Growler?", "Donde queda Rancho Grande?".
+    
+    PRIORIDAD 3.5: FOLLOWUP (Seguimiento)
+    - Preguntas específicas sobre el lugar del que YA estamos hablando.
+    - Ejemplos: "Y los precios?", "Como es el ambiente?", "Tienen opciones veganas?", "Donde queda exactamente?".
+    - CLAVE: El usuario asume que ya sabes de qué lugar habla.
     
     PRIORIDAD 4: RECOMMENDATION (Búsqueda)
-    - Busca opciones para comer o lugares con características.
+    - Busca opciones para comer o lugares con características, SIN un lugar específico en mente.
     - Ejemplos: "mejores cervecerías", "mejores helados", "Lugares con pelotero", "Quiero sushi", "Parrilla barata".
     
     PRIORIDAD 5: GENERAL (Charla y Otros)
@@ -1071,12 +1084,12 @@ async def clasificar_intencion(query, llm, last_entity=None):
         context_str = f" (Contexto previo: Hablábamos de {last_entity})" if last_entity else ""
         
         res = await llm.ainvoke(system_prompt + f"\nQUERY USUARIO: '{query}'{context_str}")
-        intent = res.content.strip().upper().replace('"', '').replace('.', '')
+        intencion = res.content.strip().upper().replace('"', '').replace('.', '')
         
-        validos = ["BLOCK", "STATS", "SPECIFIC", "RECOMMENDATION", "GENERAL"]
+        validos = ["BLOCK", "STATS", "SPECIFIC", "RECOMMENDATION", "GENERAL", "FOLLOWUP"]
         
         for v in validos:
-            if v in intent: return v
+            if v in intencion: return v
             
         return "GENERAL"
         
@@ -1115,6 +1128,9 @@ async def consultar_estadisticas(query, df, llm):
         keyword_ascii = ''.join(ch for ch in keyword_ascii if unicodedata.category(ch) != 'Mn')
         keyword_ascii = re.sub(r'[^\w\s]', '', keyword_ascii)
         
+        if len(keyword_ascii) < 3:
+            return f"No encontré una categoría clara en '{query}'.", []
+
         # 4. Filtrado (Usando tus columnas optimizadas)
         # Asumimos que df ya tiene 'restaurante_ascii' y 'texto_ascii'
         mask = (df['restaurante_ascii'].str.contains(keyword_ascii, case=False, na=False) | 
@@ -1291,6 +1307,63 @@ async def resumir_opiniones_local(query_str, df, llm, topic=None, tone='cordial'
     # Detail is usually same as text
     return full_text, restaurante, full_text, options
 
+async def responder_followup_gen(restaurante, query, df, llm, tone='cordial'):
+    """
+    Generates a targeted answer to a follow-up question based on reviews.
+    Yields tokens.
+    """
+    # 1. Validation
+    if not restaurante:
+        yield {"type": "token", "content": "No tengo un lugar seleccionado para responderte."}
+        return
+        
+    mask = df['restaurante'] == restaurante
+    if not mask.any():
+        yield {"type": "token", "content": f"No encuentro info de {restaurante}."}
+        return
+    
+    # 2. Get reviews and filter by topic/relevance
+    # reusing logic from rankear_reviews_por_topico 
+    sorted_reviews = rankear_reviews_por_topico(df[mask], query)
+    
+    # Take top 15 reviews to have enough context
+    reviews_txt = "\n".join([f"- {safe_str(r.get('texto'))[:300]}" for _, r in sorted_reviews.head(15).iterrows()])
+    
+    if not reviews_txt.strip():
+        yield {"type": "token", "content": f"No encontré reseñas específicas sobre '{query}' para {restaurante}."}
+        return
+
+    # 3. Prompt specific for Q&A
+    tone_prefix = tone_system_instruction(tone)
+    prompt = f"""{tone_prefix}
+    Estás respondiendo una PREGUNTA ESPECÍFICA sobre el restaurante "{restaurante}".
+    
+    PREGUNTA DEL USUARIO: "{query}"
+    
+    Tus fuentes (Reseñas reales):
+    {reviews_txt}
+    
+    Instrucciones:
+    1. Responde DIRECTAMENTE a la pregunta basándote SOLO en las reseñas.
+    2. Si las reseñas dicen algo relevante, sintetizalo.
+    3. Si las reseñas NO dicen nada sobre el tema (ej: pregunta precios y nadie menciona precios), di CLARAMENTE: "No encontré comentarios recientes sobre eso en las reseñas".
+    4. NO inventes datos. NO des el resumen general (onda/bueno/malo). Solo la respuesta.
+    5. Usa formato Markdown. Sé conciso (max 3 parrafos).
+    
+    Respuesta:
+    """
+    
+    try:
+        chain = ChatPromptTemplate.from_template(prompt) | llm | StrOutputParser()
+        args = {}
+        # Simulate typing/thinking? No just stream.
+        async for token in astream_buffer(chain, args):
+            yield {"type": "token", "content": token}
+    except Exception as e:
+        logger.error(f"Error responder_followup: {e}")
+        yield {"type": "token", "content": "Tuve un error procesando tu pregunta."}
+
+
 async def verificar_candidatos_con_llm(candidatos, df, query, llm):
     """
     JUEZ SEMÁNTICO (V2 - CON BÚSQUEDA DE EVIDENCIA):
@@ -1399,12 +1472,43 @@ def aplicar_filtro_zona(candidatos, df, zona_buscada):
         if z_clean in geo_data:
             candidatos_filtrados.append(local)
             
+    
     # Si el filtro fue muy agresivo y no quedó nadie, devolvemos los originales (Soft Filter)
     # O podés devolver [] si querés ser estricto. Yo prefiero soft para no dar respuesta vacía.
     if not candidatos_filtrados:
         return candidatos
         
     return candidatos_filtrados
+
+async def resolver_target_con_llm(query, last_entity, llm):
+    """
+    Decide si el usuario sigue hablando del 'last_entity' o cambia a un tema nuesvo.
+    Devuelve:
+    - nombre de la entidad (last_entity o nueva)
+    - "NONE" si no hay entidad clara
+    """
+    if not last_entity: return "NONE"
+    
+    prompt = f"""
+    Eres un asistente de contexto.
+    Contexto previo: Hablábamos de "{last_entity}".
+    Input usuario: "{query}"
+    
+    ¿El usuario sigue preguntando sobre "{last_entity}" o cambió a un lugar/tema nuevo?
+    - Si la pregunta es sobre "{last_entity}" (ej: "precio?", "donde queda?", "y opiniones?"), RESPONDE: {last_entity}
+    - Si pregunta sobre OTRO lugar (ej: "y Atila?", "que onda Growler?", "Elaskar"), RESPONDE EL NOMBRE DEL NUEVO LUGAR LIMPIO.
+    - Si no busca info de un lugar específico, RESPONDE: NONE.
+    
+    Responde SOLO el nombre o NONE.
+    """
+    try:
+        res = await llm.ainvoke(prompt)
+        text = res.content.strip().replace('"', '').replace('.', '')
+        # Basic cleanup
+        if text.upper() == "NONE": return "NONE"
+        return text
+    except:
+        return last_entity # Conservative fallback
 
 async def procesar_consulta_gen(query, df, vectorstore, llm_mini, llm_smart, ctx=None, user_ip=None):
     """
@@ -1416,6 +1520,7 @@ async def procesar_consulta_gen(query, df, vectorstore, llm_mini, llm_smart, ctx
       - {"type": "error", "message": "..."}
     """
     if ctx is None: ctx = {}
+    t_start = time.time()
     
     # 🐛 DEBUG DE ENTRADA
     yield {"type": "debug", "message": f"🟢 ENTRADA A CEREBRO | Query: '{query}'"}
@@ -1482,40 +1587,131 @@ async def procesar_consulta_gen(query, df, vectorstore, llm_mini, llm_smart, ctx
     # 3. SMART ROUTING (EL CEREBRO V8)
     # ==========================================
     last_ent = ctx.get('last_entity')
-    intent = await clasificar_intencion(query, llm_smart, last_entity=last_ent)
+    
+    # OVERRIDE: Si detectamos mención explícita, forzamos SPECIFIC_INFO
+    # Esto evita que el router se confunda con preguntas cortas como "Y Atila?" -> GENERAL
+    forced_entity = detectar_mencion_exacta(query, df)
+    
+    # IMPROVED: Deep Fuzzy Check using RapidFuzz
+    # This catches "Vikingos" -> "VIKINGS PIZZERIA" even if strict substring fails.
+    if not forced_entity:
+        candidates = df['restaurante'].unique().tolist()
+        # Use token_set_ratio to handle "Vikingos" vs "VIKINGS PIZZERIA" (Partial overlap is good)
+        # score_cutoff=80 allows some typo tolerance.
+        match = process.extractOne(query, candidates, scorer=fuzz.token_set_ratio, score_cutoff=85)
+        if match:
+             forced_entity = match[0]
+             print(f"[DEBUG] 🕵️ Fuzzy Override: '{query}' -> '{forced_entity}' (Score: {match[1]})", flush=True)
+
+    if forced_entity:
+        intencion = "SPECIFIC_INFO"
+        print(f"[DEBUG] 🚀 Router Override: Detectado '{forced_entity}' -> Forzando modo SPECIFIC_INFO", flush=True)
+    else:
+        # Use llm_mini for faster routing (Routing doesn't need GPT-4o typically)
+        intencion = await clasificar_intencion(query, llm_mini, last_entity=last_ent)
     
     # Ajuste de compatibilidad
-    if intent == "SPECIFIC": intent = "SPECIFIC_INFO"
+    if intencion == "SPECIFIC": intencion = "SPECIFIC_INFO"
     
-    yield {"type": "debug", "message": f"🧠 INTENCIÓN: {intent}"}
+    yield {"type": "debug", "message": f"🧠 INTENCIÓN: {intencion}"}
 
     # --- CAMINO A: ESTADÍSTICAS ---
-    if intent == "STATS":
-        if 'last_entity' in ctx: del ctx['last_entity']
+    if intencion == "STATS":
+        # SAFETY NET: If we have a last_entity, avoid entering STATS for ambiguous follow-ups
+        # like "precios?", "horarios?", "y la carta?".
+        # Only allow STATS if the user explicitly asks for magnitude/quantity.
+        is_explicit_stats = any(x in query.lower() for x in ["total", "cuantos", "cuántos", "cantidad", "numero de", "número de", "hay "])
         
-        resp, locales = await consultar_estadisticas(query, df, llm_mini)
-        cards = obtener_restaurant_cards_simple(locales, df)
+        if ctx.get('last_entity') and not is_explicit_stats:
+             print(f"[DEBUG] 🔄 Re-routing ambiguous STATS '{query}' to SPECIFIC because active context exists", flush=True)
+             intencion = "SPECIFIC_INFO"
+        else:
+             if 'last_entity' in ctx: del ctx['last_entity']
+             
+             resp, locales = await consultar_estadisticas(query, df, llm_mini)
+             cards = obtener_restaurant_cards_simple(locales, df)
         locs = obtener_coordenadas(locales, df)
         
         yield {"type": "meta", "mode": "estadisticas", "cards": cards, "locs": locs}
         yield {"type": "token", "content": resp}
         return
 
-    # --- CAMINO B: INFO ESPECÍFICA (UN LUGAR) ---
-    if intent == "SPECIFIC_INFO":
-        target = last_ent if ctx.get('last_entity') else query
-        # Logic to resolve target name...
-        entity_detected = None # Simplified for now as per prev code
+    # --- CAMINO AB: FOLLOWUP (PREGUNTA ESPECÍFICA DE SEGUIMIENTO) ---
+    if intencion == "FOLLOWUP":
+        target = ctx.get('last_entity')
         
-        # Resolve target
+        if not target:
+             # Fallback: Router says yes, but we have no context.
+             yield {"type": "token", "content": "Perdón, me perdí. ¿De qué lugar estábamos hablando?"}
+             yield {"type": "debug", "message": "⚠️ Intent FOLLOWUP sin last_entity"}
+        else:
+             # Streaming answer
+             yield {"type": "debug", "message": f"🔄 FOLLOWUP sobre '{target}'"}
+             # Optional: Yield meta to keep UI context? 
+             # yield {"type": "meta", "mode": "followup", "restaurante": target} 
+             
+             async for event in responder_followup_gen(target, query, df, llm_mini, tone):
+                 yield event
+        return
+
+    # --- CAMINO B: INFO ESPECÍFICA (UN LUGAR) ---
+    if intencion == "SPECIFIC_INFO":
+        # SAFE INIT
+        match_exists = False
+        temp_error_msg = None
+        options_found = None
+        found_valid_content = False
+        target = None
+        
+        # BUG FIX: Prioritize detecting NEW entity in the query over the previous one.
+        # Check if query mentions a known place
+        nuevo_candidato = detectar_mencion_exacta(query, df)
+        
+        target = None
+        
+        if nuevo_candidato:
+            # User mentioned a specific place explicitly
+            target = nuevo_candidato
+            ctx['last_entity'] = target 
+        else:
+            # AGGRESSIVE SEARCH via RapidFuzz (Best in Class)
+            # Replaces manual loop. Matches "Vikingos" to "VIKINGS PIZZERIA".
+            candidates = df['restaurante'].unique().tolist()
+            match = process.extractOne(query, candidates, scorer=fuzz.token_set_ratio, score_cutoff=85)
+            
+            match_fuzzy = match[0] if match else None
+            
+            if match_fuzzy:
+                target = match_fuzzy
+                ctx['last_entity'] = target
+            elif ctx.get('last_entity'):
+                # Consult LLM to determine if we act on last_entity or new target
+                # This handles "Y el precio?" (Keep) vs "Que onda Elaskar?" (Switch) robustly.
+                resolved_target = await resolver_target_con_llm(query, ctx.get('last_entity'), llm_mini)
+                
+                if resolved_target == "NONE" or not resolved_target:
+                     target = query # Treat as generic specific query
+                else:
+                     target = resolved_target
+                     if target != ctx.get('last_entity'):
+                         # Detected context switch to new (possibly unknown) entity
+                         ctx['last_entity'] = target
+            else:
+                 target = query
+
+        # Resolve target normalization (redundant if nuevo_candidato found, but safe)
         if target:
             nombre_candidato = detectar_mencion_exacta(target, df)
             if nombre_candidato: target = nombre_candidato
             else:
-                # Lax search
+                # Last resort fuzzy check if target comes from query string
                 mask = df['restaurante'].str.lower().str.contains(target.lower().strip(), na=False, regex=False)
-                if mask.any(): pass # Exists
-                else: target = None if not ctx.get('last_entity') else target # Attempt fallback
+                if mask.any(): pass 
+                else: 
+                     # If target was just 'query' and didn't match anything...
+                     # and we have NO last_entity, we might be lost.
+                     # But if we had last_entity and logic dropped here?
+                     pass
 
         if target:
             match_exists = True # Assume true if we resolved it or came from context
@@ -1528,36 +1724,60 @@ async def procesar_consulta_gen(query, df, vectorstore, llm_mini, llm_smart, ctx
                 if topic_actual: ctx['original_query'] = topic_actual
 
                 # Generator Call
-                nombre_final = None
+                found_valid_content = False
+                temp_error_msg = None
                 options_found = None
                 
                 async for event in resumir_opiniones_local_gen(target, df, llm_mini, topic=topic_actual, tone=tone):
                     if event["type"] == "token":
                         yield event
+                        found_valid_content = True
                     elif event["type"] == "meta":
                         if "restaurante" in event: nombre_final = event["restaurante"]
+                        # If found, propagate meta
+                        # yield event # Or wait? stream reader handles meta.
+                        # Usually we yield meta at end or inline.
+                        # resumir_opiniones_local_gen yields token content.
+                        # We should yield meta too for context update? 
+                        # The original code only captured nombre_final and yielded meta later?
+                        # No, detecting loop logic:
+                        # Original:
+                        # elif event["type"] == "meta": if "restaurante": nombre_final...
+                        # It did NOT yield the meta event?
+                        # Wait, let's look at `resumir_opiniones_local_gen` output. It yields meta.
+                        pass
                     elif event["type"] == "menu":
                         yield {"type": "token", "content": event["text"]}
                         options_found = event["options"]
+                        found_valid_content = True
                     elif event["type"] == "error":
-                         yield {"type": "token", "content": event["text"]}
+                         temp_error_msg = event["text"]
 
                 if options_found:
                     yield {"type": "meta", "mode": "resumen", "pending": {"options": options_found}}
                     return
                 
-                if nombre_final:
-                    ctx['last_entity'] = nombre_final
-                    cards = await obtener_restaurant_cards([nombre_final], df, llm_mini, query_context=topic_actual, tone=tone)
-                    locs = obtener_coordenadas([nombre_final], df)
-                    yield {"type": "meta", "mode": "resumen", "cards": cards, "locs": locs}
+                if found_valid_content:
+                    if nombre_final:
+                        ctx['last_entity'] = nombre_final
+                        cards = await obtener_restaurant_cards([nombre_final], df, llm_mini, query_context=topic_actual, tone=tone)
+                        locs = obtener_coordenadas([nombre_final], df)
+                        yield {"type": "meta", "mode": "resumen", "cards": cards, "locs": locs}
                     return
         
-        # Fallback to RECOMMENDATION if specific fails
-        intent = "RECOMMENDATION"
+        if temp_error_msg:
+             # User Request: If not found, STOP. Do not recommend others.
+             # Clean up the message slightly if it's the default one
+             final_msg = "No tengo información sobre ese lugar específico."
+             yield {"type": "token", "content": final_msg}
+             return
+        
+        # Fallback to RECOMMENDATION only if no error but also no content? 
+        # (This case shouldn't happen much if 'target' was set)
+        intencion = "RECOMMENDATION"
 
     # --- CAMINO C: RECOMENDACIÓN (PIPELINE ESTRICTO) ---
-    if intent == "RECOMMENDATION":
+    if intencion == "RECOMMENDATION":
         vars_to_kill = ['last_entity', 'original_query', 'pending_options']
         for var in vars_to_kill:
             if var in ctx: del ctx[var]
@@ -1574,7 +1794,10 @@ async def procesar_consulta_gen(query, df, vectorstore, llm_mini, llm_smart, ctx
             synonyms = analisis.get("synonyms", [])
             zona_detectada = analisis.get("donde")
 
-            docs = vectorstore.similarity_search(query, k=60)
+            t_vec_start = time.time()
+            # Optimization: Increased k to 50 to allow popular places (high reviews) to surface 
+            # even if semantic match is slightly lower.
+            docs = vectorstore.similarity_search(query, k=50)
             seen = set()
             candidatos_crudos = []
             for d in docs:
@@ -1582,9 +1805,24 @@ async def procesar_consulta_gen(query, df, vectorstore, llm_mini, llm_smart, ctx
                 if nom and nom not in seen:
                     seen.add(nom)
                     candidatos_crudos.append(nom)
+            
+            t_vec_end = time.time()
+            print(f"[TIMING] Vector Search took {t_vec_end - t_vec_start:.2f}s", flush=True)
 
             if zona_detectada:
                 candidatos_crudos = aplicar_filtro_zona(candidatos_crudos, df, zona_detectada)
+
+            # HARD FILTER: Excluir lugares con menos de 30 reseñas (evitar lugares fantasmas o muy nuevos/malos)
+            candidatos_limpios = []
+            for local in candidatos_crudos:
+                mask = df['restaurante'] == local
+                if mask.any():
+                    row = df[mask].iloc[0]
+                    revs = safe_int(row.get('total_reviews_google', 0))
+                    if revs >= 30:
+                        candidatos_limpios.append(local)
+            
+            candidatos_crudos = candidatos_limpios
 
             # Filtering logic (same as original)
             filtro_terms = set(keywords)
@@ -1608,96 +1846,141 @@ async def procesar_consulta_gen(query, df, vectorstore, llm_mini, llm_smart, ctx
             else:
                 grupo_alta_relevancia = candidatos_crudos
 
-            def sort_by_quality(nombre):
+            # 4. SELECCIÓN PARA EL JUEZ
+            
+            # Definimos la función de calidad PONDERADA
+            def calculate_weighted_score(nombre):
                 mask = df['restaurante'] == nombre
-                if not mask.any(): return 0
-                row = df[mask].iloc[0]
-                return safe_float(row.get('rating_gral'))
-
-            grupo_alta_relevancia.sort(key=sort_by_quality, reverse=True)
-            grupo_baja_relevancia.sort(key=sort_by_quality, reverse=True)
-            
-            candidatos_a_verificar = []
-            candidatos_a_verificar.extend(grupo_alta_relevancia[:10])
-            faltan = 8 - len(candidatos_a_verificar)
-            if faltan > 0: candidatos_a_verificar.extend(grupo_baja_relevancia[:faltan])
-            candidatos_a_verificar = candidatos_a_verificar[:10]
-
-            locales_verificados = await verificar_candidatos_con_llm(candidatos_a_verificar, df, query, llm_mini)
-            
-            exactos = locales_verificados[:3]
-            relacionados = [loc for loc in grupo_alta_relevancia if loc not in exactos][:4]
-            
-            def calcular_score_final(nombre_local):
-                mask = df['restaurante'] == nombre_local
                 if not mask.any(): return 0
                 row = df[mask].iloc[0]
                 rat = safe_float(row.get('rating_gral'))
                 revs = safe_int(row.get('total_reviews_google'))
-                return rat + (math.log10(revs + 1) * 0.2)
+                # Log10 de 10 = 1, 100 = 2, 1000 = 3
+                # User Request: Ponderar TODAVIA MAS la cantidad de reseñas. 
+                # Multiplier 3.5 -> 1000 reviews adds 10.5 points! Huge boost.
+                return rat + (math.log10(revs + 1) * 3)
 
-            exactos.sort(key=calcular_score_final, reverse=True)
-            relacionados.sort(key=calcular_score_final, reverse=True)
+            # Ordenamos ambos grupos por puntaje ponderado
+            grupo_alta_relevancia.sort(key=calculate_weighted_score, reverse=True)
+            grupo_baja_relevancia.sort(key=calculate_weighted_score, reverse=True)
+            
+            candidatos_a_verificar = []
+
+            # Optimization: Limit candidates for Judge to 8
+            candidatos_a_verificar.extend(grupo_alta_relevancia[:8])
+            
+            faltan = 6 - len(candidatos_a_verificar)
+            if faltan > 0:
+                candidatos_a_verificar.extend(grupo_baja_relevancia[:faltan])
+            
+            candidatos_a_verificar = candidatos_a_verificar[:8]
+
+            # 5. EL JUEZ LLM (Verificación de Contexto)
+            t0 = time.time()
+            locales_verificados = await verificar_candidatos_con_llm(
+                candidatos_a_verificar, df, query, llm_mini
+            )
+            t1 = time.time()
+            print(f"[TIMING] Juez LLM took {t1-t0:.2f}s", flush=True)
+            
+            # DEBUG: Ver qué aprobó el juez
+            print(f"[DEBUG] ⚖️ Juez LLM aprobó: {len(locales_verificados)} de {len(candidatos_a_verificar)}", flush=True)
+            print(f"[DEBUG] ⚖️ Aprobados: {locales_verificados}", flush=True)
+            
+            # Separar EXACTOS (aprobados por juez) y RELACIONADOS (alta relevancia no aprobados)
+            exactos = locales_verificados[:3]  # Máximo 3 exactos
+            relacionados = [loc for loc in grupo_alta_relevancia if loc not in exactos][:4]  # Máximo 4 relacionados
+            
+            print(f"[DEBUG] 🎯 Exactos: {exactos}", flush=True)
+            print(f"[DEBUG] 🔗 Relacionados: {relacionados}", flush=True)
+
+            # 6. RANKING FINAL (Reutilizamos el score ponderado)
+            exactos.sort(key=calculate_weighted_score, reverse=True)
+            relacionados.sort(key=calculate_weighted_score, reverse=True)
 
             if not exactos and not relacionados:
                 yield {"type": "meta", "mode": "rag", "cards": [], "locs": []}
                 yield {"type": "token", "content": "No encontré lugares que cumplan con ese requisito específico."}
                 return
 
-            todos_los_locales = exactos + relacionados
-            cards = await obtener_restaurant_cards(
+            # 6. GENERACIÓN PARALELA
+            # Lanzamos la generación de cards en background para no bloquear el chat
+            t2 = time.time()
+            
+            # Optimization: Limit card generation to Top 5 (3 Exact + 2 Related) to reduce wait time
+            todos_los_locales = exactos[:3] + relacionados[:2]
+            
+            # Helper para el contexto RÁPIDO (usando datos crudos en lugar de esperar a las cards)
+            def construir_contexto_rapido(nombres, df):
+                contexto = ""
+                for nom in nombres:
+                    mask = df['restaurante'] == nom
+                    if not mask.any(): continue
+                    row = df[mask].iloc[0]
+                    rat = safe_float(row.get('rating_gral'))
+                    revs = safe_int(row.get('total_reviews_google'))
+                    # Tomamos un snippet de reseñas (crudo, pero sirve)
+                    texto_raw = safe_str(row.get('texto', ''))[:400].replace("\n", " ")
+                    contexto += f"- {nom} ({rat}⭐, {revs} res): {texto_raw}...\n"
+                return contexto
+
+            detalles_exactos = construir_contexto_rapido(exactos, df)
+            detalles_relacionados = construir_contexto_rapido(relacionados, df)
+            
+            # Start background task
+            card_task = asyncio.create_task(obtener_restaurant_cards(
                 todos_los_locales, df, llm_mini, query, tone, 
                 strict_mode=False, keywords_list=keywords, synonyms_list=synonyms
-            )
-            
-            cards_exactos = [c for c in cards if c.nombre in exactos]
-            cards_relacionados = [c for c in cards if c.nombre in relacionados]
-            
-            nombres_finales = [c.nombre for c in cards]
-            locs = obtener_coordenadas(nombres_finales, df)
-            
-            # YIELD METADATA EARLY
-            yield {"type": "meta", "mode": "rag", "cards": cards, "locs": locs}
+            ))
 
-            prefix = tone_system_instruction(tone)
-            detalles_exactos = "\n".join([f"- {c.nombre}: {c.descripcion}" for c in cards_exactos]) if cards_exactos else ""
-            detalles_relacionados = "\n".join([f"- {c.nombre}: {c.descripcion}" for c in cards_relacionados]) if cards_relacionados else ""
-            
-            if cards_exactos and cards_relacionados:
+            if exactos and relacionados:
                  prompt_rag = (
-                    f"{prefix}\n"
+                    f"{tone_system_instruction(tone)}\n"
                     f"SITUACIÓN: El usuario buscó '{query}'.\n\n"
-                    f"LUGARES EXACTOS (cumplen específicamente con lo pedido):\n{detalles_exactos}\n\n"
-                    f"LUGARES RELACIONADOS (tienen algo similar pero no exactamente lo que pidió):\n{detalles_relacionados}\n\n"
+                    f"LUGARES EXACTOS (cumplen):\n{detalles_exactos}\n\n"
+                    f"LUGARES RELACIONADOS (similares):\n{detalles_relacionados}\n\n"
                     f"INSTRUCCIONES:\n"
-                    "1. Primero recomienda los lugares EXACTOS diciendo algo como 'Si buscás específicamente [lo que pidió], te recomiendo...'\n"
-                    "2. Luego menciona los RELACIONADOS diciendo 'Ahora, si lo que querés es un lugar con [concepto más amplio], también podés considerar...'\n"
-                    "3. Sé honesto sobre la diferencia entre ambos grupos.\n"
-                    "4. Basate EXCLUSIVAMENTE en las descripciones provistas."
+                    "1. Recomienda los EXACTOS primero.\n"
+                    "2. Menciona los RELACIONADOS como alternativa.\n"
+                    "3. Usa la info provista para describir qué tienen de bueno."
                 )
-            elif cards_exactos:
+            elif exactos:
                 prompt_rag = (
-                    f"{prefix}\n"
+                    f"{tone_system_instruction(tone)}\n"
                     f"SITUACIÓN: El usuario buscó '{query}'.\n"
-                    f"Resultados VERIFICADOS:\n{detalles_exactos}\n\n"
+                    f"Resultados:\n{detalles_exactos}\n\n"
                     f"INSTRUCCIONES:\n"
-                    "1. Confirmale al usuario que estos lugares cumplen específicamente con su búsqueda.\n"
-                    "2. Genera una recomendación útil basada en las descripciones."
+                    "1. Confirma que encontraste lo que buscaba.\n"
+                    "2. Describelos usando la info provista."
                 )
             else:
-                prompt_rag = (
-                    f"{prefix}\n"
+                 prompt_rag = (
+                    f"{tone_system_instruction(tone)}\n"
                     f"SITUACIÓN: El usuario buscó '{query}'.\n"
-                    f"No encontré lugares que cumplan EXACTAMENTE con eso, pero sí estos RELACIONADOS:\n{detalles_relacionados}\n\n"
+                    f"Solo encontré RELACIONADOS:\n{detalles_relacionados}\n\n"
                     f"INSTRUCCIONES:\n"
-                    "1. Sé honesto: decile que no encontraste algo específico para su búsqueda.\n"
-                    "2. Pero ofrecele las alternativas relacionadas que podrían servirle.\n"
-                    "3. Explicá brevemente por qué cada uno podría ser útil."
+                    "1. Aclara que no encontraste match exacto.\n"
+                    "2. Ofrece estos relacionados."
                 )
+            
+            t_stream_start = time.time()
+            print(f"[TIMING] Pre-stream setup (Parallel) took {t_stream_start - t_start:.2f}s total. Starting stream...", flush=True)
             
             # STREAMING THE RAG RESPONSE
             async for token in astream_buffer(llm_mini, prompt_rag):
                 yield {"type": "token", "content": token}
+            
+            # AWAIT CARDS AND YIELD
+            print(f"[TIMING] Text stream finished. Waiting for cards...", flush=True)
+            cards = await card_task
+            t3 = time.time()
+            print(f"[TIMING] Card Gen finished at {t3 - t_start:.2f}s total (Latencia oculta)", flush=True)
+            
+            nombres_finales = [c.nombre for c in cards]
+            locs = obtener_coordenadas(nombres_finales, df)
+            
+            # Yield Metadata at the END
+            yield {"type": "meta", "mode": "rag", "cards": cards, "locs": locs}
             return
 
         except Exception as e:
@@ -1707,7 +1990,7 @@ async def procesar_consulta_gen(query, df, vectorstore, llm_mini, llm_smart, ctx
             return
 
     # --- CAMINO D: GENERAL ---
-    if intent == "BLOCK":
+    if intencion == "BLOCK":
         ctx['strikes'] = strikes + 1
         yield {"type": "meta", "mode": "general"}
         yield {"type": "token", "content": "Epa, bajemos un cambio. Mantené el respeto, estoy acá para ayudar. (Strike sumado)"}
@@ -1859,48 +2142,46 @@ async def chat_stream(req: QueryRequest, request: Request):
                     if "pending" in event: pend = event["pending"]
                 
                 # Encode and yield
-                # We use ensuring_ascii=False to minimize size and allow unicode
                 yield json.dumps(event, ensure_ascii=False) + "\n"
-
-            # === POST-STREAMING LOGIC ===
-            
-            # 1. Update Context (Same logic as sync chat)
-            new_ctx = ctx.copy()
-            if pend: new_ctx['pending_options'] = pend
-            elif 'pending_options' in new_ctx: del new_ctx['pending_options']
-            
-            if req.conversation_context and 'original_query' in req.conversation_context and 'original_query' not in new_ctx:
-                 new_ctx['original_query'] = req.conversation_context['original_query']
-
-            # Yield final context update event
-            yield json.dumps({"type": "context_update", "context": new_ctx}, ensure_ascii=False) + "\n"
-
-            # 2. Logging
-            response_time = asyncio.get_event_loop().time() - start_time
-            restaurants = [c.nombre for c in cards] if cards else []
-            
-            ai_provider = None
-            if llm_mini: ai_provider = f"Mini:{llm_mini.model_name}"
-            if llm_smart and mode in ["rag", "resumen"]: ai_provider = f"Smart:{llm_smart.model_name}"
-
-            asyncio.create_task(log_user_query_to_discord(
-                request, 
-                req.query, 
-                tone=req.tone,
-                response_time=response_time,
-                mode=mode,
-                restaurants=restaurants,
-                keywords=None,
-                used_cache=False,
-                ai_provider=ai_provider,
-                context_info=ctx,
-                strikes=ctx.get('strikes', 0)
-            ))
-
         except Exception as e:
-            logger.error(f"Error Stream: {e}")
-            yield json.dumps({"type": "error", "message": "Stream interrupted"}, ensure_ascii=False) + "\n"
+             logger.error(f"Stream error: {e}")
+             yield json.dumps({"type": "error", "message": str(e)}, ensure_ascii=False) + "\n"
 
+        # === POST-STREAMING LOGIC ===
+        
+        # 1. Update Context (Same logic as sync chat)
+        new_ctx = ctx.copy()
+        if pend: new_ctx['pending_options'] = pend
+        elif 'pending_options' in new_ctx: del new_ctx['pending_options']
+        
+        if req.conversation_context and 'original_query' in req.conversation_context and 'original_query' not in new_ctx:
+                new_ctx['original_query'] = req.conversation_context['original_query']
+
+        # Yield final context update event
+        yield json.dumps({"type": "context_update", "context": new_ctx}, ensure_ascii=False) + "\n"
+
+        # 2. Logging
+        response_time = asyncio.get_event_loop().time() - start_time
+        restaurants = [c.nombre for c in cards] if cards else []
+        
+        ai_provider = None
+        if llm_mini: ai_provider = f"Mini:{llm_mini.model_name}"
+        if llm_smart and mode in ["rag", "resumen"]: ai_provider = f"Smart:{llm_smart.model_name}"
+
+        asyncio.create_task(log_user_query_to_discord(
+            request, 
+            req.query, 
+            tone=req.tone,
+            response_time=response_time,
+            mode=mode,
+            restaurants=restaurants,
+            keywords=None,
+            used_cache=False,
+            ai_provider=ai_provider,
+            context_info=ctx,
+            strikes=ctx.get('strikes', 0)
+        ))
+        
     return StreamingResponse(event_generator(), media_type="application/x-ndjson")
 
 @app.post("/chat", response_model=QueryResponse)
