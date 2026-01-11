@@ -127,7 +127,7 @@ async def lifespan(app: FastAPI):
             cols = ['restaurante', 'texto', 'direccion', 'barrio', 'zona', 'autor', 'fecha']
             for col in cols:
                 if col in df.columns:
-                    df[col] = df[col].fillna("").astype(str).str.strip()
+                    df.loc[:, col] = df[col].fillna("").astype(str).str.strip()
             
             # --- FILTRO TEMPORAL: Solo Neuquén Capital (Q8300/1/2) ---
             # El usuario pidió excluir Cipolletti/San Martín.
@@ -137,8 +137,8 @@ async def lifespan(app: FastAPI):
             
             # Convertir rating_gral (puede venir como "4,5")
             if 'rating_gral' in df.columns:
-                df['rating_gral'] = df['rating_gral'].astype(str).str.replace(',', '.', regex=False)
-                df['rating_gral'] = pd.to_numeric(df['rating_gral'], errors='coerce').fillna(0.0)
+                df.loc[:, 'rating_gral'] = df['rating_gral'].astype(str).str.replace(',', '.', regex=False)
+                df.loc[:, 'rating_gral'] = pd.to_numeric(df['rating_gral'], errors='coerce').fillna(0.0)
             else:
                 df['rating_gral'] = 0.0
             
@@ -149,8 +149,8 @@ async def lifespan(app: FastAPI):
                 t = ''.join(ch for ch in t if unicodedata.category(ch) != 'Mn')
                 t = re.sub(r'[^\w\s]', '', t)
                 return t
-            df['restaurante_ascii'] = df['restaurante'].apply(_norm)
-            df['texto_ascii'] = df['texto'].apply(_norm)
+            df.loc[:, 'restaurante_ascii'] = df['restaurante'].apply(_norm)
+            df.loc[:, 'texto_ascii'] = df['texto'].apply(_norm)
             logger.info(f"✅ DataFrame cargado: {len(df)} filas.")
         except Exception as e:
             logger.error(f"❌ Error cargando datos: {e}")
@@ -630,6 +630,7 @@ def tone_system_instruction(tone):
         "Conocés la ciudad como la palma de tu mano.\n"
         "Idioma: Español Rioplatense (Argentino) NATURAL.\n"
         "Reglas de Estilo:\n"
+        "- NO saludes ('Hola', 'Bienvenido', etc.). Andá directo al grano.\n"
         "- NO abuses del 'Che' ni del 'Viste' (usalo solo si fluye).\n"
         "- NO uses jerga forzada (evitá 'chabón', 'pibe' salvo que cuadre perfecto).\n"
         "- Cuando des una opinión, fundaméntala con datos de las reseñas.\n"
@@ -1413,20 +1414,24 @@ async def verificar_candidatos_con_llm(candidatos, df, query, llm):
         texto_validacion += f"- LOCAL: {local}\n  {prefix} \"...{snippet}...\"\n\n"
 
     prompt = f"""
-    Eres un JUEZ DE CALIDAD. Query usuario: "{query}"
+    Eres un JUEZ DE CALIDAD ESTRICTO. Query usuario: "{query}"
     
     Analiza la EVIDENCIA de los locales y decide cuáles aprobar.
     
-    REGLAS:
-    1. APROBAR si la evidencia confirma que tiene lo que se pide (ej: "Lindo pelotero").
-    2. ELIMINAR si la mención es NEGATIVA (ej: "No tiene pelotero", "Sacaron el pelotero").
-    3. ELIMINAR si el contexto es irónico (ej: "Parece un pelotero de tanto ruido").
-    4. Si la evidencia es vaga pero positiva, APROBAR.
+    REGLAS CRÍTICAS:
+    1. APROBAR solo si la evidencia CONFIRMA explícitamente que TIENE lo que se pide.
+    2. RECHAZAR OBLIGATORIAMENTE si dice "NO hay", "NO tiene", "Falta", "Pocas opciones", "No encontramos".
+    3. CUIDADO con dietas (vegano, celíaco, sin tacc): Si la reseña dice "No hay opciones veganas", DEBES ELIMINARLO.
+    4. Si la evidencia es vaga o irrelevante para la query, ELIMINAR.
     
-    CANDIDATOS:
+    Ejemplos Falsos Positivos (ELIMINAR):
+    - Query: "vegano" -> Evidencia: "Preguntamos y no tenían opciones veganas." (ELIMINAR)
+    - Query: "pelotero" -> Evidencia: "El pelotero estaba cerrado." (ELIMINAR)
+    
+    CANDIDATOS A ANALIZAR:
     {texto_validacion}
     
-    Responde SOLO un JSON: ["Local A", "Local B"]
+    Responde SOLO un JSON válido con la lista de nombres aprobados: ["Local A", "Local B"]
     """
     
     try:
@@ -1858,7 +1863,7 @@ async def procesar_consulta_gen(query, df, vectorstore, llm_mini, llm_smart, ctx
                 # Log10 de 10 = 1, 100 = 2, 1000 = 3
                 # User Request: Ponderar TODAVIA MAS la cantidad de reseñas. 
                 # Multiplier 3.5 -> 1000 reviews adds 10.5 points! Huge boost.
-                return rat + (math.log10(revs + 1) * 3)
+                return rat + (math.log10(revs + 1) * 2.7)
 
             # Ordenamos ambos grupos por puntaje ponderado
             grupo_alta_relevancia.sort(key=calculate_weighted_score, reverse=True)
@@ -1886,12 +1891,21 @@ async def procesar_consulta_gen(query, df, vectorstore, llm_mini, llm_smart, ctx
             # DEBUG: Ver qué aprobó el juez
             print(f"[DEBUG] ⚖️ Juez LLM aprobó: {len(locales_verificados)} de {len(candidatos_a_verificar)}", flush=True)
             print(f"[DEBUG] ⚖️ Aprobados: {locales_verificados}", flush=True)
+
+            # Identificar rechazados explícitamente para no mostrarlos en 'relacionados'
+            locales_rechazados = set(candidatos_a_verificar) - set(locales_verificados)
             
             # Separar EXACTOS (aprobados por juez) y RELACIONADOS (alta relevancia no aprobados)
-            exactos = locales_verificados[:3]  # Máximo 3 exactos
-            relacionados = [loc for loc in grupo_alta_relevancia if loc not in exactos][:4]  # Máximo 4 relacionados
+            exactos = locales_verificados[:4]  # Máximo 4 exactos
+            
+            # Relacionados: tomamos de alta relevancia, excluyendo los que ya son exactos Y los que fueron RECHAZADOS por el juez
+            relacionados = [
+                loc for loc in grupo_alta_relevancia 
+                if loc not in exactos and loc not in locales_rechazados
+            ][:3]  # Máximo 3 relacionados
             
             print(f"[DEBUG] 🎯 Exactos: {exactos}", flush=True)
+            print(f"[DEBUG] 🚫 Rechazados filtrados: {locales_rechazados}", flush=True)
             print(f"[DEBUG] 🔗 Relacionados: {relacionados}", flush=True)
 
             # 6. RANKING FINAL (Reutilizamos el score ponderado)
@@ -1907,8 +1921,9 @@ async def procesar_consulta_gen(query, df, vectorstore, llm_mini, llm_smart, ctx
             # Lanzamos la generación de cards en background para no bloquear el chat
             t2 = time.time()
             
-            # Optimization: Limit card generation to Top 5 (3 Exact + 2 Related) to reduce wait time
-            todos_los_locales = exactos[:3] + relacionados[:2]
+            # Optimization: Generate cards for ALL places mentioned in the text to maintain consistency
+            # The LLM will mention all exactos (max 3) and all relacionados (max 4)
+            todos_los_locales = exactos + relacionados  # Up to 7 cards total
             
             # Helper para el contexto RÁPIDO (usando datos crudos en lugar de esperar a las cards)
             def construir_contexto_rapido(nombres, df):
@@ -1942,7 +1957,8 @@ async def procesar_consulta_gen(query, df, vectorstore, llm_mini, llm_smart, ctx
                     f"INSTRUCCIONES:\n"
                     "1. Recomienda los EXACTOS primero.\n"
                     "2. Menciona los RELACIONADOS como alternativa.\n"
-                    "3. Usa la info provista para describir qué tienen de bueno."
+                    "3. Usa la info provista para describir qué tienen de bueno.\n"
+                    "4. IMPORTANTE: Usa Markdown. Resalta nombres de lugares con **negritas**."
                 )
             elif exactos:
                 prompt_rag = (
@@ -1951,7 +1967,8 @@ async def procesar_consulta_gen(query, df, vectorstore, llm_mini, llm_smart, ctx
                     f"Resultados:\n{detalles_exactos}\n\n"
                     f"INSTRUCCIONES:\n"
                     "1. Confirma que encontraste lo que buscaba.\n"
-                    "2. Describelos usando la info provista."
+                    "2. Describelos usando la info provista.\n"
+                    "3. IMPORTANTE: Usa Markdown. Resalta nombres de lugares con **negritas**."
                 )
             else:
                  prompt_rag = (
@@ -1960,7 +1977,8 @@ async def procesar_consulta_gen(query, df, vectorstore, llm_mini, llm_smart, ctx
                     f"Solo encontré RELACIONADOS:\n{detalles_relacionados}\n\n"
                     f"INSTRUCCIONES:\n"
                     "1. Aclara que no encontraste match exacto.\n"
-                    "2. Ofrece estos relacionados."
+                    "2. Ofrece estos relacionados.\n"
+                    "3. IMPORTANTE: Usa Markdown. Resalta nombres de lugares con **negritas**."
                 )
             
             t_stream_start = time.time()
