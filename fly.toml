@@ -21,6 +21,6 @@ primary_region = "gru"  # <--- CAMBIADO de 'gru' a 'eze' (Buenos Aires)
     timeout = "10s"
 
 [[vm]]
-  memory_mb = 512
+  memory_mb = 768
   cpu_kind = "shared"
   cpus = 1
