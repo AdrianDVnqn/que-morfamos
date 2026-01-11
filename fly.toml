@@ -4,14 +4,18 @@ primary_region = "gru"  # <--- CAMBIADO de 'gru' a 'eze' (Buenos Aires)
 [http_service]
   internal_port = 8000
   force_https = true
-  auto_stop_machines = true
+  auto_stop_machines = "stop"   # "stop" apaga después de idle, "suspend" es más rápido para retomar
   auto_start_machines = true
   min_machines_running = 0
 
   [http_service.concurrency]
     type = "requests"
-    soft_limit = 20
-    hard_limit = 25
+    soft_limit = 50    # Permite más requests concurrentes antes de escalar
+    hard_limit = 100
+
+  [http_service.machine_checks]
+    grace_period = "30s"   # Da más tiempo para el cold start
+    interval = "60s"
 
   [[http_service.checks]]
     grace_period = "60s"   # <--- Aumentado a 60s por las dudas (Pandas es pesado)
