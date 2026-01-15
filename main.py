@@ -1002,72 +1002,73 @@ def obtener_restaurant_cards_simple(nombres_restaurantes, df):
 # 5. INTENCIÓN Y DETECCIÓN (BRAIN)
 # ==========================================
 
-async def analizar_query_semantica(query, llm):
-    """ USA LLM_SMART. Retorna: {tipo, keywords, synonyms} """
+async def analizar_query_semantica(query, llm, last_entity=None):
+    """ USA LLM_SMART. Retorna: {tipo, intencion, target_name, keywords, synonyms, donde} """
     q_lower = query.lower()
     
-    # Bypass para evitar falsos positivos de seguridad, 
-    # pero igual dejamos que el LLM genere los sinónimos.
+    # Bypass para seguridad (comida/niños)
     is_safe_bypass = False
     whitelist = ["helad", "crema", "pelotero", "juego", "niñ", "chic", "infantil"]
     for safe in whitelist:
         if safe in q_lower: is_safe_bypass = True
 
-    cache_key = f"analysis_v86_{q_lower.strip()}"
+    # Cambiamos v86 a v90 para invalidar cache con el nuevo esquema
+    cache_key = f"analysis_v90_{q_lower.strip()}"
+    if last_entity:
+         cache_key += f"_{last_entity.replace(' ', '_')}"
+         
     cached = cache.get_json("analysis", cache_key)
     if cached: return cached
 
     template = f"""
-    Analiza la intención del usuario. Query: "{query}"
+    Eres el Router Maestro de un asistente gastronómico de Neuquén.
+    Analiza la query: "{query}"
+    Contexto previo: Hablábamos de "{last_entity if last_entity else 'Ninguno'}"
     
-    1. SEGURIDAD:
-       - Si es sexual/insulto -> "BLOCK".
-       - Excepciones: Comida/Infantil es seguro.
+    Determina la INTENCIÓN y extrae los datos:
     
-    2. CLASIFICACIÓN: "PRODUCTO" (Pizza) o "VIBE" (Pelotero, Romántico).
+    1. CATEGORÍAS DE INTENCIÓN:
+       - "BLOCK": Insultos o contenido sexual.
+       - "STATS": Preguntas de conteo ("cuántos...", "total de...").
+       - "SPECIFIC": El usuario pregunta por un LUGAR ESPECÍFICO por su nombre (ej: "Que onda Atila?", "Donde queda El Tío?").
+       - "FOLLOWUP": El usuario sigue preguntando sobre el lugar anterior (ej: "y los precios?", "tiene cochera?").
+       - "RECOMMENDATION": El usuario busca opciones por tipo, producto o vibra (ej: "bares", "pasteleria en el rio", "lugares con juegos").
     
-    3. EXTRAER KEYWORDS Y SINÓNIMOS (CRÍTICO):
-       - "keywords": La palabra exacta buscada (singular).
-       - "synonyms": Lista de 3 o 4 palabras relacionadas.
-       
-    4. UBICACIÓN GEOGRÁFICA (MUY IMPORTANTE):
-       - "donde": Extraer la zona/barrio si el usuario lo menciona.
-       - Patrones comunes: "en el X", "zona X", "cerca del X", "del X".
-       
-       EJEMPLOS CRÍTICOS:
-       - "bares en el rio" -> donde: "rio"
-       - "pizzerias en el centro" -> donde: "centro"
-       - "hamburgueserias en el alto" -> donde: "alto"
-       - "bares zona oeste" -> donde: "oeste"
-       - "lugares en la costa" -> donde: "rio"
-       - "mejores pizzas" -> donde: null (sin ubicación)
+    2. REGLA DE ORO:
+       - Si el usuario menciona una categoría (pastelería, bar, parrilla) junto a una ubicación -> Es RECOMMENDATION.
+       - Si el usuario menciona un NOMBRE PROPIO de un local -> Es SPECIFIC.
+       - "pasteleria en el rio" -> RECOMMENDATION (Busca el producto, no un local llamado 'Pasteleria').
+       - "Que onda Pasteleria Najuian?" -> SPECIFIC.
     
-    Responde SOLO JSON válido:
+    Responde SOLO JSON:
     {{
-        "tipo": "VIBE", 
+        "intencion": "RECOMMENDATION",
+        "tipo": "PRODUCTO", 
+        "target_name": null,
         "keywords": ["bar"], 
         "synonyms": ["cerveceria", "pub"],
         "donde": "rio"
     }}
     
-    Si NO hay ubicación, "donde" debe ser null.
+    Campos:
+    - "target_name": Solo si es SPECIFIC, pon el nombre del lugar limpio.
+    - "donde": La zona detectada (rio, centro, alto, oeste, etc) o null.
+    - "keywords": La palabra clave principal (singular).
     """
     try:
         res = await llm.ainvoke(template)
         clean = res.content.strip().replace("```json", "").replace("```", "")
         data = json.loads(clean)
         
-        # Si entró por bypass, forzamos VIBE aunque el LLM diga BLOCK
-        if is_safe_bypass and data.get("tipo") == "BLOCK":
-            data["tipo"] = "VIBE"
+        if is_safe_bypass and data.get("intencion") == "BLOCK":
+            data["intencion"] = "RECOMMENDATION"
 
         if 'synonyms' not in data: data['synonyms'] = []
         
         cache.set_json("analysis", cache_key, data)
         return data
     except: 
-        # Fallback básico
-        return {"tipo": "VIBE", "keywords": [q_lower], "synonyms": []}
+        return {"intencion": "RECOMMENDATION", "tipo": "VIBE", "keywords": [q_lower], "synonyms": []}
 
 def detectar_mencion_exacta(query, df):
     """
@@ -1083,9 +1084,10 @@ def detectar_mencion_exacta(query, df):
     rec_keywords = ["mejores", "mejor", "top", "rank", "ranking", "recomendame", "recomenda", 
                    "busco", "lugar para", "lugares para", "donde comer", "donde cenar", "donde ir", 
                    "lugares con", "lugares de", "bares en", "restaurantes en", "opciones", "opcion", "algo con",
+                   "pasteleria en", "pastelerias en", "panaderia en", "panaderias en",
                    # Patrones de zona que indican recomendación
-                   "en el oeste", "en el centro", "en el alto", "en el norte", "en el sur",
-                   "cerca del rio", "cerca del río", "cerca del paseo", "en la costa"]
+                   "en el oeste", "en el centro", "en el alto", "en el norte", "en el sur", "en el rio", "en el río",
+                   "cerca del rio", "cerca del río", "cerca del paseo", "en la costa", "zona rio", "zona río"]
     
     if any(kw in q_norm for kw in rec_keywords):
         print(f"[DEBUG] 🛡️ Heuristic blocked Exact Match: Detected recommendation intent in '{query}'", flush=True)
@@ -1094,7 +1096,8 @@ def detectar_mencion_exacta(query, df):
     venue_prefixes = {
         "restaurante", "parrilla", "bar", "confiteria", "pizzeria", "bodegon", 
         "cerveceria", "hamburgueseria", "heladeria", "cafe", "bistro", "resto", 
-        "rotiseria", "panaderia", "sushi", "casa", "local", "negocio"
+        "rotiseria", "panaderia", "pasteleria", "sushi", "casa", "local", "negocio",
+        "fabrica", "elaboracion", "reposteria"
     }
     
     stopwords = {"el", "la", "los", "las", "de", "del", "lo", "al", "y", "en", "que", "qué", "tal", "como", "es", "onda", "son",
@@ -1106,7 +1109,8 @@ def detectar_mencion_exacta(query, df):
         "helado", "helados", "heladeria", "heladerias", "crema", "cremas", 
         "birra", "cerveza", "cervezas", "birra", "birras", "cafe", "café", "parrilla", "pasta", 
         "pastas", "milanesa", "milanesas", "ensalada", "comida", "postre", 
-        "postres", "resto", "bar", "almuerzo", "cena", "menu",
+        "postres", "resto", "bar", "almuerzo", "cena", "menu", "pasteleria", "pastelerias",
+        "panaderia", "panaderias", "reposteria", "confiteria", 
         "para", "con", "donde", # Safety extra
         "tacc", "celiaco", "celiacos", "vegano", "vegana", "vegetariano"
     }
@@ -1150,60 +1154,7 @@ def detectar_mencion_exacta(query, df):
                     
     return None
 
-# Agregá "last_entity=None" en los argumentos
-async def clasificar_intencion(query, llm, last_entity=None): 
-    """
-    Router Inteligente V2 (Corregido para aceptar last_entity)
-    """
-    
-    system_prompt = """
-    Eres el cerebro clasificador de un asistente gastronómico.
-    Analiza la frase del usuario y clasifícala en UNA de estas 5 categorías.
-    
-    PRIORIDAD 1: BLOCK (Seguridad y Ofensas)
-    - Si la frase contiene INSULTOS, agresiones, palabras obscenas o falta de respeto directa.
-    - Ejemplos: "pelotudo", "bobo", "andate a cagar", "hijo de p*", "chupala", "idiota".
-    
-    PRIORIDAD 2: STATS (Estadísticas)
-    - Preguntas explícitas sobre CANTIDADES o CONTEOS.
-    - Clave: Empieza con "Cuantos", "Total de", "Numero de", "Que cantidad".
-    
-    PRIORIDAD 3: SPECIFIC (Info puntual)
-    - Preguntas sobre un lugar específico por su nombre (PRIMERA VEZ).
-    - Ejemplos: "Que opinas de Saluzzo?", "Que tal es Growler?", "Donde queda Rancho Grande?".
-    
-    PRIORIDAD 3.5: FOLLOWUP (Seguimiento)
-    - Preguntas específicas sobre el lugar del que YA estamos hablando.
-    - Ejemplos: "Y los precios?", "Como es el ambiente?", "Tienen opciones veganas?", "Donde queda exactamente?".
-    - CLAVE: El usuario asume que ya sabes de qué lugar habla.
-    
-    PRIORIDAD 4: RECOMMENDATION (Búsqueda)
-    - Busca opciones para comer o lugares con características, SIN un lugar específico en mente.
-    - Ejemplos: "mejores cervecerías", "mejores helados", "Lugares con pelotero", "Quiero sushi", "Parrilla barata".
-    
-    PRIORIDAD 5: GENERAL (Charla y Otros)
-    - Saludos, agradecimientos, incoherencias o temas off-topic.
-    
-    Responde SOLO la palabra de la categoría (ej: BLOCK).
-    """
-    
-    try:
-        # Usamos last_entity en el prompt si existe, ayuda al contexto
-        context_str = f" (Contexto previo: Hablábamos de {last_entity})" if last_entity else ""
-        
-        res = await llm.ainvoke(system_prompt + f"\nQUERY USUARIO: '{query}'{context_str}")
-        intencion = res.content.strip().upper().replace('"', '').replace('.', '')
-        
-        validos = ["BLOCK", "STATS", "SPECIFIC", "RECOMMENDATION", "GENERAL", "FOLLOWUP"]
-        
-        for v in validos:
-            if v in intencion: return v
-            
-        return "GENERAL"
-        
-    except Exception as e:
-        logger.error(f"Error Router: {e}")
-        return "GENERAL"
+# Función eliminada - integrada en analizar_query_semantica
     
 async def consultar_estadisticas(query, df, llm):
     """
@@ -1763,97 +1714,24 @@ async def procesar_consulta_gen(query, df, vectorstore, llm_mini, llm_smart, ctx
         return
 
     # ==========================================
-    # 3. SMART ROUTING (EL CEREBRO V8)
+    # 3. SMART ROUTING (EL CEREBRO V9 - LLM MASTER ROUTER)
     # ==========================================
     last_ent = ctx.get('last_entity')
     
-    # OVERRIDE: Si detectamos mención explícita, forzamos SPECIFIC_INFO
-    # Esto evita que el router se confunda con preguntas cortas como "Y Atila?" -> GENERAL
-    forced_entity = detectar_mencion_exacta(query, df)
+    # Única llamada al cerebro para clasificar y extraer datos
+    analisis = await analizar_query_semantica(query, llm_smart, last_entity=last_ent)
+    intencion = analisis.get("intencion", "RECOMMENDATION")
     
-    # IMPROVED: Deep Fuzzy Check using RapidFuzz
-    # This catches "Vikingos" -> "VIKINGS PIZZERIA" even if strict substring fails.
-    if not forced_entity:
-        # HEURISTIC: Skip fuzzy override if query looks like a recommendation request
-        recommendation_keywords = [
-            "mejores", "mejor", "top", "rank", "ranking", "recomendame", "recomenda", "busco", 
-            "lugar para", "donde comer", "donde cenar", "donde ir", 
-            "lugares en", "bares en", "restaurantes en",
-            # Patrones de zona (el Zone Safety Check cubre el resto)
-            "en el oeste", "en el centro", "en el alto", "en el norte", "en el sur",
-            "en la costa", "cerca del rio", "cerca del río", "cerca del paseo",
-            "en el", "en la", "cerca de", "zona de"
-        ]
-        is_recommendation = any(kw in query.lower() for kw in recommendation_keywords)
-
-        # Extra Check: Regex for "Category en/cerca de Zone" pattern
-        # This catches "bares cerca del rio" even if "cerca del" isn't in keywords exactly
-        import re
-        category_location_pattern = re.search(r"\b(en|cerca)\b\s+(el|la|los|las|de|del)?\s*\b(alto|centro|rio|río|costa|paseo|oeste|sur|norte)\b", query.lower())
-        if category_location_pattern:
-            is_recommendation = True
-            print(f"[DEBUG] 🛡️ Regex Protection: Detected Location Pattern '{category_location_pattern.group()}' -> Forcing RECOMMENDATION", flush=True)
-
-        if not is_recommendation:
-            candidates = df['restaurante'].unique().tolist()
-            # Use token_set_ratio to handle "Vikingos" vs "VIKINGS PIZZERIA" (Partial overlap is good)
-            # score_cutoff=85 allows some typo tolerance.
-            match = process.extractOne(query, candidates, scorer=fuzz.token_set_ratio, score_cutoff=85)
-            
-            # Extra safety: If match is found, check token_sort_ratio too (stricter) 
-            # or ensure length similarity to avoid "Oeste" matching "mejores bares en el oeste"
-            if match:
-                candidate_name = match[0]
-                score = match[1]
-                
-                # Length Safety Check: If candidate name is very short compared to query, it might be a false positive substring
-                # e.g. Query: "mejores bares en el oeste" (25 chars) vs Candidate: "Oeste" (5 chars) -> Ratio ~0.2
-                # But valid: "mcdonalds" (9) vs "McDonald's" (10) -> Ratio ~0.9
-                len_ratio = len(candidate_name) / len(query)
-                
-                # NEW: Zone Word Safety Check
-                # Si el candidato contiene una palabra de zona Y la query también la menciona,
-                # probablemente es un falso positivo (ej: "cervecerias en el oeste" -> "Aripo Oeste")
-                zone_words = {"oeste", "centro", "norte", "sur", "alto", "costa", "rio", "río", "paseo", "este"}
-                candidate_lower = candidate_name.lower()
-                query_lower = query.lower()
-                
-                zone_match_rejected = False
-                for zone in zone_words:
-                    # Si la zona aparece en el candidato Y en la query
-                    if zone in candidate_lower and zone in query_lower:
-                        # Y el candidato NO es SOLO la zona (tiene más palabras)
-                        # Ej: "Aripo Oeste" contiene "oeste" y query contiene "oeste" -> rechazar
-                        # Pero "Oeste Bar" donde query es "oeste" -> podría ser válido
-                        if len(candidate_name.split()) > 1:  # Tiene múltiples palabras
-                            zone_match_rejected = True
-                            print(f"[DEBUG] ⚠️ Zone Safety: '{candidate_name}' rejected because it contains zone word '{zone}' that's also in query", flush=True)
-                            break
-                
-                if zone_match_rejected:
-                    pass  # No asignar forced_entity
-                elif len_ratio > 0.4 or score > 95: # Allow low ratio ONLY if score is near perfect (e.g. exact match inside text)
-                     forced_entity = candidate_name
-                     print(f"[DEBUG] 🕵️ Fuzzy Override: '{query}' -> '{forced_entity}' (Score: {score}, LenRatio: {len_ratio:.2f})", flush=True)
-                else:
-                     print(f"[DEBUG] ⚠️ Fuzzy Match rejected by heuristic: '{query}' -> '{candidate_name}' (Score: {score}, LenRatio: {len_ratio:.2f})", flush=True)
-        else:
-             print(f"[DEBUG] 🛡️ Heuristic blocked Fuzzy Override: Detected recommendation intent in '{query}'", flush=True)
-
-    if forced_entity:
-        intencion = "SPECIFIC_INFO"
-        print(f"[DEBUG] 🚀 Router Override: Detectado '{forced_entity}' -> Forzando modo SPECIFIC_INFO", flush=True)
-    elif is_recommendation:
-        intencion = "RECOMMENDATION"
-        print(f"[DEBUG] 🧪 Heuristic Force: Recommendation keywords found -> Forzando modo RECOMMENDATION", flush=True)
-    else:
-        # Use llm_mini for faster routing (Routing doesn't need GPT-4o typically)
-        intencion = await clasificar_intencion(query, llm_mini, last_entity=last_ent)
+    # Extraer datos del análisis para los caminos posteriores
+    keywords = analisis.get("keywords", [])
+    synonyms = analisis.get("synonyms", [])
+    zona_detectada = analisis.get("donde")
+    target_forced = analisis.get("target_name") # Si es SPECIFIC, el LLM nos da el nombre
     
-    # Ajuste de compatibilidad
+    # Ajuste de compatibilidad de nombres de intención
     if intencion == "SPECIFIC": intencion = "SPECIFIC_INFO"
     
-    yield {"type": "debug", "message": f"🧠 INTENCIÓN: {intencion}"}
+    yield {"type": "debug", "message": f"🧠 INTENCIÓN: {intencion} | Zona: {zona_detectada}"}
 
     # --- CAMINO A: ESTADÍSTICAS ---
     if intencion == "STATS":
@@ -1903,55 +1781,27 @@ async def procesar_consulta_gen(query, df, vectorstore, llm_mini, llm_smart, ctx
         found_valid_content = False
         target = None
         
-        # BUG FIX: Prioritize detecting NEW entity in the query over the previous one.
-        # Check if query mentions a known place
-        nuevo_candidato = detectar_mencion_exacta(query, df)
-        
-        target = None
-        
-        if nuevo_candidato:
-            # User mentioned a specific place explicitly
-            target = nuevo_candidato
-            ctx['last_entity'] = target 
+        # PRIORIDAD 1: Usar el target_name que el LLM detectó (es el más inteligente)
+        if target_forced:
+             # Normalizamos contra el DF por si el LLM typoed (aunque Atila -> Atila suele venir bien)
+             match_exacto = detectar_mencion_exacta(target_forced, df)
+             target = match_exacto if match_exacto else target_forced
+             print(f"[DEBUG] 🎯 Target desde LLM: '{target_forced}' -> Resolvido: '{target}'", flush=True)
         else:
-            # AGGRESSIVE SEARCH via RapidFuzz (Best in Class)
-            # Replaces manual loop. Matches "Vikingos" to "VIKINGS PIZZERIA".
-            candidates = df['restaurante'].unique().tolist()
-            match = process.extractOne(query, candidates, scorer=fuzz.token_set_ratio, score_cutoff=85)
-            
-            match_fuzzy = match[0] if match else None
-            
-            if match_fuzzy:
-                target = match_fuzzy
-                ctx['last_entity'] = target
-            elif ctx.get('last_entity'):
-                # Consult LLM to determine if we act on last_entity or new target
-                # This handles "Y el precio?" (Keep) vs "Que onda Elaskar?" (Switch) robustly.
-                resolved_target = await resolver_target_con_llm(query, ctx.get('last_entity'), llm_mini)
-                
-                if resolved_target == "NONE" or not resolved_target:
-                     target = query # Treat as generic specific query
-                else:
-                     target = resolved_target
-                     if target != ctx.get('last_entity'):
-                         # Detected context switch to new (possibly unknown) entity
-                         ctx['last_entity'] = target
-            else:
-                 target = query
-
-        # Resolve target normalization (redundant if nuevo_candidato found, but safe)
-        if target:
-            nombre_candidato = detectar_mencion_exacta(target, df)
-            if nombre_candidato: target = nombre_candidato
-            else:
-                # Last resort fuzzy check if target comes from query string
-                mask = df['restaurante'].str.lower().str.contains(target.lower().strip(), na=False, regex=False)
-                if mask.any(): pass 
-                else: 
-                     # If target was just 'query' and didn't match anything...
-                     # and we have NO last_entity, we might be lost.
-                     # But if we had last_entity and logic dropped here?
-                     pass
+             # FALLBACK: Si el LLM dijo SPECIFIC pero no dio nombre (raro), o para mayor seguridad:
+             nuevo_candidato = detectar_mencion_exacta(query, df)
+             if nuevo_candidato:
+                 target = nuevo_candidato
+             else:
+                 # Fuzzy RapidFuzz
+                 candidates = df['restaurante'].unique().tolist()
+                 match = process.extractOne(query, candidates, scorer=fuzz.token_set_ratio, score_cutoff=85)
+                 if match:
+                     target = match[0]
+                 elif ctx.get('last_entity'):
+                     target = await resolver_target_con_llm(query, ctx.get('last_entity'), llm_mini)
+                 else:
+                     target = query
 
         if target:
             match_exists = True # Assume true if we resolved it or came from context
@@ -2023,16 +1873,12 @@ async def procesar_consulta_gen(query, df, vectorstore, llm_mini, llm_smart, ctx
             if var in ctx: del ctx[var]
 
         try:
-            analisis = await analizar_query_semantica(query, llm_smart)
-            if analisis.get("tipo") == "BLOCK":
+            if analisis.get("intencion") == "BLOCK":
                 ctx['strikes'] = strikes + 1
                 yield {"type": "meta", "mode": "rag"}
                 yield {"type": "token", "content": f"Epa, esa búsqueda no va. ({strikes+1}/5)"}
                 return
 
-            keywords = analisis.get("keywords", [])
-            synonyms = analisis.get("synonyms", [])
-            zona_detectada = analisis.get("donde")
             print(f"[DEBUG] 📍 Zona detectada por LLM: '{zona_detectada}'", flush=True)
             
             # --- DETECCIÓN DE CATEGORÍAS GENÉRICAS ---
