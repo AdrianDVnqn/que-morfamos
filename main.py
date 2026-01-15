@@ -1923,6 +1923,7 @@ async def procesar_consulta_gen(query, df, vectorstore, llm_mini, llm_smart, ctx
             keywords = analisis.get("keywords", [])
             synonyms = analisis.get("synonyms", [])
             zona_detectada = analisis.get("donde")
+            print(f"[DEBUG] 📍 Zona detectada por LLM: '{zona_detectada}'", flush=True)
 
             t_vec_start = time.time()
             # Optimization: Increased k to 50 to allow popular places (high reviews) to surface 
