@@ -2065,9 +2065,24 @@ async def procesar_consulta_gen(query, df, vectorstore, llm_mini, llm_smart, ctx
             candidatos_a_verificar = candidatos_a_verificar[:8]
 
             # 5. EL JUEZ LLM (Verificación de Contexto)
+            # Crear query limpia SIN ubicación para que el Juez solo evalúe el TIPO
+            query_para_juez = query
+            if zona_detectada:
+                # Remover patrones de ubicación de la query
+                ubicacion_patterns = [
+                    r'\s*en\s+(?:el|la)\s+' + re.escape(zona_detectada),
+                    r'\s*zona\s+' + re.escape(zona_detectada),
+                    r'\s*del?\s+' + re.escape(zona_detectada),
+                    r'\s*cerca\s+del?\s+' + re.escape(zona_detectada),
+                ]
+                for pattern in ubicacion_patterns:
+                    query_para_juez = re.sub(pattern, '', query_para_juez, flags=re.IGNORECASE)
+                query_para_juez = query_para_juez.strip()
+                print(f"[DEBUG] 🧹 Query para Juez (sin ubicación): '{query_para_juez}'", flush=True)
+            
             t0 = time.time()
             locales_verificados = await verificar_candidatos_con_llm(
-                candidatos_a_verificar, df, query, llm_mini
+                candidatos_a_verificar, df, query_para_juez, llm_mini
             )
             t1 = time.time()
             print(f"[TIMING] Juez LLM took {t1-t0:.2f}s", flush=True)
