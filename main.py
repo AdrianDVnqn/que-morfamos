@@ -2114,7 +2114,7 @@ async def procesar_consulta_gen(query, df, vectorstore, llm_mini, llm_smart, ctx
             relacionados.sort(key=calculate_weighted_score, reverse=True)
 
             if not exactos and not relacionados:
-                yield {"type": "meta", "mode": "rag", "cards": [], "locs": []}
+                yield {"type": "meta", "mode": "rag", "cards": [], "locs": [], "zona": zona_detectada}
                 yield {"type": "token", "content": "No encontré lugares que cumplan con ese requisito específico."}
                 return
 
@@ -2199,7 +2199,7 @@ async def procesar_consulta_gen(query, df, vectorstore, llm_mini, llm_smart, ctx
             locs = obtener_coordenadas(nombres_finales, df)
             
             # Yield Metadata at the END
-            yield {"type": "meta", "mode": "rag", "cards": cards, "locs": locs}
+            yield {"type": "meta", "mode": "rag", "cards": cards, "locs": locs, "zona": zona_detectada}
             return
 
         except Exception as e:
@@ -2345,6 +2345,7 @@ async def chat_stream(req: QueryRequest, request: Request):
         cards = []
         locs = []
         pend = None
+        zona = None
         
         try:
             async for event in procesar_consulta_gen(req.query, df, vectorstore, llm_mini, llm_smart, ctx, user_ip=client_ip):
@@ -2359,6 +2360,7 @@ async def chat_stream(req: QueryRequest, request: Request):
                         event["cards"] = [c.model_dump() if hasattr(c, 'model_dump') else c.dict() for c in cards]
                     if "locs" in event: locs = event["locs"]
                     if "pending" in event: pend = event["pending"]
+                    if "zona" in event: zona = event["zona"]
                 
                 # Encode and yield
                 yield json.dumps(event, ensure_ascii=False) + "\n"
@@ -2398,7 +2400,8 @@ async def chat_stream(req: QueryRequest, request: Request):
             used_cache=False,
             ai_provider=ai_provider,
             context_info=ctx,
-            strikes=ctx.get('strikes', 0)
+            strikes=ctx.get('strikes', 0),
+            zona_detectada=zona
         ))
         
     return StreamingResponse(event_generator(), media_type="application/x-ndjson")
