@@ -1454,11 +1454,16 @@ async def verificar_candidatos_con_llm(candidatos, df, query, llm):
     Analiza la EVIDENCIA de los locales y decide cuáles aprobar.
     
     REGLAS CRÍTICAS:
-    1. APROBAR solo si la evidencia CONFIRMA explícitamente que TIENE lo que se pide.
-    2. RECHAZAR OBLIGATORIAMENTE si dice "NO hay", "NO tiene", "Falta", "Pocas opciones", "No encontramos".
-    3. CUIDADO con dietas (vegano, celíaco, sin tacc): Si la reseña dice "No hay opciones veganas", DEBES ELIMINARLO.
-    4. REGLA DE ZONA/NOMBRE: Si la query pide una zona específica (ej: "Este", "Centro") y el NOMBRE del local indica explícitamente la contraria (ej: "Oeste", "Sur"), ELIMINARLO salvo que la evidencia confirme que TIENE sucursalen la zona pedida.
-    5. Si la evidencia es vaga o irrelevante para la query, ELIMINAR.
+    1. APROBAR si la evidencia confirma que el lugar ES DEL TIPO solicitado (bar, pizzería, etc.).
+    2. RECHAZAR si dice "NO hay", "NO tiene", "Falta" respecto al PRODUCTO o SERVICIO buscado.
+    3. CUIDADO con dietas (vegano, celíaco, sin tacc): Si la reseña dice "No hay opciones veganas", eliminarlo.
+    
+    ⚠️ IMPORTANTE - IGNORA LA UBICACIÓN:
+    - NO evalúes si el lugar está "en el río", "en el centro", etc.
+    - La ubicación YA fue filtrada antes. Tu trabajo es SOLO verificar el TIPO de lugar.
+    - Ejemplo: "bares en el rio" -> Solo evalúa si ES un bar/cervecería. NO busques evidencia de "río".
+    
+    4. Si la evidencia es vaga o irrelevante para el TIPO de lugar, ELIMINAR.
     
     CANDIDATOS A ANALIZAR:
     {texto_validacion}
