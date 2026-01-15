@@ -1482,14 +1482,22 @@ def aplicar_filtro_zona(candidatos, df, zona_buscada):
     search_terms = [z_clean]
     
     # Si busca "rio", "paseo" o "costa", ampliamos la búsqueda
-    if any(x in z_clean for x in ["rio", "río", "paseo", "costa", "limay"]):
-        search_terms.extend(["rio", "paseo de la costa", "limay", "balneario"])
+    if any(x in z_clean for x in ["rio", "río", "paseo", "costa", "limay", "isla"]):
+        # Agregamos términos clave que suelen aparecer en direcciones o zonas cercanas al río
+        search_terms.extend([
+            "rio", "río", "limay", "balneario", 
+            "paseo", "costa", "costanera", "ribera",
+            "isla", "132", "isla 132", "sur" # Muchas veces el río se asocia con zona Sur
+        ])
         
     if "alto" in z_clean or "norte" in z_clean:
-         search_terms.extend(["alto", "norte", "barda"])
+         search_terms.extend(["alto", "norte", "barda", "parque industrial", "terrazas"])
          
     if "centro" in z_clean:
-         search_terms.append("centro") # Redundant but safe
+         search_terms.extend(["centro", "bajo"]) # Centro y Bajo a veces se solapan
+    
+    if "oeste" in z_clean:
+         search_terms.extend(["oeste", "aeropuerto", "canal"])
 
     candidatos_filtrados = []
     
