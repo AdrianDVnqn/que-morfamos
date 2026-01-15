@@ -511,7 +511,8 @@ async def log_user_query_to_discord(
     used_cache: bool = False,
     ai_provider: str = None,
     context_info: dict = None,
-    strikes: int = 0
+    strikes: int = 0,
+    zona_detectada: str = None
 ) -> None:
     try:
         dt = datetime.now(ZoneInfo("America/Argentina/Buenos_Aires"))
@@ -535,9 +536,12 @@ async def log_user_query_to_discord(
     if location['city']:
         loc_str += f" ({location['city']})"
 
-    # Mensaje Discord (compacto, solo info clave)
+    # Mensaje Discord (compacto, query primero)
+    zona_str = zona_detectada.title() if zona_detectada else "Todo Neuquén"
+    
     discord_parts = [
-        "📝 **Nueva consulta**",
+        f"💬 **{q}**",  # Query PRIMERO y destacada
+        f"🗺️ Zona: {zona_str}",
         f"🕒 {ts}",
         f"📍 {loc_str}",
         f"{ua_info['device']} {ua_info['browser']} ({ua_info['os']})",
@@ -556,8 +560,6 @@ async def log_user_query_to_discord(
         if len(restaurants) > 3:
             rest_str += f" (+{len(restaurants)-3} más)"
         discord_parts.append(f"🏪 {rest_str}")
-    
-    discord_parts.append(f"💬 {q}")
     
     content = "\n".join(discord_parts)
     await _send_discord_webhook(content)
