@@ -1,0 +1,111 @@
+[
+    {
+        "id": "zona_rio",
+        "query": "bares en el rio",
+        "type": "zone_match",
+        "expected_zones": [
+            "paseo de la costa",
+            "rio",
+            "isla 132",
+            "ribera",
+            "costa"
+        ],
+        "min_results": 1,
+        "sql_where": "zona ILIKE '%centro sur%' OR barrio ILIKE '%costa%' OR direccion ILIKE '%rio%'"
+    },
+    {
+        "id": "zona_oeste",
+        "query": "cervecerias en el oeste",
+        "type": "zone_match",
+        "expected_zones": [
+            "oeste",
+            "aeropuerto",
+            "canal",
+            "san lorenzo"
+        ],
+        "min_results": 2,
+        "sql_where": "zona ILIKE '%oeste%' AND (nombre ILIKE '%cerveza%' OR nombre ILIKE '%cerveceria%' OR nombre ILIKE '%birra%')"
+    },
+    {
+        "id": "combo_merienda_alto",
+        "query": "merienda en el alto",
+        "type": "zone_match",
+        "expected_zones": [
+            "alto",
+            "norte",
+            "barda",
+            "parque industrial"
+        ],
+        "min_results": 2,
+        "sql_where": "(zona ILIKE '%alto%' OR zona ILIKE '%norte%') AND (nombre ILIKE '%cafe%' OR nombre ILIKE '%confiteria%')"
+    },
+    {
+        "id": "combo_parrilla_centro",
+        "query": "parrilla en el centro",
+        "type": "zone_match",
+        "expected_zones": [
+            "centro",
+            "bajo",
+            "area centro"
+        ],
+        "min_results": 3,
+        "sql_where": "zona ILIKE '%centro%' AND (nombre ILIKE '%parrilla%' OR nombre ILIKE '%asado%')"
+    },
+    {
+        "id": "plato_milanesas",
+        "query": "donde comer buenas milanesas",
+        "type": "keyword_match",
+        "expected_keywords": [
+            "milanesa",
+            "bodegon",
+            "casera"
+        ],
+        "min_results": 3,
+        "sql_where": "nombre ILIKE '%bodegon%' OR nombre ILIKE '%milanesa%' OR nombre ILIKE '%club%'"
+    },
+    {
+        "id": "feature_pelotero",
+        "query": "lugares con pelotero para chicos",
+        "type": "keyword_match",
+        "expected_keywords": [
+            "pelotero",
+            "juegos",
+            "niños",
+            "infantil"
+        ],
+        "min_results": 2,
+        "sql_where": "nombre ILIKE '%pelotero%' OR nombre ILIKE '%tierra de indios%' OR nombre ILIKE '%kronos%'"
+    },
+    {
+        "id": "feature_sintacc",
+        "query": "opciones sin tacc",
+        "type": "keyword_match",
+        "expected_keywords": [
+            "sin tacc",
+            "celiaco",
+            "gluten",
+            "libres de gluten"
+        ],
+        "min_results": 2,
+        "sql_where": "nombre ILIKE '%sintacc%' OR nombre ILIKE '%celiaco%' OR nombre ILIKE '%gluten%' OR nombre ILIKE '%natural%'"
+    },
+    {
+        "id": "producto_sushi",
+        "query": "donde comer sushi",
+        "type": "keyword_match",
+        "expected_keywords": [
+            "sushi",
+            "asiatica",
+            "rolls"
+        ],
+        "min_results": 3,
+        "sql_where": "nombre ILIKE '%sushi%' OR nombre ILIKE '%wok%'"
+    },
+    {
+        "id": "lugar_especifico",
+        "query": "Growler Bar",
+        "type": "exact_match",
+        "expected_name": "Growler Bar",
+        "min_results": 1
+    }
+]

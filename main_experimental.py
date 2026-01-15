@@ -431,11 +431,9 @@ async def get_ip_location(ip: str) -> dict:
         logger.info(f"🌍 Consultando geolocalización para IP: {ip}")
         
         def _fetch_sync():
-            # Fix V2: URL correcta validada con Curl
-            url = f"https://theipapi.com/v1/ip/{ip}?api_key={THEIPAPI_KEY}"
+            url = f"https://api.theipapi.com/v1/{ip}?apiKey={THEIPAPI_KEY}"
             logger.info(f"📡 Consultando theipapi.com")
-            # Headers mínimos necesarios, a veces User-Agent genérico ayuda
-            req = urllib.request.Request(url, headers={"User-Agent": "curl/7.68.0"}) 
+            req = urllib.request.Request(url, headers={"User-Agent": "QueMorfamosBot/1.0"})
             with urllib.request.urlopen(req, timeout=5) as resp:
                 raw = resp.read().decode('utf-8')
                 logger.info(f"📥 Respuesta API: {raw[:200]}...")  # Log truncado
