@@ -96,6 +96,7 @@ cache = RedisCacheManager(UPSTASH_REDIS_REST_URL, UPSTASH_REDIS_REST_TOKEN)
 
 # Variables globales
 df = None
+df_lugares = None
 vectorstore = None
 llm_mini = None  
 llm_smart = None 
@@ -166,7 +167,7 @@ KEYWORD_TO_CATEGORIES = {
 # ==========================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global df, vectorstore, llm_mini, llm_smart
+    global df, df_lugares, vectorstore, llm_mini, llm_smart
     logger.info("☁️ Iniciando servidor (Lifespan v6.8)...")
     
     # Notificar activación del backend
@@ -179,19 +180,26 @@ async def lifespan(app: FastAPI):
         try:
             engine = create_engine(DATABASE_URL)
             
-            # Cargar reviews con datos del lugar (JOIN)
-            query = """
-                SELECT 
-                    r.restaurante, r.autor, r.rating_user, r.texto, 
-                    r.fecha_aproximada as fecha, r.review_id,
-                    l.rating_gral, l.total_reviews_google, l.direccion,
-                    l.latitud, l.longitud, l.barrio, l.zona, l.categoria,
-                    l.resumen_reviews
-                FROM reviews r
-                LEFT JOIN lugares l ON r.restaurante = l.nombre
+            # 1. Cargar REVIEWS (Tabla ligera, solo lo necesario para búsqueda)
+            query_revs = """
+                SELECT restaurante, autor, rating_user, texto, fecha_aproximada as fecha, review_id
+                FROM reviews
             """
-            df = pd.read_sql(query, engine)
-            logger.info(f"📊 Datos cargados desde PostgreSQL: {len(df)} filas")
+            df = pd.read_sql(query_revs, engine)
+            logger.info(f"📊 Reseñas cargadas: {len(df)} filas")
+
+            # 2. Cargar LUGARES (Una fila por lugar, incluye resumen pesado)
+            query_lugares = """
+                SELECT nombre as restaurante, rating_gral, total_reviews_google, direccion,
+                       latitud, longitud, barrio, zona, categoria, resumen_reviews
+                FROM lugares
+            """
+            df_lugares = pd.read_sql(query_lugares, engine)
+            logger.info(f"📊 Lugares cargados: {len(df_lugares)} locales")
+
+            # Combinar datos mínimos en DF de reviews para filtros rápidos de zona/cat
+            # Pero SIN el resumen_reviews que es el que pesa
+            df = df.merge(df_lugares.drop(columns=['resumen_reviews']), on='restaurante', how='left')
             
             cols = ['restaurante', 'texto', 'direccion', 'barrio', 'zona', 'autor', 'fecha']
             for col in cols:
@@ -199,17 +207,13 @@ async def lifespan(app: FastAPI):
                     df.loc[:, col] = df[col].fillna("").astype(str).str.strip()
             
             # --- FILTRO TEMPORAL: Solo Neuquén Capital (Q8300/1/2) ---
-            # El usuario pidió excluir Cipolletti/San Martín.
             mask_neuquen = df['direccion'].str.contains('Q8300|Q8301|Q8302', case=False, na=False)
             df = df[mask_neuquen]
-            logger.info(f"📊 Datos filtrados (Solo Neuquén): {len(df)} filas")
             
-            # Convertir rating_gral (puede venir como "4,5")
+            # Convertir rating_gral
             if 'rating_gral' in df.columns:
                 df.loc[:, 'rating_gral'] = df['rating_gral'].astype(str).str.replace(',', '.', regex=False)
                 df.loc[:, 'rating_gral'] = pd.to_numeric(df['rating_gral'], errors='coerce').fillna(0.0)
-            else:
-                df['rating_gral'] = 0.0
             
             def _norm(s):
                 if pd.isna(s) or s is None: return ""
@@ -220,7 +224,8 @@ async def lifespan(app: FastAPI):
                 return t
             df.loc[:, 'restaurante_ascii'] = df['restaurante'].apply(_norm)
             df.loc[:, 'texto_ascii'] = df['texto'].apply(_norm)
-            logger.info(f"✅ DataFrame cargado: {len(df)} filas.")
+            
+            logger.info(f"✅ DataFrames listos: {len(df)} reviews en memoria.")
         except Exception as e:
             logger.error(f"❌ Error cargando datos: {e}")
             df = pd.DataFrame()
@@ -2250,28 +2255,35 @@ async def procesar_consulta_gen(query, df, vectorstore, llm_mini, llm_smart, ctx
             todos_los_locales = exactos + relacionados  # Up to 7 cards total
             
             # Helper para el contexto RÁPIDO (usando datos crudos en lugar de esperar a las cards)
-            def construir_contexto_rapido(nombres, df):
+            def construir_contexto_rapido(nombres, df_lugares_ref, df_reviews_ref):
                 contexto = ""
                 for nom in nombres:
-                    mask = df['restaurante'] == nom
-                    if not mask.any(): continue
-                    row = df[mask].iloc[0]
-                    rat = safe_float(row.get('rating_gral'))
-                    revs = safe_int(row.get('total_reviews_google'))
+                    # Datos del lugar (resumen, rating, etc)
+                    mask_l = df_lugares_ref['restaurante'] == nom
+                    if not mask_l.any(): continue
+                    row_l = df_lugares_ref[mask_l].iloc[0]
                     
-                    # Priorizamos el resumen inteligente IA si existe y es válido
-                    resumen_ia = safe_str(row.get('resumen_reviews'))
+                    rat = safe_float(row_l.get('rating_gral'))
+                    revs = safe_int(row_l.get('total_reviews_google'))
+                    
+                    # Priorizamos el resumen inteligente IA
+                    resumen_ia = safe_str(row_l.get('resumen_reviews'))
                     if resumen_ia and len(resumen_ia) > 30:
                         texto_final = resumen_ia[:600].replace("\n", " ")
                     else:
-                        # Fallback a snippet de reseñas si no hay resumen
-                        texto_final = safe_str(row.get('texto', ''))[:400].replace("\n", " ")
+                        # Fallback a snippet de reseñas del DF de reviews si no hay resumen
+                        mask_r = df_reviews_ref['restaurante'] == nom
+                        if mask_r.any():
+                            texto_final = safe_str(df_reviews_ref[mask_r].iloc[0].get('texto', ''))[:400].replace("\n", " ")
+                        else:
+                            texto_final = "No hay descripción disponible."
                     
                     contexto += f"- {nom} ({rat}⭐, {revs} res): {texto_final}...\n"
                 return contexto
 
-            detalles_exactos = construir_contexto_rapido(exactos, df)
-            detalles_relacionados = construir_contexto_rapido(relacionados, df)
+            detalles_exactos = construir_contexto_rapido(exactos, df_lugares, df)
+            detalles_relacionados = construir_contexto_rapido(relacionados, df_lugares, df)
+
             
             # Start background task
             card_task = asyncio.create_task(obtener_restaurant_cards(
