@@ -206,9 +206,12 @@ async def lifespan(app: FastAPI):
                 if col in df.columns:
                     df.loc[:, col] = df[col].fillna("").astype(str).str.strip()
             
-            # --- FILTRO TEMPORAL: Solo Neuquén Capital (Q8300/1/2) ---
-            mask_neuquen = df['direccion'].str.contains('Q8300|Q8301|Q8302', case=False, na=False)
-            df = df[mask_neuquen]
+            # --- FILTRO GEOGRÁFICO: Solo Neuquén Capital ---
+            # Antes era solo por CP (Q8300/1/2), pero Google no siempre lo provee.
+            mask_cp = df['direccion'].str.contains('Q8300|Q8301|Q8302', case=False, na=False)
+            mask_city = df['direccion'].str.contains('Neuquén', case=False, na=False) & \
+                        ~df['direccion'].str.contains('Cipolletti|Plottier|Centenario|Senillosa|Añelo|R8324', case=False, na=False)
+            df = df[mask_cp | mask_city]
             
             # Convertir rating_gral
             if 'rating_gral' in df.columns:
