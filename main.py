@@ -1487,7 +1487,7 @@ def aplicar_filtro_zona(candidatos, df, zona_buscada):
         search_terms.extend([
             "rio", "río", "limay", "balneario", 
             "paseo", "costa", "costanera", "ribera",
-            "isla", "132", "isla 132", "sur" # Muchas veces el río se asocia con zona Sur
+            "isla", "132", "isla 132" 
         ])
         
     if "alto" in z_clean or "norte" in z_clean:
