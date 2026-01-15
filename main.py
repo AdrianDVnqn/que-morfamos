@@ -1528,6 +1528,8 @@ def aplicar_filtro_zona(candidatos, df, zona_buscada):
 
     candidatos_filtrados = []
     
+    print(f"[DEBUG] 🗺️ Filtro de zona activado: '{zona_buscada}' -> terms: {search_terms[:5]}...", flush=True)
+    
     for local in candidatos:
         mask = df['restaurante'] == local
         if not mask.any(): continue
@@ -1543,20 +1545,23 @@ def aplicar_filtro_zona(candidatos, df, zona_buscada):
             # Si el único match es por "río negro" (provincia), NO es zona río
             geo_data_clean = geo_data.replace("río negro", "").replace("rio negro", "")
             if not any(term in geo_data_clean for term in search_terms):
+                print(f"[DEBUG] ❌ Excluido por 'Río Negro' (provincia): {local}", flush=True)
                 continue  # No matchea sin "río negro"
         
         # Chequeamos si CUALQUIERA de los términos buscados está en la data
-        if any(term in geo_data for term in search_terms):
+        matches = [term for term in search_terms if term in geo_data]
+        if matches:
             candidatos_filtrados.append(local)
+            print(f"[DEBUG] ✅ Pasó filtro zona: {local} (match: {matches[:2]})", flush=True)
+        else:
+            print(f"[DEBUG] ❌ NO pasó filtro zona: {local} (geo: {geo_data[:60]}...)", flush=True)
             
     
     # Si el filtro fue muy agresivo y no quedó nadie, devolvemos VACÍO (Hard Filter)
     # Usuario solicitó explícitamente una zona. Si no hay, mejor decir "no hay" que mentir.
     if not candidatos_filtrados:
-        print(f"[DEBUG] ⚠️ Filtro de zona '{zona_buscada}' (terms: {search_terms}) eliminó TODOS los candidatos.", flush=True)
+        print(f"[DEBUG] ⚠️ Filtro de zona '{zona_buscada}' eliminó TODOS los candidatos.", flush=True)
         return []
-        
-    return candidatos_filtrados
         
     return candidatos_filtrados
 
