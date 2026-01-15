@@ -24,6 +24,10 @@ from langchain_core.output_parsers import StrOutputParser
 from upstash_redis import Redis
 from rapidfuzz import process, fuzz
 
+
+
+
+
 # ==========================================
 # 0. CONFIGURACIÓN DE LOGS
 # ==========================================
@@ -225,6 +229,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+
 
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import RedirectResponse, StreamingResponse
@@ -987,6 +994,19 @@ def detectar_mencion_exacta(query, df):
     if df is None or df.empty: return None
     q_norm = query.lower().strip()
     
+    # HEURISTIC SAFEGUARD: Si la query pide recomendación explícita, NO buscamos match exacto/parcial.
+    # Esto previene que "mejores bares en el oeste" matchee con el lugar "Oeste".
+    rec_keywords = ["mejores", "mejor", "top", "rank", "ranking", "recomendame", "recomenda", 
+                   "busco", "lugar para", "donde comer", "donde cenar", "donde ir", 
+                   "lugares en", "bares en", "restaurantes en",
+                   # Patrones de zona que indican recomendación
+                   "en el oeste", "en el centro", "en el alto", "en el norte", "en el sur",
+                   "cerca del rio", "cerca del río", "cerca del paseo", "en la costa"]
+    
+    if any(kw in q_norm for kw in rec_keywords):
+        print(f"[DEBUG] 🛡️ Heuristic blocked Exact Match: Detected recommendation intent in '{query}'", flush=True)
+        return None
+    
     venue_prefixes = {
         "restaurante", "parrilla", "bar", "confiteria", "pizzeria", "bodegon", 
         "cerveceria", "hamburgueseria", "heladeria", "cafe", "bistro", "resto", 
@@ -1422,7 +1442,8 @@ async def verificar_candidatos_con_llm(candidatos, df, query, llm):
     1. APROBAR solo si la evidencia CONFIRMA explícitamente que TIENE lo que se pide.
     2. RECHAZAR OBLIGATORIAMENTE si dice "NO hay", "NO tiene", "Falta", "Pocas opciones", "No encontramos".
     3. CUIDADO con dietas (vegano, celíaco, sin tacc): Si la reseña dice "No hay opciones veganas", DEBES ELIMINARLO.
-    4. Si la evidencia es vaga o irrelevante para la query, ELIMINAR.
+    4. REGLA DE ZONA/NOMBRE: Si la query pide una zona específica (ej: "Este", "Centro") y el NOMBRE del local indica explícitamente la contraria (ej: "Oeste", "Sur"), ELIMINARLO salvo que la evidencia confirme que TIENE sucursalen la zona pedida.
+    5. Si la evidencia es vaga o irrelevante para la query, ELIMINAR.
     
     Ejemplos Falsos Positivos (ELIMINAR):
     - Query: "vegano" -> Evidencia: "Preguntamos y no tenían opciones veganas." (ELIMINAR)
@@ -1457,10 +1478,18 @@ def aplicar_filtro_zona(candidatos, df, zona_buscada):
     
     z_clean = zona_buscada.lower().strip()
     
-    # Mapeo de sinónimos comunes de Neuquén (Opcional pero recomendado)
-    if "rio" in z_clean or "paseo" in z_clean: z_clean = "rio"
-    if "alto" in z_clean: z_clean = "alto"
-    # "centro" suele ser tal cual "centro"
+    # Mapeo de sinónimos comunes de Neuquén
+    search_terms = [z_clean]
+    
+    # Si busca "rio", "paseo" o "costa", ampliamos la búsqueda
+    if any(x in z_clean for x in ["rio", "río", "paseo", "costa", "limay"]):
+        search_terms.extend(["rio", "paseo de la costa", "limay", "balneario"])
+        
+    if "alto" in z_clean or "norte" in z_clean:
+         search_terms.extend(["alto", "norte", "barda"])
+         
+    if "centro" in z_clean:
+         search_terms.append("centro") # Redundant but safe
 
     candidatos_filtrados = []
     
@@ -1473,8 +1502,8 @@ def aplicar_filtro_zona(candidatos, df, zona_buscada):
         # Juntamos toda la info geográfica del local en un solo string
         geo_data = f"{safe_str(row.get('zona'))} {safe_str(row.get('barrio'))} {safe_str(row.get('direccion'))}".lower()
         
-        # Chequeamos si la zona buscada está en la data del local
-        if z_clean in geo_data:
+        # Chequeamos si CUALQUIERA de los términos buscados está en la data
+        if any(term in geo_data for term in search_terms):
             candidatos_filtrados.append(local)
             
     
@@ -1600,17 +1629,78 @@ async def procesar_consulta_gen(query, df, vectorstore, llm_mini, llm_smart, ctx
     # IMPROVED: Deep Fuzzy Check using RapidFuzz
     # This catches "Vikingos" -> "VIKINGS PIZZERIA" even if strict substring fails.
     if not forced_entity:
-        candidates = df['restaurante'].unique().tolist()
-        # Use token_set_ratio to handle "Vikingos" vs "VIKINGS PIZZERIA" (Partial overlap is good)
-        # score_cutoff=80 allows some typo tolerance.
-        match = process.extractOne(query, candidates, scorer=fuzz.token_set_ratio, score_cutoff=85)
-        if match:
-             forced_entity = match[0]
-             print(f"[DEBUG] 🕵️ Fuzzy Override: '{query}' -> '{forced_entity}' (Score: {match[1]})", flush=True)
+        # HEURISTIC: Skip fuzzy override if query looks like a recommendation request
+        recommendation_keywords = [
+            "mejores", "mejor", "top", "rank", "ranking", "recomendame", "recomenda", "busco", 
+            "lugar para", "donde comer", "donde cenar", "donde ir", 
+            "lugares en", "bares en", "restaurantes en",
+            # Patrones de zona (el Zone Safety Check cubre el resto)
+            "en el oeste", "en el centro", "en el alto", "en el norte", "en el sur",
+            "en la costa", "cerca del rio", "cerca del río", "cerca del paseo",
+            "en el", "en la", "cerca de", "zona de"
+        ]
+        is_recommendation = any(kw in query.lower() for kw in recommendation_keywords)
+
+        # Extra Check: Regex for "Category en/cerca de Zone" pattern
+        # This catches "bares cerca del rio" even if "cerca del" isn't in keywords exactly
+        import re
+        category_location_pattern = re.search(r"\b(en|cerca)\b\s+(el|la|los|las|de|del)?\s*\b(alto|centro|rio|río|costa|paseo|oeste|sur|norte)\b", query.lower())
+        if category_location_pattern:
+            is_recommendation = True
+            print(f"[DEBUG] 🛡️ Regex Protection: Detected Location Pattern '{category_location_pattern.group()}' -> Forcing RECOMMENDATION", flush=True)
+
+        if not is_recommendation:
+            candidates = df['restaurante'].unique().tolist()
+            # Use token_set_ratio to handle "Vikingos" vs "VIKINGS PIZZERIA" (Partial overlap is good)
+            # score_cutoff=85 allows some typo tolerance.
+            match = process.extractOne(query, candidates, scorer=fuzz.token_set_ratio, score_cutoff=85)
+            
+            # Extra safety: If match is found, check token_sort_ratio too (stricter) 
+            # or ensure length similarity to avoid "Oeste" matching "mejores bares en el oeste"
+            if match:
+                candidate_name = match[0]
+                score = match[1]
+                
+                # Length Safety Check: If candidate name is very short compared to query, it might be a false positive substring
+                # e.g. Query: "mejores bares en el oeste" (25 chars) vs Candidate: "Oeste" (5 chars) -> Ratio ~0.2
+                # But valid: "mcdonalds" (9) vs "McDonald's" (10) -> Ratio ~0.9
+                len_ratio = len(candidate_name) / len(query)
+                
+                # NEW: Zone Word Safety Check
+                # Si el candidato contiene una palabra de zona Y la query también la menciona,
+                # probablemente es un falso positivo (ej: "cervecerias en el oeste" -> "Aripo Oeste")
+                zone_words = {"oeste", "centro", "norte", "sur", "alto", "costa", "rio", "río", "paseo", "este"}
+                candidate_lower = candidate_name.lower()
+                query_lower = query.lower()
+                
+                zone_match_rejected = False
+                for zone in zone_words:
+                    # Si la zona aparece en el candidato Y en la query
+                    if zone in candidate_lower and zone in query_lower:
+                        # Y el candidato NO es SOLO la zona (tiene más palabras)
+                        # Ej: "Aripo Oeste" contiene "oeste" y query contiene "oeste" -> rechazar
+                        # Pero "Oeste Bar" donde query es "oeste" -> podría ser válido
+                        if len(candidate_name.split()) > 1:  # Tiene múltiples palabras
+                            zone_match_rejected = True
+                            print(f"[DEBUG] ⚠️ Zone Safety: '{candidate_name}' rejected because it contains zone word '{zone}' that's also in query", flush=True)
+                            break
+                
+                if zone_match_rejected:
+                    pass  # No asignar forced_entity
+                elif len_ratio > 0.4 or score > 95: # Allow low ratio ONLY if score is near perfect (e.g. exact match inside text)
+                     forced_entity = candidate_name
+                     print(f"[DEBUG] 🕵️ Fuzzy Override: '{query}' -> '{forced_entity}' (Score: {score}, LenRatio: {len_ratio:.2f})", flush=True)
+                else:
+                     print(f"[DEBUG] ⚠️ Fuzzy Match rejected by heuristic: '{query}' -> '{candidate_name}' (Score: {score}, LenRatio: {len_ratio:.2f})", flush=True)
+        else:
+             print(f"[DEBUG] 🛡️ Heuristic blocked Fuzzy Override: Detected recommendation intent in '{query}'", flush=True)
 
     if forced_entity:
         intencion = "SPECIFIC_INFO"
         print(f"[DEBUG] 🚀 Router Override: Detectado '{forced_entity}' -> Forzando modo SPECIFIC_INFO", flush=True)
+    elif is_recommendation:
+        intencion = "RECOMMENDATION"
+        print(f"[DEBUG] 🧪 Heuristic Force: Recommendation keywords found -> Forzando modo RECOMMENDATION", flush=True)
     else:
         # Use llm_mini for faster routing (Routing doesn't need GPT-4o typically)
         intencion = await clasificar_intencion(query, llm_mini, last_entity=last_ent)
