@@ -1422,6 +1422,10 @@ async def verificar_candidatos_con_llm(candidatos, df, query, llm):
         mask = df['restaurante'] == local
         if not mask.any(): continue
         
+        row = df[mask].iloc[0]
+        rating = safe_float(row.get('rating_gral', 0))
+        total_reviews = safe_int(row.get('total_reviews_google', 0))
+        
         all_reviews = df[mask]['texto'].fillna("").astype(str)
         
         # 2. BÚSQUEDA DE EVIDENCIA
@@ -1438,29 +1442,28 @@ async def verificar_candidatos_con_llm(candidatos, df, query, llm):
                     evidence_reviews.extend(matches.head(2).tolist())
                     found_evidence = True
         
-        # 3. ARMADO DEL CONTEXTO
+        # 3. ARMADO DEL CONTEXTO (con rating y cantidad de reseñas)
         if found_evidence:
-            # Si encontramos evidencia, se la mostramos al Juez
-            snippet = " ... ".join(evidence_reviews)[:900]
-            prefix = "EVIDENCIA ENCONTRADA:"
+            snippet = " ... ".join(evidence_reviews)[:700]
+            prefix = "EVIDENCIA:"
         else:
-            # Si es búsqueda semántica pura (sin keyword exacta), mandamos las generales
-            snippet = " ... ".join(all_reviews.head(5).tolist())[:900]
-            prefix = "RESEÑAS GENERALES:"
+            snippet = " ... ".join(all_reviews.head(5).tolist())[:700]
+            prefix = "RESEÑAS:"
             
-        texto_validacion += f"- LOCAL: {local}\n  {prefix} \"...{snippet}...\"\n\n"
+        texto_validacion += f"- LOCAL: {local} (⭐{rating} - {total_reviews} reseñas)\n  {prefix} \"...{snippet}...\"\n\n"
 
     prompt = f"""
     Eres un filtro de calidad. Query: "{query}"
     
-    REGLA PRINCIPAL: APRUEBA POR DEFECTO.
+    REGLA: APRUEBA POR DEFECTO.
     
-    Solo RECHAZA si:
-    - Las reseñas dicen "cerrado", "no existe", "pésimo".
-    - Si el usuario busca "vegano" y las reseñas dicen "no hay opciones veganas".
+    RECHAZA solo si:
+    - Está cerrado definitivamente.
+    - El usuario busca algo específico (vegano, sin tacc) y NO lo tiene.
     
-    IGNORA NOMBRES: No rechaces por el nombre del local.
-    La query ya fue procesada, solo verifica que no haya evidencia negativa GRAVE.
+    IMPORTANTE: Mira el rating y cantidad de reseñas.
+    - Un lugar con ⭐4+ y 1000+ reseñas es BUENO aunque tenga 1 crítica negativa.
+    - Ignora reseñas negativas aisladas en lugares bien valorados.
     
     CANDIDATOS:
     {texto_validacion}
