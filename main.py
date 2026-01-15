@@ -101,6 +101,67 @@ llm_mini = None
 llm_smart = None 
 
 # ==========================================
+# MAPEO DE KEYWORDS GENÉRICAS A CATEGORÍAS
+# Para queries como "bares", "pizzerias", "sushi" -> filtrar por categoría directa
+# ==========================================
+KEYWORD_TO_CATEGORIES = {
+    # Bares y cervecerías
+    "bar": ["Bar", "Bar & grill", "Beer garden", "Beer hall", "Brewery", "Brewpub", "Gastropub", "Lounge", "Piano bar", "Wine bar"],
+    "bares": ["Bar", "Bar & grill", "Beer garden", "Beer hall", "Brewery", "Brewpub", "Gastropub", "Lounge", "Piano bar", "Wine bar"],
+    "cerveceria": ["Brewery", "Brewpub", "Beer hall", "Beer garden"],
+    "cerveceria": ["Brewery", "Brewpub", "Beer hall", "Beer garden"],
+    "pub": ["Brewpub", "Gastropub", "Bar"],
+    
+    # Pizzerías
+    "pizza": ["Pizza restaurant", "Pizza delivery", "Pizza Takeout"],
+    "pizzeria": ["Pizza restaurant", "Pizza delivery", "Pizza Takeout"],
+    "pizzerias": ["Pizza restaurant", "Pizza delivery", "Pizza Takeout"],
+    
+    # Sushi / Japonés
+    "sushi": ["Sushi restaurant", "Sushi takeaway", "Japanese restaurant"],
+    "japones": ["Japanese restaurant", "Sushi restaurant", "Noodle shop"],
+    
+    # Heladerías
+    "helado": ["Ice cream shop"],
+    "heladeria": ["Ice cream shop"],
+    "helados": ["Ice cream shop"],
+    
+    # Cafeterías
+    "cafe": ["Cafe", "Coffee shop", "Cafeteria", "Espresso bar"],
+    "cafeteria": ["Cafe", "Coffee shop", "Cafeteria"],
+    
+    # Parrillas / Carnes
+    "parrilla": ["Barbecue restaurant", "Steak house", "Grill", "Chophouse restaurant", "Argentinian restaurant"],
+    "asado": ["Barbecue restaurant", "Steak house", "Grill", "Argentinian restaurant"],
+    "carne": ["Steak house", "Barbecue restaurant", "Chophouse restaurant"],
+    
+    # Hamburguesas
+    "hamburguesa": ["Hamburger restaurant", "Fast food restaurant", "Bar & grill"],
+    "hamburgueserias": ["Hamburger restaurant", "Fast food restaurant"],
+    
+    # Mariscos / Pescados
+    "mariscos": ["Seafood restaurant", "Fish restaurant"],
+    "pescado": ["Seafood restaurant", "Fish restaurant"],
+    
+    # Pastas / Italiano
+    "pasta": ["Italian restaurant", "Pasta shop"],
+    "italiano": ["Italian restaurant", "Pasta shop"],
+    
+    # Vegetariano / Vegano
+    "vegano": ["Vegan restaurant", "Vegetarian restaurant", "Health food restaurant"],
+    "vegetariano": ["Vegetarian restaurant", "Vegan restaurant", "Health food restaurant"],
+    
+    # Panaderías / Pastelerías
+    "panaderia": ["Bakery", "Pastry shop", "Patisserie"],
+    "pasteleria": ["Pastry shop", "Patisserie", "Cake shop", "Bakery"],
+    "tortas": ["Cake shop", "Pastry shop", "Patisserie"],
+    
+    # Mexicano
+    "mexicano": ["Mexican restaurant", "Pueblan restaurant"],
+    "tacos": ["Mexican restaurant"],
+}
+
+# ==========================================
 # 2. LIFESPAN
 # ==========================================
 @asynccontextmanager
@@ -124,7 +185,8 @@ async def lifespan(app: FastAPI):
                     r.restaurante, r.autor, r.rating_user, r.texto, 
                     r.fecha_aproximada as fecha, r.review_id,
                     l.rating_gral, l.total_reviews_google, l.direccion,
-                    l.latitud, l.longitud, l.barrio, l.zona, l.categoria
+                    l.latitud, l.longitud, l.barrio, l.zona, l.categoria,
+                    l.resumen_reviews
                 FROM reviews r
                 LEFT JOIN lugares l ON r.restaurante = l.nombre
             """
@@ -1604,6 +1666,20 @@ async def resolver_target_con_llm(query, last_entity, llm):
     except:
         return last_entity # Conservative fallback
 
+def obtener_categorias_desde_keywords(keywords, synonyms):
+    """
+    Retorna una lista de categorías oficiales que matchean con las keywords/sinónimos.
+    """
+    categorias_encontradas = []
+    all_terms = [k.lower().strip() for k in (keywords + synonyms)]
+    
+    for term in all_terms:
+        if term in KEYWORD_TO_CATEGORIES:
+            categorias_encontradas.extend(KEYWORD_TO_CATEGORIES[term])
+            
+    return list(set(categorias_encontradas))
+
+
 async def procesar_consulta_gen(query, df, vectorstore, llm_mini, llm_smart, ctx=None, user_ip=None):
     """
     Generator that handles the chat logic.
@@ -1950,6 +2026,16 @@ async def procesar_consulta_gen(query, df, vectorstore, llm_mini, llm_smart, ctx
             zona_detectada = analisis.get("donde")
             print(f"[DEBUG] 📍 Zona detectada por LLM: '{zona_detectada}'", flush=True)
             
+            # --- DETECCIÓN DE CATEGORÍAS GENÉRICAS ---
+            categorias_detectadas = obtener_categorias_desde_keywords(keywords, synonyms)
+            
+            # Es genérica si al menos una keyword es categoría y NO hay keywords extra específicas
+            keywords_extra = [k for k in keywords if k.lower().strip() not in KEYWORD_TO_CATEGORIES]
+            es_query_generica = len(categorias_detectadas) > 0 and len(keywords_extra) == 0
+            
+            # Si no hay keywords detectadas (query rara), no es genérica
+            if not keywords: es_query_generica = False
+
             # FALLBACK: Detección heurística de zona si LLM no la detectó
             if not zona_detectada:
                 zona_patterns = [
@@ -1970,21 +2056,35 @@ async def procesar_consulta_gen(query, df, vectorstore, llm_mini, llm_smart, ctx
                         print(f"[DEBUG] 📍 Zona detectada por REGEX fallback: '{zona_detectada}'", flush=True)
                         break
 
-
-            t_vec_start = time.time()
-            # Optimization: Increased k to 50 to allow popular places (high reviews) to surface 
-            # even if semantic match is slightly lower.
-            docs = vectorstore.similarity_search(query, k=50)
-            seen = set()
             candidatos_crudos = []
-            for d in docs:
-                nom = d.metadata.get('nombre')
-                if nom and nom not in seen:
-                    seen.add(nom)
-                    candidatos_crudos.append(nom)
+            skip_juez = False
+
+            # ESTRATEGIA A: MODO GENÉRICO (Búsqueda por Categoría)
+            if es_query_generica:
+                print(f"[DEBUG] 🚀 MODO GENÉRICO detectado para categorias: {categorias_detectadas[:3]}...", flush=True)
+                mask_cat = df['categoria'].isin(categorias_detectadas)
+                if mask_cat.any():
+                    candidatos_crudos = df[mask_cat]['restaurante'].unique().tolist()
+                    print(f"[DEBUG] 🏷️ Candidatos encontrados por categoría: {len(candidatos_crudos)}", flush=True)
+                    skip_juez = True # No necesitamos al Juez para verificar si un Bar es un Bar
             
-            t_vec_end = time.time()
-            print(f"[TIMING] Vector Search took {t_vec_end - t_vec_start:.2f}s", flush=True)
+            # ESTRATEGIA B: MODO ESPECÍFICO (Vector Search + Hybrid)
+            if not candidatos_crudos:
+                t_vec_start = time.time()
+                docs = vectorstore.similarity_search(query, k=50)
+                seen = set()
+                for d in docs:
+                    nom = d.metadata.get('nombre')
+                    if nom and nom not in seen:
+                        seen.add(nom)
+                        candidatos_crudos.append(nom)
+                
+                t_vec_end = time.time()
+                print(f"[TIMING] Vector Search took {t_vec_end - t_vec_start:.2f}s", flush=True)
+
+                # Si tenemos categorías aunque no sea genérica, podríamos filtrar si hay demasiados
+                # pero por ahora dejamos que el Hybrid y el Juez hagan su trabajo.
+
 
             # --- HYBRID INJECTION (EXPERIMENTAL) ---
             # Si hay keywords claras, forzamos la inclusión de lugares que las mencionan mucho en reviews.
@@ -2038,7 +2138,10 @@ async def procesar_consulta_gen(query, df, vectorstore, llm_mini, llm_smart, ctx
             grupo_alta_relevancia = []
             grupo_baja_relevancia = []
 
-            if filtro_terms:
+            if es_query_generica:
+                # En modo genérico, todos los que pasaron el filtro de categoría son alta relevancia
+                grupo_alta_relevancia = candidatos_crudos
+            elif filtro_terms:
                 import re
                 patron_regex = '|'.join([re.escape(t) for t in filtro_terms])
                 for local in candidatos_crudos:
@@ -2097,12 +2200,17 @@ async def procesar_consulta_gen(query, df, vectorstore, llm_mini, llm_smart, ctx
                 query_para_juez = query_para_juez.strip()
                 print(f"[DEBUG] 🧹 Query para Juez (sin ubicación): '{query_para_juez}'", flush=True)
             
-            t0 = time.time()
-            locales_verificados = await verificar_candidatos_con_llm(
-                candidatos_a_verificar, df, query_para_juez, llm_mini
-            )
-            t1 = time.time()
-            print(f"[TIMING] Juez LLM took {t1-t0:.2f}s", flush=True)
+            if skip_juez:
+                locales_verificados = candidatos_a_verificar
+                print(f"[DEBUG] ⏩ Saltando Juez LLM (Modo Genérico activo)", flush=True)
+            else:
+                t0 = time.time()
+                locales_verificados = await verificar_candidatos_con_llm(
+                    candidatos_a_verificar, df, query_para_juez, llm_mini
+                )
+                t1 = time.time()
+                print(f"[TIMING] Juez LLM took {t1-t0:.2f}s", flush=True)
+
             
             # DEBUG: Ver qué aprobó el juez
             print(f"[DEBUG] ⚖️ Juez LLM aprobó: {len(locales_verificados)} de {len(candidatos_a_verificar)}", flush=True)
@@ -2150,9 +2258,16 @@ async def procesar_consulta_gen(query, df, vectorstore, llm_mini, llm_smart, ctx
                     row = df[mask].iloc[0]
                     rat = safe_float(row.get('rating_gral'))
                     revs = safe_int(row.get('total_reviews_google'))
-                    # Tomamos un snippet de reseñas (crudo, pero sirve)
-                    texto_raw = safe_str(row.get('texto', ''))[:400].replace("\n", " ")
-                    contexto += f"- {nom} ({rat}⭐, {revs} res): {texto_raw}...\n"
+                    
+                    # Priorizamos el resumen inteligente IA si existe y es válido
+                    resumen_ia = safe_str(row.get('resumen_reviews'))
+                    if resumen_ia and len(resumen_ia) > 30:
+                        texto_final = resumen_ia[:600].replace("\n", " ")
+                    else:
+                        # Fallback a snippet de reseñas si no hay resumen
+                        texto_final = safe_str(row.get('texto', ''))[:400].replace("\n", " ")
+                    
+                    contexto += f"- {nom} ({rat}⭐, {revs} res): {texto_final}...\n"
                 return contexto
 
             detalles_exactos = construir_contexto_rapido(exactos, df)
