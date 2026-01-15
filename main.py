@@ -1474,29 +1474,31 @@ async def verificar_candidatos_con_llm(candidatos, df, query, llm):
         texto_validacion += f"- LOCAL: {local} (⭐{rating} - {total_reviews} reseñas)\n  {prefix} \"...{snippet}...\"\n\n"
 
     prompt = f"""
-    Eres un filtro de calidad de sentido común. Query: "{query}"
+    Eres un validador de catálogo, NO un crítico. Query: "{query}"
     
-    REGLA DE ORO: NO eres un crítico gastronómico. NO rechaces por una mala reseña de sabor o servicio si el local es generalmente bueno.
+    TAREA: Determinar si el local OFRECE lo que el usuario busca.
     
-    APRUEBA POR DEFECTO a menos que haya un problema crítico.
+    REGLA DE ORO: SI EL LOCAL TIENE EL PRODUCTO (o es de la categoría), APRUÉBALO. No importa si la reseña dice que es "feo", "industrial", "caro" o "lento". 
     
-    CRITERIOS DE RECHAZO (SOLO ESTOS):
-    1. Está cerrado definitivamente o es una casa particular.
-    2. El usuario busca algo EXCLUYENTE (vegano, celíaco, mascota) y el local NO lo permite o no tiene opción.
-    3. El local NO vende lo que el usuario busca (ej: busca Sushi y es una Parrilla).
+    MOTIVOS VÁLIDOS DE RECHAZO (Y SOLO ESTOS):
+    1. CATEGORÍA TOTALMENTE ERRÓNEA: El usuario busca "Pizza" y el local es una "Heladería" que no vende comida.
+    2. REQUISITO EXCLUYENTE INCUMPLIDO: Busca "Sin TACC", "Vegano" o "Pet Friendly" y el local NO lo es.
+    3. CERRADO DEFINITIVAMENTE: El local no existe más.
     
-    IGNORA TOTALMENTE:
-    - Incidentes aislados de mal servicio o variaciones subjetivas en el sabor/calidad del plato.
-    - Críticas negativas que contradigan el consenso general (ej: si el local tiene ⭐4.0+ y cientos de reseñas, un puñado de quejas no es motivo de rechazo).
-    - Tu función no es validar si la comida es "rica" (subjetivo), sino si el local cumple con la categoría y atributos buscados.
+    ESTÁ PROHIBIDO RECHAZAR POR:
+    - Calidad/Sabor: "La milanesa es dura", "el rebozado es industrial", "no es rico". (EL USUARIO DECIDIRÁ SI LE GUSTA).
+    - Servicio/Higiene: "Tardaron mucho", "estaba sucio", "mala atención". (NO RECHACES POR ESTO).
+    - Foco del local: Si el usuario busca "milanesas" y una "Marisquería" o "Cervecería" las ofrece en su menú, DEBES APROBARLO aunque no sea su especialidad.
+    
+    Si tienes la más mínima duda de si lo venden, ¡APRUEBA! Es mejor mostrar de más que de menos.
     
     CANDIDATOS:
     {texto_validacion}
     
     Responde JSON:
     {{
-        "aprobados": ["Locales que pasan el filtro"],
-        "rechazados": {{"Nombre del Local": "Solo si es un error grave de categoría o está cerrado"}}
+        "aprobados": ["Nombres de locales que pasan"],
+        "rechazados": {{"Nombre del Local": "Solo si es un error grosero de categoría o está cerrado"}}
     }}
     """
     
