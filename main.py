@@ -47,6 +47,8 @@ UPSTASH_REDIS_REST_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN")
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 THEIPAPI_KEY = os.getenv("THEIPAPI_KEY")
 
+logger.info(f"🔌 Iniciando BACKEND con Colección: '{COLLECTION_NAME}'")
+
 class RedisCacheManager:
     def __init__(self, url, token):
         self.client = None
