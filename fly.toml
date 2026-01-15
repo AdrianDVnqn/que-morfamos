@@ -13,9 +13,7 @@ primary_region = "gru"  # <--- CAMBIADO de 'gru' a 'eze' (Buenos Aires)
     soft_limit = 50    # Permite más requests concurrentes antes de escalar
     hard_limit = 100
 
-  [http_service.machine_checks]
-    grace_period = "30s"   # Da más tiempo para el cold start
-    interval = "60s"
+
 
   [[http_service.checks]]
     grace_period = "60s"   # <--- Aumentado a 60s por las dudas (Pandas es pesado)
