@@ -1451,30 +1451,35 @@ async def verificar_candidatos_con_llm(candidatos, df, query, llm):
         texto_validacion += f"- LOCAL: {local}\n  {prefix} \"...{snippet}...\"\n\n"
 
     prompt = f"""
-    Eres un JUEZ DE CALIDAD ESTRICTO. Query usuario: "{query}"
+    Eres un JUEZ DE CALIDAD. Query usuario: "{query}"
     
-    Analiza la EVIDENCIA de los locales y decide cuáles aprobar.
+    Analiza los locales y decide cuáles aprobar.
     
-    REGLAS CRÍTICAS:
-    1. APROBAR si la evidencia confirma que el lugar ES DEL TIPO solicitado (bar, pizzería, etc.).
-    2. RECHAZAR si dice "NO hay", "NO tiene", "Falta" respecto al PRODUCTO o SERVICIO buscado.
-    3. CUIDADO con dietas (vegano, celíaco, sin tacc): Si la reseña dice "No hay opciones veganas", eliminarlo.
+    REGLAS:
+    1. ENTIENDE SINÓNIMOS: "bar" incluye cervecería, vinoteca, pub, brewpub, resto-bar, wine bar.
+       - "pizzería" incluye pizzeria, horno de pizza.
+       - "heladería" incluye helados, cremería.
     
-    ⚠️ IMPORTANTE - IGNORA LA UBICACIÓN:
-    - NO evalúes si el lugar está "en el río", "en el centro", etc.
-    - La ubicación YA fue filtrada antes. Tu trabajo es SOLO verificar el TIPO de lugar.
-    - Ejemplo: "bares en el rio" -> Solo evalúa si ES un bar/cervecería. NO busques evidencia de "río".
+    2. MIRA EL NOMBRE DEL LOCAL: Si el nombre contiene "Cervecería", "Vinoteca", "Bar", "Pub", 
+       ESO ES EVIDENCIA SUFICIENTE de que es un bar. Apruébalo.
     
-    4. Si la evidencia es vaga o irrelevante para el TIPO de lugar, ELIMINAR.
+    3. RECHAZAR solo si hay evidencia NEGATIVA explícita:
+       - "NO hay opciones veganas" (si el usuario buscaba vegano).
+       - "Cerrado definitivamente".
+       - Evidencia clara de que NO cumple.
     
-    CANDIDATOS A ANALIZAR:
+    4. EN CASO DE DUDA, APROBAR. Es mejor pecar de exceso que dejar lugares válidos afuera.
+    
+    ⚠️ IGNORA UBICACIÓN: Ya fue filtrada. NO rechaces por ubicación.
+    
+    CANDIDATOS:
     {texto_validacion}
     
-    Responde SOLO un JSON válido con esta estructura:
+    Responde SOLO JSON:
     {{
         "aprobados": ["Local A", "Local B"],
         "rechazados": {{
-             "Local C": "Breve razón del rechazo"
+             "Local C": "Razón"
         }}
     }}
     """
@@ -1543,6 +1548,14 @@ def aplicar_filtro_zona(candidatos, df, zona_buscada):
         
         # Juntamos toda la info geográfica del local en un solo string
         geo_data = f"{safe_str(row.get('zona'))} {safe_str(row.get('barrio'))} {safe_str(row.get('direccion'))}".lower()
+        
+        # EXCLUSIÓN: "Río Negro" es la provincia, NO el río de Neuquén
+        # Evita falsos positivos de lugares de Cipolletti
+        if "río negro" in geo_data or "rio negro" in geo_data:
+            # Si el único match es por "río negro" (provincia), NO es zona río
+            geo_data_clean = geo_data.replace("río negro", "").replace("rio negro", "")
+            if not any(term in geo_data_clean for term in search_terms):
+                continue  # No matchea sin "río negro"
         
         # Chequeamos si CUALQUIERA de los términos buscados está en la data
         if any(term in geo_data for term in search_terms):
