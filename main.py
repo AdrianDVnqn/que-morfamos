@@ -1474,25 +1474,28 @@ async def verificar_candidatos_con_llm(candidatos, df, query, llm):
         texto_validacion += f"- LOCAL: {local} (⭐{rating} - {total_reviews} reseñas)\n  {prefix} \"...{snippet}...\"\n\n"
 
     prompt = f"""
-    Eres un filtro de calidad. Query: "{query}"
+    Eres un filtro de calidad de sentido común. Query: "{query}"
     
-    REGLA: APRUEBA POR DEFECTO.
+    REGLA DE ORO: NO eres un crítico gastronómico. NO rechaces por una mala reseña de sabor o servicio si el local es generalmente bueno.
     
-    RECHAZA solo si:
-    - Está cerrado definitivamente.
-    - El usuario busca algo específico (vegano, sin tacc) y NO lo tiene.
+    APRUEBA POR DEFECTO a menos que haya un problema crítico.
     
-    IMPORTANTE: Mira el rating y cantidad de reseñas.
-    - Un lugar con ⭐4+ y 1000+ reseñas es BUENO aunque tenga 1 crítica negativa.
-    - Ignora reseñas negativas aisladas en lugares bien valorados.
+    CRITERIOS DE RECHAZO (SOLO ESTOS):
+    1. Está cerrado definitivamente o es una casa particular.
+    2. El usuario busca algo EXCLUYENTE (vegano, celíaco, mascota) y el local NO lo permite o no tiene opción.
+    3. El local NO vende lo que el usuario busca (ej: busca Sushi y es una Parrilla).
+    
+    IGNORA TOTALMENTE:
+    - Críticas sobre "la milanesa estaba fría", "el mozo tardó", "el rebozado es industrial". 
+    - Si el local tiene ⭐4.0+ y cientos de reseñas, un comentario negativo es irrelevante. Solo el usuario decidirá si le gusta el sabor.
     
     CANDIDATOS:
     {texto_validacion}
     
     Responde JSON:
     {{
-        "aprobados": ["todos los que no tienen problemas graves"],
-        "rechazados": {{"Local": "Solo si hay problema grave"}}
+        "aprobados": ["Locales que pasan el filtro"],
+        "rechazados": {{"Nombre del Local": "Solo si es un error grave de categoría o está cerrado"}}
     }}
     """
     
@@ -1941,37 +1944,41 @@ async def procesar_consulta_gen(query, df, vectorstore, llm_mini, llm_smart, ctx
                 # pero por ahora dejamos que el Hybrid y el Juez hagan su trabajo.
 
 
-            # --- HYBRID INJECTION (EXPERIMENTAL) ---
+            # 1. Filtro de zona inicial para lo que trajo Vector Search
+            if zona_detectada:
+                candidatos_crudos = aplicar_filtro_zona(candidatos_crudos, df, zona_detectada)
+
+            # --- HYBRID INJECTION (GEOLOCALIZADA) ---
             # Si hay keywords claras, forzamos la inclusión de lugares que las mencionan mucho en reviews.
-            # Esto corrige el problema de "El Tío" (mencionado 80 veces como 'milanesa' pero ignorado por vector).
             if keywords:
-                print(f"[DEBUG] 💉 Hybrid Retrieval: Inyectando candidatos por keyword frequency: {keywords}", flush=True)
+                print(f"[DEBUG] 💉 Hybrid Retrieval (Zona: {zona_detectada if zona_detectada else 'Global'}): Inyectando por keywords {keywords}", flush=True)
+                
+                # Si hay zona, pre-filtramos el DF para que la inyección sea solo en esa zona
+                df_para_inyectar = df
+                if zona_detectada:
+                    # Obtenemos todos los locales que pertenecen a la zona según metadatos
+                    locales_en_zona = aplicar_filtro_zona(df['restaurante'].unique().tolist(), df, zona_detectada)
+                    df_para_inyectar = df[df['restaurante'].isin(locales_en_zona)]
+                    print(f"[DEBUG] 📍 Inyección limitada a {len(locales_en_zona)} locales de la zona '{zona_detectada}'", flush=True)
+
                 for kw in keywords:
                     if len(kw) < 4: continue 
                     t_inj_start = time.time()
                     
-                    # 1. Buscar menciones exactas (case insensitive)
-                    # Usamos 'restaurante' y 'texto' normalizados si es posible, pero str.contains es rapido en memoria.
-                    mask = df['texto'].str.contains(re.escape(kw), case=False, na=False)
+                    # Buscar menciones en el subset geográfico
+                    mask = df_para_inyectar['texto'].str.contains(re.escape(kw), case=False, na=False)
                     
-                    # 2. Contar menciones por local
                     if mask.any():
-                        counts = df[mask]['restaurante'].value_counts()
-                        # Tomamos el Top 10 de "Expertos" en esa keyword
+                        counts = df_para_inyectar[mask]['restaurante'].value_counts()
                         top_inject = counts.head(10).index.tolist()
                         
-                        count_new = 0
                         for cand in top_inject:
                             if cand not in candidatos_crudos:
                                 candidatos_crudos.append(cand)
-                                count_new += 1
-                                print(f"[DEBUG] 💉 Inyectado: {cand} ({counts[cand]} menciones)", flush=True)
+                                print(f"[DEBUG] 💉 Inyectado (Geo): {cand} ({counts[cand]} menciones)", flush=True)
                         
-                    print(f"[TIMING] Injection '{kw}' took {time.time() - t_inj_start:.2f}s", flush=True)
+                    print(f"[TIMING] Injection geolocalizada '{kw}' took {time.time() - t_inj_start:.2f}s", flush=True)
             # --- END HYBRID INJECTION ---
-
-            if zona_detectada:
-                candidatos_crudos = aplicar_filtro_zona(candidatos_crudos, df, zona_detectada)
 
             # HARD FILTER: Excluir lugares con menos de 30 reseñas (evitar lugares fantasmas o muy nuevos/malos)
             candidatos_limpios = []
