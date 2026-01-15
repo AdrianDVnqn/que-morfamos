@@ -1549,7 +1549,13 @@ def aplicar_filtro_zona(candidatos, df, zona_buscada):
                 continue  # No matchea sin "río negro"
         
         # Chequeamos si CUALQUIERA de los términos buscados está en la data
-        matches = [term for term in search_terms if term in geo_data]
+        # IMPORTANTE: Usar word boundaries para evitar falsos positivos (ej: 'periodistas' contiene 'rio')
+        matches = []
+        for term in search_terms:
+            # Regex con word boundary para evitar matches parciales
+            if re.search(r'\b' + re.escape(term) + r'\b', geo_data):
+                matches.append(term)
+        
         if matches:
             candidatos_filtrados.append(local)
             print(f"[DEBUG] ✅ Pasó filtro zona: {local} (match: {matches[:2]})", flush=True)
