@@ -1606,8 +1606,9 @@ def aplicar_filtro_zona(candidatos, df, zona_buscada):
         
         row = df[mask].iloc[0]
         
-        # Juntamos toda la info geográfica del local en un solo string
-        geo_data = f"{safe_str(row.get('zona'))} {safe_str(row.get('barrio'))} {safe_str(row.get('direccion'))}".lower()
+        # Juntamos solo zona y barrio para el filtro, ignorando dirección para evitar falsos positivos de calles
+        # (ej: calle 'Rio ...' en zona oeste que no es zona río)
+        geo_data = f"{safe_str(row.get('zona'))} {safe_str(row.get('barrio'))}".lower()
         
         # EXCLUSIÓN: "Río Negro" es la provincia, NO el río de Neuquén
         # Evita falsos positivos de lugares de Cipolletti
