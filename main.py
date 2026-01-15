@@ -2038,14 +2038,14 @@ async def procesar_consulta_gen(query, df, vectorstore, llm_mini, llm_smart, ctx
             
             candidatos_a_verificar = []
 
-            # Optimization: Limit candidates for Judge to 8
-            candidatos_a_verificar.extend(grupo_alta_relevancia[:8])
+            # Optimization: Limit candidates for Judge to 12 (to allow more variety in results)
+            candidatos_a_verificar.extend(grupo_alta_relevancia[:12])
             
-            faltan = 6 - len(candidatos_a_verificar)
+            faltan = 10 - len(candidatos_a_verificar)
             if faltan > 0:
                 candidatos_a_verificar.extend(grupo_baja_relevancia[:faltan])
             
-            candidatos_a_verificar = candidatos_a_verificar[:8]
+            candidatos_a_verificar = candidatos_a_verificar[:12]
 
             # 5. EL JUEZ LLM (Verificación de Contexto)
             # Crear query limpia SIN ubicación para que el Juez solo evalúe el TIPO
@@ -2083,13 +2083,13 @@ async def procesar_consulta_gen(query, df, vectorstore, llm_mini, llm_smart, ctx
             locales_rechazados = set(candidatos_a_verificar) - set(locales_verificados)
             
             # Separar EXACTOS (aprobados por juez) y RELACIONADOS (alta relevancia no aprobados)
-            exactos = locales_verificados[:4]  # Máximo 4 exactos
+            exactos = locales_verificados[:6]  # Máximo 6 exactos (antes 4)
             
             # Relacionados: tomamos de alta relevancia, excluyendo los que ya son exactos Y los que fueron RECHAZADOS por el juez
             relacionados = [
                 loc for loc in grupo_alta_relevancia 
                 if loc not in exactos and loc not in locales_rechazados
-            ][:3]  # Máximo 3 relacionados
+            ][:4]  # Máximo 4 relacionados (antes 3)
             
             print(f"[DEBUG] 🎯 Exactos: {exactos}", flush=True)
             print(f"[DEBUG] 🚫 Rechazados filtrados: {locales_rechazados}", flush=True)
@@ -2109,8 +2109,8 @@ async def procesar_consulta_gen(query, df, vectorstore, llm_mini, llm_smart, ctx
             t2 = time.time()
             
             # Optimization: Generate cards for ALL places mentioned in the text to maintain consistency
-            # The LLM will mention all exactos (max 3) and all relacionados (max 4)
-            todos_los_locales = exactos + relacionados  # Up to 7 cards total
+            # The LLM will mention all exactos (max 6) and all relacionados (max 4)
+            todos_los_locales = exactos + relacionados  # Up to 10 cards total
             
             # Helper para el contexto RÁPIDO (usando datos crudos en lugar de esperar a las cards)
             def construir_contexto_rapido(nombres, df_lugares_ref, df_reviews_ref):
