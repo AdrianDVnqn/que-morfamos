@@ -6,6 +6,7 @@ import asyncio
 import logging
 import math
 import time # Added for debugging
+import urllib.request
 from datetime import datetime, timezone
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
