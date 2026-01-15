@@ -941,7 +941,7 @@ async def analizar_query_semantica(query, llm):
     for safe in whitelist:
         if safe in q_lower: is_safe_bypass = True
 
-    cache_key = f"analysis_v85_{q_lower.strip()}"
+    cache_key = f"analysis_v86_{q_lower.strip()}"
     cached = cache.get_json("analysis", cache_key)
     if cached: return cached
 
@@ -956,26 +956,29 @@ async def analizar_query_semantica(query, llm):
     
     3. EXTRAER KEYWORDS Y SINÓNIMOS (CRÍTICO):
        - "keywords": La palabra exacta buscada (singular).
-       - "synonyms": Lista de 3 o 4 palabras relacionadas semánticamente que sirvan para buscar evidencia en reseñas.
+       - "synonyms": Lista de 3 o 4 palabras relacionadas.
        
-       EJEMPLOS:
-       - Query: "Lugar con pelotero" -> keywords: ["pelotero"], synonyms: ["juegos", "niños", "infantil", "tobogan"]
-       - Query: "Para celiacos" -> keywords: ["celiaco"], synonyms: ["sin tacc", "gluten", "intolerante"]
-       - Query: "Con terraza" -> keywords: ["terraza"], synonyms: ["afuera", "aire libre", "patio", "vereda"]
+    4. UBICACIÓN GEOGRÁFICA (MUY IMPORTANTE):
+       - "donde": Extraer la zona/barrio si el usuario lo menciona.
+       - Patrones comunes: "en el X", "zona X", "cerca del X", "del X".
+       
+       EJEMPLOS CRÍTICOS:
+       - "bares en el rio" -> donde: "rio"
+       - "pizzerias en el centro" -> donde: "centro"
+       - "hamburgueserias en el alto" -> donde: "alto"
+       - "bares zona oeste" -> donde: "oeste"
+       - "lugares en la costa" -> donde: "rio"
+       - "mejores pizzas" -> donde: null (sin ubicación)
     
-    
-    4. UBICACIÓN GEOGRÁFICA (Opcional):
-       - Si el usuario menciona una zona, barrio o referencia espacial.
-       - Ejemplos: "en el centro", "zona alto", "cerca del rio", "cipolletti", "plottier".
-       - Si no menciona nada, devuelve null.
-    
-    Responde SOLO JSON: 
+    Responde SOLO JSON válido:
     {{
-        "tipo": "...", 
-        "keywords": [...], 
-        "synonyms": [...],
-        "donde": "centro" (o null)
+        "tipo": "VIBE", 
+        "keywords": ["bar"], 
+        "synonyms": ["cerveceria", "pub"],
+        "donde": "rio"
     }}
+    
+    Si NO hay ubicación, "donde" debe ser null.
     """
     try:
         res = await llm.ainvoke(template)
@@ -1924,6 +1927,27 @@ async def procesar_consulta_gen(query, df, vectorstore, llm_mini, llm_smart, ctx
             synonyms = analisis.get("synonyms", [])
             zona_detectada = analisis.get("donde")
             print(f"[DEBUG] 📍 Zona detectada por LLM: '{zona_detectada}'", flush=True)
+            
+            # FALLBACK: Detección heurística de zona si LLM no la detectó
+            if not zona_detectada:
+                zona_patterns = [
+                    (r'\ben\s+(?:el|la)?\s*(rio|río)', 'rio'),
+                    (r'\ben\s+(?:el|la)?\s*(centro)', 'centro'),
+                    (r'\ben\s+(?:el|la)?\s*(alto)', 'alto'),
+                    (r'\ben\s+(?:el|la)?\s*(oeste)', 'oeste'),
+                    (r'\ben\s+(?:el|la)?\s*(este)', 'este'),
+                    (r'\b(paseo\s*(?:de\s*la)?\s*costa)', 'rio'),
+                    (r'\b(costanera|ribera)', 'rio'),
+                    (r'\bzona\s+(rio|río|centro|alto|oeste|este)', None),  # Captura directa
+                ]
+                q_lower = query.lower()
+                for pattern, default_zone in zona_patterns:
+                    match = re.search(pattern, q_lower)
+                    if match:
+                        zona_detectada = default_zone if default_zone else match.group(1)
+                        print(f"[DEBUG] 📍 Zona detectada por REGEX fallback: '{zona_detectada}'", flush=True)
+                        break
+
 
             t_vec_start = time.time()
             # Optimization: Increased k to 50 to allow popular places (high reviews) to surface 
