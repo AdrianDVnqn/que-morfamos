@@ -1524,7 +1524,7 @@ async def verificar_candidatos_con_llm(candidatos, df, query, llm):
 # ==========================================
 
 
-def aplicar_filtro_zona(candidatos, df, zona_buscada):
+def aplicar_filtro_zona(candidatos, df, zona_buscada, verbose=True):
     """
     Filtra la lista de nombres de restaurantes según si coinciden con la zona buscada.
     Busca en las columnas: 'zona', 'barrio' y 'direccion'.
@@ -1546,17 +1546,18 @@ def aplicar_filtro_zona(candidatos, df, zona_buscada):
         ])
         
     if "alto" in z_clean or "norte" in z_clean:
-         search_terms.extend(["alto", "norte", "barda", "parque industrial", "terrazas"])
+        search_terms.extend(["alto", "norte", "barda", "parque industrial", "terrazas"])
          
     if "centro" in z_clean:
-         search_terms.extend(["centro", "bajo"]) # Centro y Bajo a veces se solapan
+        search_terms.extend(["centro", "bajo"]) # Centro y Bajo a veces se solapan
     
     if "oeste" in z_clean:
-         search_terms.extend(["oeste", "aeropuerto", "canal"])
+        search_terms.extend(["oeste", "aeropuerto", "canal"])
 
     candidatos_filtrados = []
     
-    print(f"[DEBUG] 🗺️ Filtro de zona activado: '{zona_buscada}' -> terms: {search_terms[:5]}...", flush=True)
+    if verbose:
+        print(f"[DEBUG] 🗺️ Filtro de zona activado: '{zona_buscada}' -> terms: {search_terms[:5]}...", flush=True)
     
     for local in candidatos:
         mask = df['restaurante'] == local
@@ -1574,7 +1575,7 @@ def aplicar_filtro_zona(candidatos, df, zona_buscada):
             # Si el único match es por "río negro" (provincia), NO es zona río
             geo_data_clean = geo_data.replace("río negro", "").replace("rio negro", "")
             if not any(term in geo_data_clean for term in search_terms):
-                print(f"[DEBUG] ❌ Excluido por 'Río Negro' (provincia): {local}", flush=True)
+                if verbose: print(f"[DEBUG] ❌ Excluido por 'Río Negro' (provincia): {local}", flush=True)
                 continue  # No matchea sin "río negro"
         
         # Chequeamos si CUALQUIERA de los términos buscados está en la data
@@ -1587,15 +1588,15 @@ def aplicar_filtro_zona(candidatos, df, zona_buscada):
         
         if matches:
             candidatos_filtrados.append(local)
-            print(f"[DEBUG] ✅ Pasó filtro zona: {local} (match: {matches[:2]})", flush=True)
+            if verbose: print(f"[DEBUG] ✅ Pasó filtro zona: {local} (match: {matches[:2]})", flush=True)
         else:
-            print(f"[DEBUG] ❌ NO pasó filtro zona: {local} (geo: {geo_data[:60]}...)", flush=True)
+            if verbose: print(f"[DEBUG] ❌ NO pasó filtro zona: {local} (geo: {geo_data[:60]}...)", flush=True)
             
     
     # Si el filtro fue muy agresivo y no quedó nadie, devolvemos VACÍO (Hard Filter)
     # Usuario solicitó explícitamente una zona. Si no hay, mejor decir "no hay" que mentir.
     if not candidatos_filtrados:
-        print(f"[DEBUG] ⚠️ Filtro de zona '{zona_buscada}' eliminó TODOS los candidatos.", flush=True)
+        if verbose: print(f"[DEBUG] ⚠️ Filtro de zona '{zona_buscada}' eliminó TODOS los candidatos.", flush=True)
         return []
         
     return candidatos_filtrados
@@ -1957,8 +1958,8 @@ async def procesar_consulta_gen(query, df, vectorstore, llm_mini, llm_smart, ctx
                 # Si hay zona, pre-filtramos el DF para que la inyección sea solo en esa zona
                 df_para_inyectar = df
                 if zona_detectada:
-                    # Obtenemos todos los locales que pertenecen a la zona según metadatos
-                    locales_en_zona = aplicar_filtro_zona(df['restaurante'].unique().tolist(), df, zona_detectada)
+                    # Buscamos en toda la lista de locales pero de forma SILENCIOSA
+                    locales_en_zona = aplicar_filtro_zona(df['restaurante'].unique().tolist(), df, zona_detectada, verbose=False)
                     df_para_inyectar = df[df['restaurante'].isin(locales_en_zona)]
                     print(f"[DEBUG] 📍 Inyección limitada a {len(locales_en_zona)} locales de la zona '{zona_detectada}'", flush=True)
 
