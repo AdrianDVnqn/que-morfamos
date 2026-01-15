@@ -1997,7 +1997,6 @@ async def procesar_consulta_gen(query, df, vectorstore, llm_mini, llm_smart, ctx
                 # En modo genérico, todos los que pasaron el filtro de categoría son alta relevancia
                 grupo_alta_relevancia = candidatos_crudos
             elif filtro_terms:
-                import re
                 patron_regex = '|'.join([re.escape(t) for t in filtro_terms])
                 for local in candidatos_crudos:
                     mask = df['restaurante'] == local
