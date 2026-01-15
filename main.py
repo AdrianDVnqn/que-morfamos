@@ -1515,10 +1515,13 @@ def aplicar_filtro_zona(candidatos, df, zona_buscada):
             candidatos_filtrados.append(local)
             
     
-    # Si el filtro fue muy agresivo y no quedó nadie, devolvemos los originales (Soft Filter)
-    # O podés devolver [] si querés ser estricto. Yo prefiero soft para no dar respuesta vacía.
+    # Si el filtro fue muy agresivo y no quedó nadie, devolvemos VACÍO (Hard Filter)
+    # Usuario solicitó explícitamente una zona. Si no hay, mejor decir "no hay" que mentir.
     if not candidatos_filtrados:
-        return candidatos
+        print(f"[DEBUG] ⚠️ Filtro de zona '{zona_buscada}' (terms: {search_terms}) eliminó TODOS los candidatos.", flush=True)
+        return []
+        
+    return candidatos_filtrados
         
     return candidatos_filtrados
 
