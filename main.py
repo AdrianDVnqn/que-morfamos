@@ -1451,36 +1451,24 @@ async def verificar_candidatos_con_llm(candidatos, df, query, llm):
         texto_validacion += f"- LOCAL: {local}\n  {prefix} \"...{snippet}...\"\n\n"
 
     prompt = f"""
-    Eres un JUEZ DE CALIDAD. Query usuario: "{query}"
+    Eres un filtro de calidad. Query: "{query}"
     
-    Analiza los locales y decide cuáles aprobar.
+    REGLA PRINCIPAL: APRUEBA POR DEFECTO.
     
-    REGLAS:
-    1. ENTIENDE SINÓNIMOS: "bar" incluye cervecería, vinoteca, pub, brewpub, resto-bar, wine bar.
-       - "pizzería" incluye pizzeria, horno de pizza.
-       - "heladería" incluye helados, cremería.
+    Solo RECHAZA si:
+    - Las reseñas dicen "cerrado", "no existe", "pésimo".
+    - Si el usuario busca "vegano" y las reseñas dicen "no hay opciones veganas".
     
-    2. MIRA EL NOMBRE DEL LOCAL: Si el nombre contiene "Cervecería", "Vinoteca", "Bar", "Pub", 
-       ESO ES EVIDENCIA SUFICIENTE de que es un bar. Apruébalo.
-    
-    3. RECHAZAR solo si hay evidencia NEGATIVA explícita:
-       - "NO hay opciones veganas" (si el usuario buscaba vegano).
-       - "Cerrado definitivamente".
-       - Evidencia clara de que NO cumple.
-    
-    4. EN CASO DE DUDA, APROBAR. Es mejor pecar de exceso que dejar lugares válidos afuera.
-    
-    ⚠️ IGNORA UBICACIÓN: Ya fue filtrada. NO rechaces por ubicación.
+    IGNORA NOMBRES: No rechaces por el nombre del local.
+    La query ya fue procesada, solo verifica que no haya evidencia negativa GRAVE.
     
     CANDIDATOS:
     {texto_validacion}
     
-    Responde SOLO JSON:
+    Responde JSON:
     {{
-        "aprobados": ["Local A", "Local B"],
-        "rechazados": {{
-             "Local C": "Razón"
-        }}
+        "aprobados": ["todos los que no tienen problemas graves"],
+        "rechazados": {{"Local": "Solo si hay problema grave"}}
     }}
     """
     
