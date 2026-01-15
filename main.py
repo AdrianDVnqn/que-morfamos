@@ -941,7 +941,7 @@ async def analizar_query_semantica(query, llm):
     for safe in whitelist:
         if safe in q_lower: is_safe_bypass = True
 
-    cache_key = f"analysis_v84_{q_lower.strip()}"
+    cache_key = f"analysis_v85_{q_lower.strip()}"
     cached = cache.get_json("analysis", cache_key)
     if cached: return cached
 
