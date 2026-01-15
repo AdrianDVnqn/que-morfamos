@@ -1486,8 +1486,9 @@ async def verificar_candidatos_con_llm(candidatos, df, query, llm):
     3. El local NO vende lo que el usuario busca (ej: busca Sushi y es una Parrilla).
     
     IGNORA TOTALMENTE:
-    - Críticas sobre "la milanesa estaba fría", "el mozo tardó", "el rebozado es industrial". 
-    - Si el local tiene ⭐4.0+ y cientos de reseñas, un comentario negativo es irrelevante. Solo el usuario decidirá si le gusta el sabor.
+    - Incidentes aislados de mal servicio o variaciones subjetivas en el sabor/calidad del plato.
+    - Críticas negativas que contradigan el consenso general (ej: si el local tiene ⭐4.0+ y cientos de reseñas, un puñado de quejas no es motivo de rechazo).
+    - Tu función no es validar si la comida es "rica" (subjetivo), sino si el local cumple con la categoría y atributos buscados.
     
     CANDIDATOS:
     {texto_validacion}
