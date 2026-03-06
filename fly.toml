@@ -1,5 +1,5 @@
 app = "que-morfamos-api-black-paper-1056"
-primary_region = "gru"
+primary_region = "ewr"
 
 [http_service]
   internal_port = 8000
