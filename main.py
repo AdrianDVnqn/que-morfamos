@@ -221,10 +221,12 @@ async def lifespan(app: FastAPI):
                         ~df['direccion'].str.contains('Cipolletti|Plottier|Centenario|Senillosa|Añelo|R8324', case=False, na=False)
             df = df[mask_cp | mask_city]
             
-            # Convertir rating_gral
+            # Convertir rating_gral — usar to_numpy() para salir del tipo Arrow-backed
+            # que retorna SQLAlchemy en algunas versiones y que pd.to_numeric() no entiende
             if 'rating_gral' in df.columns:
-                df.loc[:, 'rating_gral'] = df['rating_gral'].astype(str).str.replace(',', '.', regex=False)
-                df.loc[:, 'rating_gral'] = pd.to_numeric(df['rating_gral'], errors='coerce').fillna(0.0)
+                rating_vals = df['rating_gral'].to_numpy(dtype=str, na_value='0')
+                rating_vals = [v.replace(',', '.') for v in rating_vals]
+                df['rating_gral'] = pd.to_numeric(rating_vals, errors='coerce').fillna(0.0)
             
             # --- MEMORY CLEANUP: ASCII pre-calculation removed to prevent OOM ---
             # We no longer pre-calculate texto_ascii for all 183k reviews.
