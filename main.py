@@ -49,7 +49,7 @@ THEIPAPI_KEY = os.getenv("THEIPAPI_KEY")
 
 # Versión del servidor — actualizar manualmente al hacer cambios significativos
 SERVER_VERSION = (
-    "v6.9"  # 2026-03-06: fix OOM (astype str), Arrow types, logging mejorado
+    "v7.0"  # 2026-03-06: O(1) indexed lookups, asyncio.to_thread for Pandas, health check fix
 )
 
 logger.info(f"🔌 Iniciando BACKEND {SERVER_VERSION} con Colección: '{COLLECTION_NAME}'")
@@ -295,8 +295,17 @@ async def lifespan(app: FastAPI):
             # We no longer pre-calculate texto_ascii for all 183k reviews.
             # Normalization is done on-the-fly for the small df_lugares when needed.
 
+            # --- INDEXING: Crucial for performance with 180k rows ---
+            # Set index to restaurant name for O(1) lookups instead of O(N) scans.
+            if not df.empty and "restaurante" in df.columns:
+                df.set_index("restaurante", inplace=True, drop=False)
+                # Ensure the index is sorted for potentially faster slicings/lookups
+                df.sort_index(inplace=True)
+            if not df_lugares.empty and "restaurante" in df_lugares.columns:
+                df_lugares.set_index("restaurante", inplace=True, drop=False)
+
             gc.collect()  # Libera memoria después del merge y limpieza inicial
-            logger.info(f"✅ DataFrames listos: {len(df)} reviews en memoria.")
+            logger.info(f"✅ DataFrames listos e indexados: {len(df)} reviews en memoria.")
         except Exception as e:
             logger.error(f"❌ Error cargando datos: {e}")
             df = pd.DataFrame()
@@ -830,27 +839,52 @@ def fecha_a_orden(fecha_str):
     return 5000
 
 
-def obtener_coordenadas(nombres, df):
+def obtener_coordenadas(nombres, df=None):
+    """
+    Usa df_lugares (ya indexado) para buscar lat/lng de forma instantánea O(1).
+    Esto evita escanear 180k filas de reseñas solo para buscar coordenadas.
+    """
+    global df_lugares
     locs = []
+    
+    # Si df_lugares no está indexado aún (fallback), buscamos linearmente en df
+    if df_lugares.index.name != "restaurante":
+        if df is None or df.empty: return []
+        for nom in nombres:
+            if not nom: continue
+            mask = df["restaurante"].str.lower() == nom.lower()
+            if mask.any():
+                r = df[mask].iloc[0]
+                locs.append({
+                    "nombre": safe_str(r.get("restaurante")),
+                    "lat": safe_float(r.get("latitud")),
+                    "lng": safe_float(r.get("longitud")),
+                    "direccion": safe_str(r.get("direccion")),
+                    "rating": safe_float(r.get("rating_gral")),
+                    "total_reviews": safe_int(r.get("total_reviews_google"))
+                })
+        return locs
+
+    # Método optimizado O(1)
     for nom in nombres:
-        if not nom:
+        if not nom or nom not in df_lugares.index:
             continue
-        mask = df["restaurante"].str.lower() == nom.lower()
-        if mask.any():
-            r = df[mask].iloc[0]
-            lat = safe_float(r.get("latitud"))
-            lng = safe_float(r.get("longitud"))
-            if lat != 0 and lng != 0:
-                locs.append(
-                    {
-                        "nombre": safe_str(r["restaurante"]),
-                        "lat": lat,
-                        "lng": lng,
-                        "direccion": safe_str(r.get("direccion")),
-                        "rating": safe_float(r.get("rating_gral")),
-                        "total_reviews": safe_int(r.get("total_reviews_google")),
-                    }
-                )
+        
+        r = df_lugares.loc[nom]
+        if isinstance(r, pd.DataFrame):
+            r = r.iloc[0]
+            
+        lat = safe_float(r.get("latitud"))
+        lng = safe_float(r.get("longitud"))
+        if lat != 0 and lng != 0:
+            locs.append({
+                "nombre": safe_str(nom),
+                "lat": lat,
+                "lng": lng,
+                "direccion": safe_str(r.get("direccion", "")),
+                "rating": safe_float(r.get("rating_gral", 0.0)),
+                "total_reviews": safe_int(r.get("total_reviews_google", 0)),
+            })
     return locs
 
 
@@ -2003,108 +2037,56 @@ async def verificar_candidatos_con_llm(candidatos, df, query, llm):
 def aplicar_filtro_zona(candidatos, df, zona_buscada, verbose=True):
     """
     Filtra la lista de nombres de restaurantes según si coinciden con la zona buscada.
-    Busca en las columnas: 'zona', 'barrio' y 'direccion'.
+    Optimizado: Usa df_lugares (900 filas) indexado para filtrar miles de candidatos en ms.
     """
-    if not zona_buscada:
+    global df_lugares
+    if not zona_buscada or not candidatos:
         return candidatos
 
     z_clean = zona_buscada.lower().strip()
-
-    # Mapeo de sinónimos comunes de Neuquén
     search_terms = [z_clean]
 
     # Si busca "rio", "paseo" o "costa", ampliamos la búsqueda
     if any(x in z_clean for x in ["rio", "río", "paseo", "costa", "limay", "isla"]):
-        # Agregamos términos clave que suelen aparecer en direcciones o zonas cercanas al río
-        search_terms.extend(
-            [
-                "rio",
-                "río",
-                "limay",
-                "balneario",
-                "paseo",
-                "costa",
-                "costanera",
-                "ribera",
-                "isla",
-                "132",
-                "isla 132",
-            ]
-        )
+        search_terms.extend(["rio", "río", "limay", "balneario", "paseo", "costa", "costanera", "ribera", "isla", "132", "isla 132"])
 
     if "alto" in z_clean or "norte" in z_clean:
         search_terms.extend(["alto", "norte", "barda", "parque industrial", "terrazas"])
 
     if "centro" in z_clean:
-        search_terms.extend(["centro", "bajo"])  # Centro y Bajo a veces se solapan
+        search_terms.extend(["centro", "bajo"])
 
     if "oeste" in z_clean:
         search_terms.extend(["oeste", "aeropuerto", "canal"])
 
     candidatos_filtrados = []
+    
+    # Lookup metadata for ALL candidates at once O(1) inside loop
+    valid_cands = [c for c in candidatos if c in df_lugares.index]
+    if not valid_cands:
+        return []
+        
+    meta_df = df_lugares.loc[valid_cands]
+    if isinstance(meta_df, pd.Series): meta_df = meta_df.to_frame().T
 
-    if verbose:
-        print(
-            f"[DEBUG] 🗺️ Filtro de zona activado: '{zona_buscada}' -> terms: {search_terms[:5]}...",
-            flush=True,
-        )
-
-    for local in candidatos:
-        mask = df["restaurante"] == local
-        if not mask.any():
-            continue
-
-        row = df[mask].iloc[0]
-
-        # Juntamos solo zona y barrio para el filtro, ignorando dirección para evitar falsos positivos de calles
-        # (ej: calle 'Rio ...' en zona oeste que no es zona río)
+    for local, row in meta_df.iterrows():
         geo_data = f"{safe_str(row.get('zona'))} {safe_str(row.get('barrio'))}".lower()
-
-        # EXCLUSIÓN: "Río Negro" es la provincia, NO el río de Neuquén
-        # Evita falsos positivos de lugares de Cipolletti
+        
+        # EXCLUSIÓN: "Río Negro" provincia
         if "río negro" in geo_data or "rio negro" in geo_data:
-            # Si el único match es por "río negro" (provincia), NO es zona río
             geo_data_clean = geo_data.replace("río negro", "").replace("rio negro", "")
             if not any(term in geo_data_clean for term in search_terms):
-                if verbose:
-                    print(
-                        f"[DEBUG] ❌ Excluido por 'Río Negro' (provincia): {local}",
-                        flush=True,
-                    )
-                continue  # No matchea sin "río negro"
+                continue
 
-        # Chequeamos si CUALQUIERA de los términos buscados está en la data
-        # IMPORTANTE: Usar word boundaries para evitar falsos positivos (ej: 'periodistas' contiene 'rio')
-        matches = []
+        match = False
         for term in search_terms:
-            # Regex con word boundary para evitar matches parciales
             if re.search(r"\b" + re.escape(term) + r"\b", geo_data):
-                matches.append(term)
-
-        if matches:
+                match = True
+                break
+        
+        if match:
             candidatos_filtrados.append(local)
-            if verbose:
-                print(
-                    f"[DEBUG] ✅ Pasó filtro zona: {local} (match: {matches[:2]})",
-                    flush=True,
-                )
-        else:
-            if verbose:
-                print(
-                    f"[DEBUG] ❌ NO pasó filtro zona: {local} (geo: {geo_data[:60]}...)",
-                    flush=True,
-                )
-
-    # Si el filtro fue muy agresivo y no quedó nadie, devolvemos VACÍO (Hard Filter)
-    # Usuario solicitó explícitamente una zona. Si no hay, mejor decir "no hay" que mentir.
-    if not candidatos_filtrados:
-        if verbose:
-            print(
-                f"[DEBUG] ⚠️ Filtro de zona '{zona_buscada}' eliminó TODOS los candidatos.",
-                flush=True,
-            )
-        return []
-
+    
     return candidatos_filtrados
 
 
@@ -2153,6 +2135,74 @@ def obtener_categorias_desde_keywords(keywords, synonyms):
             categorias_encontradas.extend(KEYWORD_TO_CATEGORIES[term])
 
     return list(set(categorias_encontradas))
+
+
+def procesar_recomendacion_pesado(
+    candidatos_crudos, df_ref, df_lugares_ref, keywords, synonyms, es_query_generica, zona_detectada
+):
+    """
+    Función síncrona para ejecutar las operaciones pesadas de Pandas/CPU fuera del event loop.
+    Retorna (candidatos_a_verificar, grupo_alta_relevancia).
+    """
+    # 1. Filtro de zona inicial
+    if zona_detectada:
+        candidatos_crudos = aplicar_filtro_zona(candidatos_crudos, None, zona_detectada, verbose=False)
+
+    # 2. HYBRID INJECTION
+    if keywords:
+        df_para_inyectar = df_ref
+        if zona_detectada:
+            locales_en_zona = aplicar_filtro_zona(df_lugares_ref.index.tolist(), None, zona_detectada, verbose=False)
+            df_para_inyectar = df_ref.loc[df_ref.index.isin(locales_en_zona)]
+
+        for kw in keywords:
+            if len(kw) < 4: continue
+            mask = df_para_inyectar["texto"].str.contains(re.escape(kw), case=False, na=False)
+            if mask.any():
+                counts = df_para_inyectar[mask]["restaurante"].value_counts()
+                for cand in counts.head(10).index.tolist():
+                    if cand not in candidatos_crudos:
+                        candidatos_crudos.append(cand)
+
+    # 3. HARD FILTER (reviews >= 30)
+    candidatos_limpios = []
+    for local in candidatos_crudos:
+        if local in df_lugares_ref.index:
+            row = df_lugares_ref.loc[local]
+            if isinstance(row, pd.DataFrame): row = row.iloc[0]
+            if safe_int(row.get("total_reviews_google", 0)) >= 30:
+                candidatos_limpios.append(local)
+    candidatos_crudos = candidatos_limpios
+
+    # 4. RELEVANCIA Y SORTING
+    filtro_terms = [t.lower() for t in (set(keywords) | set(synonyms or [])) if len(t) > 3]
+    grupo_alta = []
+    grupo_baja = []
+
+    def calc_score(nombre):
+        if nombre not in df_lugares_ref.index: return 0
+        r = df_lugares_ref.loc[nombre]
+        if isinstance(r, pd.DataFrame): r = r.iloc[0]
+        return safe_float(r.get("rating_gral")) + (math.log10(safe_int(r.get("total_reviews_google")) + 1) * 2.7)
+
+    if es_query_generica:
+        grupo_alta = candidatos_crudos
+    elif filtro_terms:
+        patron = "|".join([re.escape(t) for t in filtro_terms])
+        for local in candidatos_crudos:
+            if local in df_ref.index:
+                if df_ref.loc[[local]]["texto"].fillna("").str.contains(patron, case=False, na=False).any():
+                    grupo_alta.append(local)
+                    continue
+            grupo_baja.append(local)
+    else:
+        grupo_alta = candidatos_crudos
+
+    grupo_alta.sort(key=calc_score, reverse=True)
+    grupo_baja.sort(key=calc_score, reverse=True)
+
+    candidatos_verif = (grupo_alta[:12] + grupo_baja[:12])[:12]
+    return candidatos_verif, grupo_alta
 
 
 async def procesar_consulta_gen(
@@ -2555,167 +2605,38 @@ async def procesar_consulta_gen(
 
             # ESTRATEGIA A: MODO GENÉRICO (Búsqueda por Categoría)
             if es_query_generica:
-                print(
-                    f"[DEBUG] 🚀 MODO GENÉRICO detectado para categorias: {categorias_detectadas[:3]}...",
-                    flush=True,
-                )
+                print(f"[DEBUG] 🚀 MODO GENÉRICO detectado para categorias: {categorias_detectadas[:3]}...", flush=True)
                 if "categoria" in df.columns:
                     mask_cat = df["categoria"].isin(categorias_detectadas)
                     if mask_cat.any():
-                        candidatos_crudos = (
-                            df[mask_cat]["restaurante"].unique().tolist()
-                        )
-                        print(
-                            f"[DEBUG] 🏷️ Candidatos encontrados por categoría: {len(candidatos_crudos)}",
-                            flush=True,
-                        )
-                        skip_juez = True  # No necesitamos al Juez para verificar si un Bar es un Bar
+                        candidatos_crudos = df[mask_cat]["restaurante"].unique().tolist()
+                        print(f"[DEBUG] 🏷️ Candidatos encontrados por categoría: {len(candidatos_crudos)}", flush=True)
+                        skip_juez = True
                 else:
                     logger.warning("⚠️ Columna 'categoria' no encontrada en df.")
 
             # ESTRATEGIA B: MODO ESPECÍFICO (Vector Search + Hybrid)
             if not candidatos_crudos:
-                # Usamos el resultado de la tarea que lanzamos en paralelo al principio
                 candidatos_crudos = await vec_task
-            else:
-                # Si es genérica, igual cancelamos o dejamos que termine la tarea en background
-                # pero no la esperamos para no bloquear.
-                pass
 
-                # Si tenemos categorías aunque no sea genérica, podríamos filtrar si hay demasiados
-                # pero por ahora dejamos que el Hybrid y el Juez hagan su trabajo.
-
-            # 1. Filtro de zona inicial para lo que trajo Vector Search
-            if zona_detectada:
-                candidatos_crudos = aplicar_filtro_zona(
-                    candidatos_crudos, df, zona_detectada
-                )
-
-            # --- HYBRID INJECTION (GEOLOCALIZADA) ---
-            # Si hay keywords claras, forzamos la inclusión de lugares que las mencionan mucho en reviews.
-            if keywords:
-                print(
-                    f"[DEBUG] 💉 Hybrid Retrieval (Zona: {zona_detectada if zona_detectada else 'Global'}): Inyectando por keywords {keywords}",
-                    flush=True,
-                )
-
-                # Si hay zona, pre-filtramos el DF para que la inyección sea solo en esa zona
-                df_para_inyectar = df
-                if zona_detectada:
-                    # Buscamos en toda la lista de locales pero de forma SILENCIOSA
-                    locales_en_zona = aplicar_filtro_zona(
-                        df["restaurante"].unique().tolist(),
-                        df,
-                        zona_detectada,
-                        verbose=False,
-                    )
-                    df_para_inyectar = df[df["restaurante"].isin(locales_en_zona)]
-                    print(
-                        f"[DEBUG] 📍 Inyección limitada a {len(locales_en_zona)} locales de la zona '{zona_detectada}'",
-                        flush=True,
-                    )
-
-                for kw in keywords:
-                    if len(kw) < 4:
-                        continue
-                    t_inj_start = time.time()
-
-                    # Buscar menciones en el subset geográfico
-                    mask = df_para_inyectar["texto"].str.contains(
-                        re.escape(kw), case=False, na=False
-                    )
-
-                    if mask.any():
-                        counts = df_para_inyectar[mask]["restaurante"].value_counts()
-                        top_inject = counts.head(10).index.tolist()
-
-                        for cand in top_inject:
-                            if cand not in candidatos_crudos:
-                                candidatos_crudos.append(cand)
-                                print(
-                                    f"[DEBUG] 💉 Inyectado (Geo): {cand} ({counts[cand]} menciones)",
-                                    flush=True,
-                                )
-
-                    print(
-                        f"[TIMING] Injection geolocalizada '{kw}' took {time.time() - t_inj_start:.2f}s",
-                        flush=True,
-                    )
-            # --- END HYBRID INJECTION ---
-
-            # HARD FILTER: Excluir lugares con menos de 30 reseñas (evitar lugares fantasmas o muy nuevos/malos)
-            candidatos_limpios = []
-            for local in candidatos_crudos:
-                mask = df["restaurante"] == local
-                if mask.any():
-                    row = df[mask].iloc[0]
-                    revs = safe_int(row.get("total_reviews_google", 0))
-                    if revs >= 30:
-                        candidatos_limpios.append(local)
-
-            candidatos_crudos = candidatos_limpios
-
-            # Filtering logic (same as original)
-            filtro_terms = set(keywords)
-            if synonyms:
-                filtro_terms.update(synonyms)
-            filtro_terms = [t.lower() for t in filtro_terms if len(t) > 3]
-
-            grupo_alta_relevancia = []
-            grupo_baja_relevancia = []
-
-            if es_query_generica:
-                # En modo genérico, todos los que pasaron el filtro de categoría son alta relevancia
-                grupo_alta_relevancia = candidatos_crudos
-            elif filtro_terms:
-                patron_regex = "|".join([re.escape(t) for t in filtro_terms])
-                for local in candidatos_crudos:
-                    mask = df["restaurante"] == local
-                    if not mask.any():
-                        continue
-                    series_textos = df[mask]["texto"].fillna("").astype(str).str.lower()
-                    if series_textos.str.contains(patron_regex, regex=True).any():
-                        grupo_alta_relevancia.append(local)
-                    else:
-                        grupo_baja_relevancia.append(local)
-            else:
-                grupo_alta_relevancia = candidatos_crudos
-
-            # 4. SELECCIÓN PARA EL JUEZ
-
-            # Definimos la función de calidad PONDERADA
-            def calculate_weighted_score(nombre):
-                mask = df["restaurante"] == nombre
-                if not mask.any():
-                    return 0
-                row = df[mask].iloc[0]
-                rat = safe_float(row.get("rating_gral"))
-                revs = safe_int(row.get("total_reviews_google"))
-                # Log10 de 10 = 1, 100 = 2, 1000 = 3
-                # User Request: Ponderar TODAVIA MAS la cantidad de reseñas.
-                # Multiplier 3.5 -> 1000 reviews adds 10.5 points! Huge boost.
-                return rat + (math.log10(revs + 1) * 2.7)
-
-            # Ordenamos ambos grupos por puntaje ponderado
-            grupo_alta_relevancia.sort(key=calculate_weighted_score, reverse=True)
-            grupo_baja_relevancia.sort(key=calculate_weighted_score, reverse=True)
-
-            candidatos_a_verificar = []
-
-            # Optimization: Limit candidates for Judge to 12 (to allow more variety in results)
-            candidatos_a_verificar.extend(grupo_alta_relevancia[:12])
-
-            faltan = 10 - len(candidatos_a_verificar)
-            if faltan > 0:
-                candidatos_a_verificar.extend(grupo_baja_relevancia[:faltan])
-
-            candidatos_a_verificar = candidatos_a_verificar[:12]
+            # --- OPERACIONES PESADAS (OFFLOAD TO THREAD) ---
+            # Filtro de zona, Hybrid Injection, Hard Filter y Ranking se hacen en un thread aparte.
+            t_pesado_start = time.time()
+            candidatos_a_verificar, grupo_alta_relevancia = await asyncio.to_thread(
+                procesar_recomendacion_pesado,
+                candidatos_crudos,
+                df,
+                df_lugares,
+                keywords,
+                synonyms,
+                es_query_generica,
+                zona_detectada
+            )
+            print(f"[TIMING] Heavy Pandas operations took {time.time() - t_pesado_start:.2f}s (in thread)", flush=True)
 
             # 5. EL JUEZ LLM (Verificación de Contexto)
-            # Crear query limpia SIN ubicación para que el Juez solo evalúe el TIPO
             query_para_juez = query
             if zona_detectada:
-                # Remover patrones de ubicación de la query
                 ubicacion_patterns = [
                     r"\s*en\s+(?:el|la)\s+" + re.escape(zona_detectada),
                     r"\s*zona\s+" + re.escape(zona_detectada),
@@ -2723,20 +2644,13 @@ async def procesar_consulta_gen(
                     r"\s*cerca\s+del?\s+" + re.escape(zona_detectada),
                 ]
                 for pattern in ubicacion_patterns:
-                    query_para_juez = re.sub(
-                        pattern, "", query_para_juez, flags=re.IGNORECASE
-                    )
+                    query_para_juez = re.sub(pattern, "", query_para_juez, flags=re.IGNORECASE)
                 query_para_juez = query_para_juez.strip()
-                print(
-                    f"[DEBUG] 🧹 Query para Juez (sin ubicación): '{query_para_juez}'",
-                    flush=True,
-                )
+                print(f"[DEBUG] 🧹 Query para Juez (sin ubicación): '{query_para_juez}'", flush=True)
 
             if skip_juez:
                 locales_verificados = candidatos_a_verificar
-                print(
-                    f"[DEBUG] ⏩ Saltando Juez LLM (Modo Genérico activo)", flush=True
-                )
+                print(f"[DEBUG] ⏩ Saltando Juez LLM (Modo Genérico activo)", flush=True)
             else:
                 t0 = time.time()
                 locales_verificados = await verificar_candidatos_con_llm(
@@ -2771,9 +2685,15 @@ async def procesar_consulta_gen(
             print(f"[DEBUG] 🚫 Rechazados filtrados: {locales_rechazados}", flush=True)
             print(f"[DEBUG] 🔗 Relacionados: {relacionados}", flush=True)
 
-            # 6. RANKING FINAL (Reutilizamos el score ponderado)
-            exactos.sort(key=calculate_weighted_score, reverse=True)
-            relacionados.sort(key=calculate_weighted_score, reverse=True)
+            # 6. RANKING FINAL (Final sort by rating and review count)
+            def get_score(n):
+                if n not in df_lugares.index: return 0
+                r = df_lugares.loc[n]
+                if isinstance(r, pd.DataFrame): r = r.iloc[0]
+                return safe_float(r.get("rating_gral")) + (math.log10(safe_int(r.get("total_reviews_google")) + 1) * 2.7)
+
+            exactos.sort(key=get_score, reverse=True)
+            relacionados.sort(key=get_score, reverse=True)
 
             if not exactos and not relacionados:
                 yield {
@@ -2790,22 +2710,17 @@ async def procesar_consulta_gen(
                 return
 
             # 6. GENERACIÓN PARALELA
-            # Lanzamos la generación de cards en background para no bloquear el chat
             t2 = time.time()
-
-            # Optimization: Generate cards for ALL places mentioned in the text to maintain consistency
-            # The LLM will mention all exactos (max 6) and all relacionados (max 4)
             todos_los_locales = exactos + relacionados  # Up to 10 cards total
 
-            # Helper para el contexto RÁPIDO (usando datos crudos en lugar de esperar a las cards)
+            # Helper para el contexto RÁPIDO (O(1) lookups)
             def construir_contexto_rapido(nombres, df_lugares_ref, df_reviews_ref):
                 contexto = ""
                 for nom in nombres:
-                    # Datos del lugar (resumen, rating, etc)
-                    mask_l = df_lugares_ref["restaurante"] == nom
-                    if not mask_l.any():
+                    if nom not in df_lugares_ref.index:
                         continue
-                    row_l = df_lugares_ref[mask_l].iloc[0]
+                    row_l = df_lugares_ref.loc[nom]
+                    if isinstance(row_l, pd.DataFrame): row_l = row_l.iloc[0]
 
                     rat = safe_float(row_l.get("rating_gral"))
                     revs = safe_int(row_l.get("total_reviews_google"))
@@ -2815,12 +2730,10 @@ async def procesar_consulta_gen(
                     if resumen_ia and len(resumen_ia) > 30:
                         texto_final = resumen_ia[:600].replace("\n", " ")
                     else:
-                        # Fallback a snippet de reseñas del DF de reviews si no hay resumen
-                        mask_r = df_reviews_ref["restaurante"] == nom
-                        if mask_r.any():
-                            texto_final = safe_str(
-                                df_reviews_ref[mask_r].iloc[0].get("texto", "")
-                            )[:400].replace("\n", " ")
+                        # Fallback a snippet de reseñas indexado
+                        if nom in df_reviews_ref.index:
+                            reviews_local = df_reviews_ref.loc[[nom]]
+                            texto_final = safe_str(reviews_local.iloc[0].get("texto", ""))[:400].replace("\n", " ")
                         else:
                             texto_final = "No hay descripción disponible."
 
@@ -2828,9 +2741,7 @@ async def procesar_consulta_gen(
                 return contexto
 
             detalles_exactos = construir_contexto_rapido(exactos, df_lugares, df)
-            detalles_relacionados = construir_contexto_rapido(
-                relacionados, df_lugares, df
-            )
+            detalles_relacionados = construir_contexto_rapido(relacionados, df_lugares, df)
 
             # Start background task
             card_task = asyncio.create_task(
