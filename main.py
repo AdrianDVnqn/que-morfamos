@@ -1,4 +1,14 @@
 import os
+import sys
+
+# Force UTF-8 on Windows for emoji printing
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+    except AttributeError:
+        # Older python versions might not have reconfigure
+        pass
+
 import json
 import re
 import unicodedata
@@ -1168,7 +1178,6 @@ async def obtener_restaurant_cards(
         nombre_real = safe_str(row.get("restaurante", nombre))
 
         # 2. BÚSQUEDA DE EVIDENCIA
-        # Aquí es donde encontramos las reseñas de "pelotero"
         if final_search_terms:
             reviews_filtradas = obtener_reviews_tematicas(
                 rest_df, final_search_terms, limit=8
@@ -1191,48 +1200,51 @@ async def obtener_restaurant_cards(
             ]
             best_review = rest_df.iloc[0]
 
-            frase = safe_str(best_review["texto"])[:200] + "..."
-            autor = formatear_autor(best_review.get("autor"))
+        # 3. EXTRACCIÓN DE EVIDENCIA Y GENERACIÓN CON LLM
+        frase = safe_str(best_review["texto"])[:200] + "..."
+        autor = formatear_autor(best_review.get("autor"))
 
-            # 3. GENERACIÓN CON LLM
-            # Cache key única por tema de búsqueda
-            topic_key = (
-                "-".join(sorted(list(search_terms))) if search_terms else "general"
+        # Cache key única por tema de búsqueda
+        topic_key = (
+            "-".join(sorted(list(search_terms))) if search_terms else "general"
+        )
+        cache_key = f"desc_{nombre_real}_{topic_key}_{sanitize_tone(tone)}"
+
+        desc = cache.get_json("desc", cache_key)
+
+        if desc:
+            tasks.append(
+                {
+                    "type": "cached",
+                    "val": desc,
+                    "row": row,
+                    "frase": frase,
+                    "autor": autor,
+                    "nombre_real": nombre_real,
+                }
             )
-            cache_key = f"desc_{nombre_real}_{topic_key}_{sanitize_tone(tone)}"
-
-            desc = cache.get_json("desc", cache_key)
-
-            if desc:
-                tasks.append(
-                    {
-                        "type": "cached",
-                        "val": desc,
-                        "row": row,
-                        "frase": frase,
-                        "autor": autor,
-                        "nombre_real": nombre_real,
-                    }
-                )
-            else:
-                # El prompt le dice al LLM qué buscar
+        else:
+            # El prompt le dice al LLM qué buscar
+            if final_search_terms:
                 contexto_extra = f"El usuario busca conceptos relacionados con: '{', '.join(final_search_terms)}'. Si aparecen en las reviews, MENCIONALO."
+            else:
+                contexto_extra = ""
 
-                # Reutilizamos la función helper que ya tenías o la definimos abajo
-                task_coro = generar_descripcion_async_tematica(
-                    llm, nombre_real, sample_text, tone, contexto_extra
-                )
-                tasks.append(
-                    {
-                        "type": "generate",
-                        "val": task_coro,
-                        "row": row,
-                        "frase": frase,
-                        "autor": autor,
-                        "nombre_real": nombre_real,
-                        "cache_key": cache_key,
-                    }
-                )
+            # Reutilizamos la función helper
+            task_coro = generar_descripcion_async_tematica(
+                llm, nombre_real, sample_text, tone, contexto_extra
+            )
+            tasks.append(
+                {
+                    "type": "generate",
+                    "val": task_coro,
+                    "row": row,
+                    "frase": frase,
+                    "autor": autor,
+                    "nombre_real": nombre_real,
+                    "cache_key": cache_key,
+                }
+            )
 
     # Ejecución Async
     generations_needed = [t["val"] for t in tasks if t["type"] == "generate"]
