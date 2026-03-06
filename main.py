@@ -3083,7 +3083,15 @@ async def chat_stream(req: QueryRequest, request: Request):
             )
         )
 
-    return StreamingResponse(event_generator(), media_type="application/x-ndjson")
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "X-Accel-Buffering": "no",
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive",
+        },
+    )
 
 
 @app.post("/chat", response_model=QueryResponse)
