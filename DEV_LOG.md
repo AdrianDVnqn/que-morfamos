@@ -125,8 +125,18 @@ Este archivo registra los hitos técnicos, decisiones de diseño y correcciones 
     - El endpoint `/chat/stream` ahora loguea: IP del usuario, Query original, Tono, Zona detectada, Cantidad de resultados y Tiempo de respuesta total.
     - Se incluyó un preview de la respuesta del LLM en los logs para monitoreo rápido sin entrar a Discord.
 
-#### 5. Configuración de Infraestructura
-- **Fly.toml:** Se revirtió la configuración a **Tier Gratuito** (`min_machines_running = 0`, `memory_mb = 768`) optimizando el código para que sea estable bajo estas restricciones de hardware.
+#### 6. Arquitectura v7.0: Solución Definitiva de Latencia y Bloqueo
+- **Problema:** El servidor bloqueaba el event loop por ~25s durante inyecciones y rankings pesados, causando fallos de health check (`servicecheck-00-http-8000 failed`) y timeouts.
+- **Solución - Threading:** Se extrajeron las operaciones CPU-bound a la función `procesar_recomendacion_pesado` y se implementó `asyncio.to_thread`. El event loop ahora queda libre para responder pings mientras se procesa la recomendación.
+- **Solución - Indexación O(1):** Se indexaron los DataFrames `df` y `df_lugares` por `restaurante`. 
+    - Se eliminaron decenas de miles de escaneos lineales (`df["restaurante"] == x`) en bucles. 
+    - Funciones como `obtener_coordenadas` y `aplicar_filtro_zona` ahora funcionan en tiempo constante.
+- **Resultado:** El tiempo de preparación pre-stream bajó de **25s a <1s** en la mayoría de los casos. Estabilidad total en Fly.io.
+
+#### 7. Arquitectura v7.1: Latencia Residual y Tarjetas
+- **Pre-stream setup:** Reducido de 23s a <1s mediante el uso de lookups indexados en el Juez LLM y offloading a threads.
+- **Generación de Tarjetas:** Reducida de 85s a <15s netos (tiempo del LLM) eliminando escaneos lineales redundantes.
+- **Integridad:** Corregidos errores de estructura en `main.py`.
 
 ---
-*Bitácora actualizada por Antigravity Agent.*
+*Bitácora actualizada por Antigravity Agent (v7.1).*

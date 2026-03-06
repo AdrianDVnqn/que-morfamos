@@ -1159,37 +1159,37 @@ async def obtener_restaurant_cards(
     final_search_terms = [k for k in search_terms if len(k) > 3]
 
     for nombre in nombres_restaurantes:
-        if not nombre:
+        if not nombre or nombre not in df.index:
             continue
-        mask = df["restaurante"].str.lower() == nombre.lower()
-        if mask.any():
-            rest_df = df[mask]
-            row = rest_df.iloc[0]
-            nombre_real = safe_str(row["restaurante"])
+            
+        # O(1) indexed lookup instead of O(N) linear scan
+        rest_df = df.loc[[nombre]]
+        row = rest_df.iloc[0]
+        nombre_real = safe_str(row.get("restaurante", nombre))
 
-            # 2. BÚSQUEDA DE EVIDENCIA
-            # Aquí es donde encontramos las reseñas de "pelotero"
-            if final_search_terms:
-                reviews_filtradas = obtener_reviews_tematicas(
-                    rest_df, final_search_terms, limit=8
-                )
+        # 2. BÚSQUEDA DE EVIDENCIA
+        # Aquí es donde encontramos las reseñas de "pelotero"
+        if final_search_terms:
+            reviews_filtradas = obtener_reviews_tematicas(
+                rest_df, final_search_terms, limit=8
+            )
 
-                if not reviews_filtradas.empty:
-                    # Unimos hasta 3000 chars para asegurar contexto completo
-                    sample_text = " ... ".join(
-                        [safe_str(t) for t in reviews_filtradas["texto"]]
-                    )[:3000]
-                    best_review = reviews_filtradas.iloc[0]
-                else:
-                    sample_text = " ".join(
-                        [safe_str(t) for t in rest_df["texto"].head(5)]
-                    )[:1000]
-                    best_review = rest_df.iloc[0]
+            if not reviews_filtradas.empty:
+                # Unimos hasta 3000 chars para asegurar contexto completo
+                sample_text = " ... ".join(
+                    [safe_str(t) for t in reviews_filtradas["texto"]]
+                )[:3000]
+                best_review = reviews_filtradas.iloc[0]
             else:
-                sample_text = " ".join([safe_str(t) for t in rest_df["texto"].head(5)])[
-                    :1000
-                ]
+                sample_text = " ".join(
+                    [safe_str(t) for t in rest_df["texto"].head(5)]
+                )[:1000]
                 best_review = rest_df.iloc[0]
+        else:
+            sample_text = " ".join([safe_str(t) for t in rest_df["texto"].head(5)])[
+                :1000
+            ]
+            best_review = rest_df.iloc[0]
 
             frase = safe_str(best_review["texto"])[:200] + "..."
             autor = formatear_autor(best_review.get("autor"))
@@ -1916,61 +1916,39 @@ async def responder_followup_gen(restaurante, query, df, llm, tone="cordial"):
     """
 
     try:
-        chain = ChatPromptTemplate.from_template(prompt) | llm | StrOutputParser()
+        chain = ChatPromptTemplate.from_template(prompt) | llm_mini | StrOutputParser()
         args = {}
-        # Simulate typing/thinking? No just stream.
         async for token in astream_buffer(chain, args):
             yield {"type": "token", "content": token}
     except Exception as e:
         logger.error(f"Error responder_followup: {e}")
         yield {"type": "token", "content": "Tuve un error procesando tu pregunta."}
-
-
-async def verificar_candidatos_con_llm(candidatos, df, query, llm):
-    """
-    JUEZ SEMÁNTICO (V2 - CON BÚSQUEDA DE EVIDENCIA):
-    En lugar de leer las primeras 5 reseñas al azar, busca específicamente
-    las reseñas que contienen las palabras clave de la query.
-    """
-    if not candidatos:
-        return []
-
-    # 1. Extraemos keywords relevantes de la query (ej: "pelotero")
-    stop_short = ["que", "los", "las", "con", "para", "donde", "hay", "lugar"]
-    words = query.lower().split()
-    keywords = [w for w in words if len(w) > 3 and w not in stop_short]
-
+def obtener_evidencia_para_juez(candidatos, df, keywords):
+    """Worker function to be run in a thread to gather evidence for the Judge LLM."""
     texto_validacion = ""
-
-    # Analizamos Top 10
     for local in candidatos[:10]:
-        mask = df["restaurante"] == local
-        if not mask.any():
+        if local not in df.index:
             continue
-
-        row = df[mask].iloc[0]
+            
+        # O(1) indexed lookup instead of O(N) linear scan
+        reviews_local = df.loc[[local]]
+        row = reviews_local.iloc[0]
+        
         rating = safe_float(row.get("rating_gral", 0))
         total_reviews = safe_int(row.get("total_reviews_google", 0))
+        all_reviews = reviews_local["texto"].fillna("").astype(str)
 
-        all_reviews = df[mask]["texto"].fillna("").astype(str)
-
-        # 2. BÚSQUEDA DE EVIDENCIA
-        # Buscamos reseñas que contengan ALGUNA de las keywords
         evidence_reviews = []
         found_evidence = False
 
         if keywords:
-            for k in keywords:
-                # Buscamos filas que contengan la keyword 'k'
-                matches = all_reviews[
-                    all_reviews.str.lower().str.contains(k, regex=False)
-                ]
-                if not matches.empty:
-                    # Tomamos hasta 2 reseñas que hablen del tema
-                    evidence_reviews.extend(matches.head(2).tolist())
-                    found_evidence = True
+            # Optimize: use a single regex for all keywords instead of nested loop
+            pattern = "|".join([re.escape(k) for k in keywords])
+            matches = all_reviews[all_reviews.str.lower().str.contains(pattern, regex=True, na=False)]
+            if not matches.empty:
+                evidence_reviews = matches.head(2).tolist()
+                found_evidence = True
 
-        # 3. ARMADO DEL CONTEXTO (con rating y cantidad de reseñas)
         if found_evidence:
             snippet = " ... ".join(evidence_reviews)[:700]
             prefix = "EVIDENCIA:"
@@ -1979,6 +1957,22 @@ async def verificar_candidatos_con_llm(candidatos, df, query, llm):
             prefix = "RESEÑAS:"
 
         texto_validacion += f'- LOCAL: {local} (⭐{rating} - {total_reviews} reseñas)\n  {prefix} "...{snippet}..."\n\n'
+    return texto_validacion
+
+async def verificar_candidatos_con_llm(candidatos, df, query, llm):
+    """
+    JUEZ SEMÁNTICO (V3 - INDEXADO + THREADED):
+    Optimizado para evitar bloqueos del event loop y escaneos lineales.
+    """
+    if not candidatos:
+        return []
+
+    stop_short = ["que", "los", "las", "con", "para", "donde", "hay", "lugar"]
+    words = query.lower().split()
+    keywords = [w for w in words if len(w) > 3 and w not in stop_short]
+
+    # Offload evidence gathering to thread (regex on thousands of rows is CPU-bound)
+    texto_validacion = await asyncio.to_thread(obtener_evidencia_para_juez, candidatos, df, keywords)
 
     prompt = f"""
     Eres un validador de catálogo, NO un crítico. Query: "{query}"
