@@ -1,22 +1,20 @@
 app = "que-morfamos-api-black-paper-1056"
-primary_region = "gru"  # <--- CAMBIADO de 'gru' a 'eze' (Buenos Aires)
+primary_region = "gru"
 
 [http_service]
   internal_port = 8000
   force_https = true
-  auto_stop_machines = "stop"   # "stop" apaga después de idle, "suspend" es más rápido para retomar
+  auto_stop_machines = "stop"
   auto_start_machines = true
   min_machines_running = 0
 
   [http_service.concurrency]
     type = "requests"
-    soft_limit = 50    # Permite más requests concurrentes antes de escalar
+    soft_limit = 50
     hard_limit = 100
 
-
-
   [[http_service.checks]]
-    grace_period = "60s"   # <--- Aumentado a 60s por las dudas (Pandas es pesado)
+    grace_period = "90s"
     interval = "30s"
     method = "get"
     path = "/health"

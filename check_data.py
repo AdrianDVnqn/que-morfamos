@@ -9,14 +9,10 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 def check_places():
     engine = create_engine(DATABASE_URL)
     query = """
-    SELECT nombre as restaurante, zona, barrio, direccion 
+    SELECT nombre as restaurante, zona, barrio, direccion, latitud, longitud 
     FROM lugares 
-    WHERE nombre ILIKE '%%cerveceria owe%%' 
-       OR nombre ILIKE '%%bamb%%' 
-       OR nombre ILIKE '%%ribera%%'
-       OR nombre ILIKE '%%bordelesa%%'
+    WHERE nombre ILIKE '%%bordelesa%%'
        OR nombre ILIKE '%%carritos%%'
-       OR nombre ILIKE '%%patagonia%%refugio%%'
     """
     try:
         df = pd.read_sql(query, engine)
