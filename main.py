@@ -1262,7 +1262,8 @@ async def resumir_opiniones_local_gen(query_str, df, llm, topic=None, tone='cord
                 yield {
                     "type": "menu", 
                     "text": f"Encontré varios lugares con ese nombre. ¿Cuál decís?\n\n{lista_txt}\n\n*(Escribí el número)*", 
-                    "options": encontrados
+                    "options": encontrados,
+                    "labels": [lbl.replace("**", "") for lbl in labels]
                 }
                 return
 
@@ -1880,6 +1881,10 @@ async def procesar_consulta_gen(query, df, vectorstore, llm_mini, llm_smart, ctx
             if var in ctx: del ctx[var]
 
         try:
+            if df is None or df.empty:
+                yield {"type": "meta", "mode": "rag", "cards": [], "locs": [], "zona": zona_detectada}
+                yield {"type": "token", "content": "Aún no tengo información cargada en mi base de datos para responder."}
+                return
             if analisis.get("intencion") == "BLOCK":
                 ctx['strikes'] = strikes + 1
                 yield {"type": "meta", "mode": "rag"}
@@ -1924,11 +1929,14 @@ async def procesar_consulta_gen(query, df, vectorstore, llm_mini, llm_smart, ctx
             # ESTRATEGIA A: MODO GENÉRICO (Búsqueda por Categoría)
             if es_query_generica:
                 print(f"[DEBUG] 🚀 MODO GENÉRICO detectado para categorias: {categorias_detectadas[:3]}...", flush=True)
-                mask_cat = df['categoria'].isin(categorias_detectadas)
-                if mask_cat.any():
-                    candidatos_crudos = df[mask_cat]['restaurante'].unique().tolist()
-                    print(f"[DEBUG] 🏷️ Candidatos encontrados por categoría: {len(candidatos_crudos)}", flush=True)
-                    skip_juez = True # No necesitamos al Juez para verificar si un Bar es un Bar
+                if 'categoria' in df.columns:
+                    mask_cat = df['categoria'].isin(categorias_detectadas)
+                    if mask_cat.any():
+                        candidatos_crudos = df[mask_cat]['restaurante'].unique().tolist()
+                        print(f"[DEBUG] 🏷️ Candidatos encontrados por categoría: {len(candidatos_crudos)}", flush=True)
+                        skip_juez = True # No necesitamos al Juez para verificar si un Bar es un Bar
+                else:
+                    logger.warning("⚠️ Columna 'categoria' no encontrada en df.")
             
             # ESTRATEGIA B: MODO ESPECÍFICO (Vector Search + Hybrid)
             if not candidatos_crudos:
