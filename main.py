@@ -2698,20 +2698,7 @@ async def procesar_consulta_gen(
             detalles_exactos = construir_contexto_rapido(exactos, df_lugares)
             detalles_relacionados = construir_contexto_rapido(relacionados, df_lugares)
 
-            # Start background task
-            card_task = asyncio.create_task(
-                obtener_restaurant_cards(
-                    todos_los_locales,
-                    df_lugares,
-                    llm_mini,
-                    query,
-                    tone,
-                    strict_mode=False,
-                    keywords_list=keywords,
-                    synonyms_list=synonyms,
-                )
-            )
-
+            # Build prompt FIRST (cards deferred to avoid API contention)
             if exactos and relacionados:
                 prompt_rag = (
                     f"{tone_system_instruction(tone)}\n"
@@ -2752,12 +2739,30 @@ async def procesar_consulta_gen(
             )
 
             # STREAMING THE RAG RESPONSE
+            # Cards deferred: start AFTER first token to avoid OpenAI API contention
+            # (11 concurrent calls caused 32s throttle delay)
+            card_task = None
             async for token in astream_buffer(llm_mini, prompt_rag):
+                if card_task is None:
+                    # First token flowed → NOW start card generation in parallel
+                    print(f"[TIMING] First token at {time.time() - t_start:.2f}s. Starting card gen...", flush=True)
+                    card_task = asyncio.create_task(
+                        obtener_restaurant_cards(
+                            todos_los_locales,
+                            df_lugares,
+                            llm_mini,
+                            query,
+                            tone,
+                            strict_mode=False,
+                            keywords_list=keywords,
+                            synonyms_list=synonyms,
+                        )
+                    )
                 yield {"type": "token", "content": token}
 
             # AWAIT CARDS AND YIELD
             print(f"[TIMING] Text stream finished. Waiting for cards...", flush=True)
-            cards = await card_task
+            cards = await card_task if card_task else []
             t3 = time.time()
             print(
                 f"[TIMING] Card Gen finished at {t3 - t_start:.2f}s total (Latencia oculta)",
