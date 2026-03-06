@@ -2973,6 +2973,12 @@ async def chat_stream(req: QueryRequest, request: Request):
     client_ip = extract_client_ip(request)
 
     async def event_generator():
+        # === FLUSH PROXY BUFFER ===
+        # Fly.io's reverse proxy buffers small response chunks.
+        # Send a 4KB padding to exceed the proxy's buffer threshold,
+        # forcing it to forward all subsequent chunks immediately.
+        yield ": " + " " * 4096 + "\n\n"
+
         # Accumulators for Logging and Context
         full_text = ""
         mode = "general"
@@ -3016,13 +3022,13 @@ async def chat_stream(req: QueryRequest, request: Request):
                     if "zona" in event:
                         zona = event["zona"]
 
-                # Encode and yield
-                yield json.dumps(event, ensure_ascii=False) + "\n"
+                # Encode and yield as SSE data event
+                yield "data: " + json.dumps(event, ensure_ascii=False) + "\n\n"
         except Exception as e:
             logger.error(f"❌ Stream error | query='{req.query}' | error={e}")
-            yield json.dumps(
+            yield "data: " + json.dumps(
                 {"type": "error", "message": str(e)}, ensure_ascii=False
-            ) + "\n"
+            ) + "\n\n"
 
         # === POST-STREAMING LOGIC ===
 
@@ -3041,9 +3047,9 @@ async def chat_stream(req: QueryRequest, request: Request):
             new_ctx["original_query"] = req.conversation_context["original_query"]
 
         # Yield final context update event
-        yield json.dumps(
+        yield "data: " + json.dumps(
             {"type": "context_update", "context": new_ctx}, ensure_ascii=False
-        ) + "\n"
+        ) + "\n\n"
 
         # 2. Logging
         response_time = asyncio.get_event_loop().time() - start_time
