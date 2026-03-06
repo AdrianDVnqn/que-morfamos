@@ -48,7 +48,10 @@ UPSTASH_REDIS_REST_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN")
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 THEIPAPI_KEY = os.getenv("THEIPAPI_KEY")
 
-logger.info(f"🔌 Iniciando BACKEND con Colección: '{COLLECTION_NAME}'")
+# Versión del servidor — actualizar manualmente al hacer cambios significativos
+SERVER_VERSION = "v6.9"  # 2026-03-06: fix OOM (astype str), Arrow types, logging mejorado
+
+logger.info(f"🔌 Iniciando BACKEND {SERVER_VERSION} con Colección: '{COLLECTION_NAME}'")
 
 class RedisCacheManager:
     def __init__(self, url, token):
@@ -169,7 +172,8 @@ KEYWORD_TO_CATEGORIES = {
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global df, df_lugares, vectorstore, llm_mini, llm_smart
-    logger.info("☁️ Iniciando servidor (Lifespan v6.8)...")
+    startup_dt = datetime.now(ZoneInfo("America/Argentina/Buenos_Aires")).strftime("%Y-%m-%d %H:%M:%S ART")
+    logger.info(f"☁️ Servidor iniciado | {SERVER_VERSION} | {startup_dt}")
     
     # Notificar activación del backend
     try:
@@ -221,12 +225,14 @@ async def lifespan(app: FastAPI):
                         ~df['direccion'].str.contains('Cipolletti|Plottier|Centenario|Senillosa|Añelo|R8324', case=False, na=False)
             df = df[mask_cp | mask_city]
             
-            # Convertir rating_gral — usar to_numpy() para salir del tipo Arrow-backed
-            # que retorna SQLAlchemy en algunas versiones y que pd.to_numeric() no entiende
+            # Convertir rating_gral — salida del tipo Arrow-backed con to_numpy()
+            # pd.to_numeric sobre una lista devuelve ndarray (sin .fillna), por eso wrapeamos con pd.Series
             if 'rating_gral' in df.columns:
-                rating_vals = df['rating_gral'].to_numpy(dtype=str, na_value='0')
-                rating_vals = [v.replace(',', '.') for v in rating_vals]
-                df['rating_gral'] = pd.to_numeric(rating_vals, errors='coerce').fillna(0.0)
+                rating_raw = df['rating_gral'].to_numpy(dtype=str, na_value='0')
+                rating_clean = [v.replace(',', '.') for v in rating_raw]
+                df['rating_gral'] = pd.Series(
+                    pd.to_numeric(rating_clean, errors='coerce'), index=df.index
+                ).fillna(0.0)
             
             # --- MEMORY CLEANUP: ASCII pre-calculation removed to prevent OOM ---
             # We no longer pre-calculate texto_ascii for all 183k reviews.
@@ -2362,14 +2368,24 @@ async def chat_stream(req: QueryRequest, request: Request):
         locs = []
         pend = None
         zona = None
+        intent_debug = ""
+        
+        # LOG DE ENTRADA — visible en Fly.io
+        logger.info(f"📥 QUERY | '{req.query}' | ip={client_ip} | tone={req.tone or '-'}")
         
         try:
             async for event in procesar_consulta_gen(req.query, df, vectorstore, llm_mini, llm_smart, ctx, user_ip=client_ip):
                 # Update accumulators
                 if event["type"] == "token":
                     full_text += event["content"]
+                elif event["type"] == "debug":
+                    # Capturar intent del debug message para el log final
+                    msg = event.get("message", "")
+                    if "🧠 INTENCIóN:" in msg or "INTENCION" in msg.upper():
+                        intent_debug = msg
                 elif event["type"] == "meta":
-                    if "mode" in event: mode = event["mode"]
+                    if "mode" in event: 
+                        mode = event["mode"]
                     if "cards" in event: 
                         cards = event["cards"]
                         # Convert Pydantic models to dicts for JSON serialization
@@ -2381,7 +2397,7 @@ async def chat_stream(req: QueryRequest, request: Request):
                 # Encode and yield
                 yield json.dumps(event, ensure_ascii=False) + "\n"
         except Exception as e:
-             logger.error(f"Stream error: {e}")
+             logger.error(f"❌ Stream error | query='{req.query}' | error={e}")
              yield json.dumps({"type": "error", "message": str(e)}, ensure_ascii=False) + "\n"
 
         # === POST-STREAMING LOGIC ===
@@ -2400,11 +2416,18 @@ async def chat_stream(req: QueryRequest, request: Request):
         # 2. Logging
         response_time = asyncio.get_event_loop().time() - start_time
         restaurants = [c.nombre for c in cards] if cards else []
+        rest_str = ", ".join(restaurants[:4]) + (" ..." if len(restaurants) > 4 else "") if restaurants else "-"
+        resp_preview = full_text[:120].replace("\n", " ") if full_text else "-"
+        
+        logger.info(
+            f"📤 RESP | mode={mode} | zona={zona or 'global'} | "
+            f"lugares={len(restaurants)} ({rest_str}) | "
+            f"{response_time:.1f}s | preview='{resp_preview}'"
+        )
         
         ai_provider = None
         if llm_mini: ai_provider = f"Mini:{llm_mini.model_name}"
         if llm_smart and mode in ["rag", "resumen"]: ai_provider = f"Smart:{llm_smart.model_name}"
-
         asyncio.create_task(log_user_query_to_discord(
             request, 
             req.query, 
