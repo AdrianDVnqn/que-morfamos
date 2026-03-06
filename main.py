@@ -59,7 +59,7 @@ THEIPAPI_KEY = os.getenv("THEIPAPI_KEY")
 
 # Versión del servidor — actualizar manualmente al hacer cambios significativos
 SERVER_VERSION = (
-    "v7.0"  # 2026-03-06: O(1) indexed lookups, asyncio.to_thread for Pandas, health check fix
+    "v8.0"  # 2026-03-06: LAZY reviews architecture — only df_lugares (936 rows) in memory
 )
 
 logger.info(f"🔌 Iniciando BACKEND {SERVER_VERSION} con Colección: '{COLLECTION_NAME}'")
@@ -124,6 +124,7 @@ cache = RedisCacheManager(UPSTASH_REDIS_REST_URL, UPSTASH_REDIS_REST_TOKEN)
 # Variables globales
 df = None
 df_lugares = None
+db_engine = None  # SQLAlchemy engine for lazy-load queries
 vectorstore = None
 llm_mini = None
 llm_smart = None
@@ -232,95 +233,50 @@ async def lifespan(app: FastAPI):
 
     if DATABASE_URL:
         try:
-            engine = create_engine(DATABASE_URL)
+            db_engine = create_engine(DATABASE_URL)
 
-            # 1. Cargar REVIEWS (Tabla ligera, solo lo necesario para búsqueda)
-            query_revs = """
-                SELECT restaurante, autor, rating_user, texto, fecha_aproximada as fecha, review_id
-                FROM reviews
-            """
-            df = pd.read_sql(query_revs, engine)
-            logger.info(f"📊 Reseñas cargadas: {len(df)} filas")
-
-            # 2. Cargar LUGARES (Una fila por lugar, incluye resumen pesado)
+            # LAZY ARCHITECTURE v8: Solo cargamos df_lugares (936 filas)
+            # Las reviews (155k+) se consultan bajo demanda por restaurante.
             query_lugares = """
                 SELECT nombre as restaurante, rating_gral, total_reviews_google, direccion,
                        latitud, longitud, barrio, zona, categoria, resumen_reviews
                 FROM lugares
             """
-            df_lugares = pd.read_sql(query_lugares, engine)
+            df_lugares = pd.read_sql(query_lugares, db_engine)
             logger.info(f"📊 Lugares cargados: {len(df_lugares)} locales")
 
-            # Combinar metadatos de lugares (sin texto pesado) para filtros de zona/categoria
-            # Solo columnas ligeras: NO resumen_reviews
-            df = df.merge(
-                df_lugares.drop(columns=["resumen_reviews"]),
-                on="restaurante",
-                how="left",
-            )
-
-            # Fix OOM: NO usamos .astype(str) en columnas de texto porque convierte
-            # a NumPy array de ancho fijo (<U4097) que consume ~2.8GB en 183k filas.
-            # Usamos fillna() sobre object dtype nativo que Pandas retorna de SQL.
-            cols_ligeras = [
-                "restaurante",
-                "direccion",
-                "barrio",
-                "zona",
-                "autor",
-                "fecha",
-            ]
+            # Limpiar columnas ligeras
+            cols_ligeras = ["restaurante", "direccion", "barrio", "zona"]
             for col in cols_ligeras:
-                if col in df.columns:
-                    df[col] = df[col].fillna("").str.strip()
+                if col in df_lugares.columns:
+                    df_lugares[col] = df_lugares[col].fillna("").str.strip()
+            if "resumen_reviews" in df_lugares.columns:
+                df_lugares["resumen_reviews"] = df_lugares["resumen_reviews"].fillna("")
 
-            # 'texto' solo se limpia con fillna(""): sin strip() ni astype() para no explotar RAM.
-            if "texto" in df.columns:
-                df["texto"] = df["texto"].fillna("")
-
-            # --- FILTRO GEOGRÁFICO: Solo Neuquén Capital ---
-            # Antes era solo por CP (Q8300/1/2), pero Google no siempre lo provee.
-            mask_cp = df["direccion"].str.contains(
-                "Q8300|Q8301|Q8302", case=False, na=False
-            )
-            mask_city = df["direccion"].str.contains(
-                "Neuquén", case=False, na=False
-            ) & ~df["direccion"].str.contains(
-                "Cipolletti|Plottier|Centenario|Senillosa|Añelo|R8324",
-                case=False,
-                na=False,
-            )
-            df = df[mask_cp | mask_city]
-
-            # Convertir rating_gral — salida del tipo Arrow-backed con to_numpy()
-            # pd.to_numeric sobre una lista devuelve ndarray (sin .fillna), por eso wrapeamos con pd.Series
-            if "rating_gral" in df.columns:
-                rating_raw = df["rating_gral"].to_numpy(dtype=str, na_value="0")
+            # Convertir rating_gral
+            if "rating_gral" in df_lugares.columns:
+                rating_raw = df_lugares["rating_gral"].to_numpy(dtype=str, na_value="0")
                 rating_clean = [v.replace(",", ".") for v in rating_raw]
-                df["rating_gral"] = pd.Series(
-                    pd.to_numeric(rating_clean, errors="coerce"), index=df.index
+                df_lugares["rating_gral"] = pd.Series(
+                    pd.to_numeric(rating_clean, errors="coerce"), index=df_lugares.index
                 ).fillna(0.0)
 
-            # --- MEMORY CLEANUP: ASCII pre-calculation removed to prevent OOM ---
-            # We no longer pre-calculate texto_ascii for all 183k reviews.
-            # Normalization is done on-the-fly for the small df_lugares when needed.
-
-            # --- INDEXING: Crucial for performance with 180k rows ---
-            # Set index to restaurant name for O(1) lookups instead of O(N) scans.
-            if not df.empty and "restaurante" in df.columns:
-                df.set_index("restaurante", inplace=True, drop=False)
-                # Ensure the index is sorted for potentially faster slicings/lookups
-                df.sort_index(inplace=True)
+            # Indexar por nombre de restaurante para O(1) lookups
             if not df_lugares.empty and "restaurante" in df_lugares.columns:
                 df_lugares.set_index("restaurante", inplace=True, drop=False)
 
-            gc.collect()  # Libera memoria después del merge y limpieza inicial
-            logger.info(f"✅ DataFrames listos e indexados: {len(df)} reviews en memoria.")
+            # df ya no se carga; se usa None como señal para lazy-load
+            df = None
+
+            gc.collect()
+            logger.info(f"✅ df_lugares indexado: {len(df_lugares)} locales. Reviews: LAZY MODE.")
         except Exception as e:
             logger.error(f"❌ Error cargando datos: {e}")
-            df = pd.DataFrame()
+            df_lugares = pd.DataFrame()
+            df = None
     else:
-        df = pd.DataFrame()
+        df_lugares = pd.DataFrame()
+        df = None
 
     try:
         embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
@@ -385,6 +341,50 @@ async def lifespan(app: FastAPI):
         )
     except Exception as e:
         logger.warning(f"No se pudo notificar shutdown a Discord: {e}")
+
+
+# ==========================================
+# LAZY-LOAD: Reviews bajo demanda desde PostgreSQL
+# ==========================================
+def _fetch_reviews_sync(nombres: list, limit_per_local: int = 15):
+    """Sync worker for fetching reviews from DB. Runs in thread."""
+    global db_engine
+    if db_engine is None or not nombres:
+        return pd.DataFrame()
+    
+    # Use parameterized query for safety
+    placeholders = ", ".join([f"'{n.replace(chr(39), chr(39)+chr(39))}'" for n in nombres])
+    query = f"""
+        SELECT restaurante, autor, rating_user, texto, fecha_aproximada as fecha
+        FROM reviews
+        WHERE restaurante IN ({placeholders})
+    """
+    try:
+        result = pd.read_sql(query, db_engine)
+        if not result.empty and "texto" in result.columns:
+            result["texto"] = result["texto"].fillna("")
+        return result
+    except Exception as e:
+        logger.error(f"Error lazy-loading reviews: {e}")
+        return pd.DataFrame()
+
+
+async def obtener_reviews_por_local(nombres: list, limit_per_local: int = 15):
+    """
+    LAZY-LOAD: Trae reviews de PostgreSQL solo para los restaurantes necesarios.
+    Se ejecuta en un thread para no bloquear el event loop.
+    Retorna un DataFrame indexado por 'restaurante' (compatible con el viejo df).
+    """
+    if not nombres:
+        return pd.DataFrame()
+    
+    result = await asyncio.to_thread(_fetch_reviews_sync, nombres, limit_per_local)
+    
+    if not result.empty and "restaurante" in result.columns:
+        result.set_index("restaurante", inplace=True, drop=False)
+        result.sort_index(inplace=True)
+    
+    return result
 
 
 # ==========================================
@@ -1141,7 +1141,7 @@ def obtener_reviews_tematicas(df_local, keywords, limit=8):
 
 async def obtener_restaurant_cards(
     nombres_restaurantes,
-    df,
+    df_lugares_ref,
     llm,
     query_context=None,
     tone="cordial",
@@ -1149,6 +1149,10 @@ async def obtener_restaurant_cards(
     keywords_list=None,
     synonyms_list=None,
 ):
+    """
+    LAZY v8: Usa df_lugares para metadata y resumen_reviews para sample text.
+    Ya no depende del DataFrame de 155k reviews.
+    """
     cards = []
     tasks = []
 
@@ -1160,91 +1164,49 @@ async def obtener_restaurant_cards(
     if synonyms_list:
         for s in synonyms_list:
             search_terms.add(s.lower())
-
-    # Si la lista vino vacía, usamos la query original
     if not search_terms and query_context:
         search_terms.add(query_context.lower())
 
-    # Filtramos palabras muy cortas
     final_search_terms = [k for k in search_terms if len(k) > 3]
 
     for nombre in nombres_restaurantes:
-        if not nombre or nombre not in df.index:
+        if not nombre or nombre not in df_lugares_ref.index:
             continue
-            
-        # O(1) indexed lookup instead of O(N) linear scan
-        rest_df = df.loc[[nombre]]
-        row = rest_df.iloc[0]
+
+        row = df_lugares_ref.loc[nombre]
+        if isinstance(row, pd.DataFrame): row = row.iloc[0]
         nombre_real = safe_str(row.get("restaurante", nombre))
 
-        # 2. BÚSQUEDA DE EVIDENCIA
-        if final_search_terms:
-            reviews_filtradas = obtener_reviews_tematicas(
-                rest_df, final_search_terms, limit=8
-            )
-
-            if not reviews_filtradas.empty:
-                # Unimos hasta 3000 chars para asegurar contexto completo
-                sample_text = " ... ".join(
-                    [safe_str(t) for t in reviews_filtradas["texto"]]
-                )[:3000]
-                best_review = reviews_filtradas.iloc[0]
-            else:
-                sample_text = " ".join(
-                    [safe_str(t) for t in rest_df["texto"].head(5)]
-                )[:1000]
-                best_review = rest_df.iloc[0]
+        # 2. SAMPLE TEXT desde resumen_reviews (disponible en df_lugares)
+        resumen = safe_str(row.get("resumen_reviews", ""))
+        if resumen and len(resumen) > 30:
+            sample_text = resumen[:3000]
+            frase = resumen[:200] + "..."
         else:
-            sample_text = " ".join([safe_str(t) for t in rest_df["texto"].head(5)])[
-                :1000
-            ]
-            best_review = rest_df.iloc[0]
+            sample_text = f"Restaurante en Neuquén con {safe_int(row.get('total_reviews_google', 0))} reseñas."
+            frase = sample_text
+        autor = "Google Reviews"
 
-        # 3. EXTRACCIÓN DE EVIDENCIA Y GENERACIÓN CON LLM
-        frase = safe_str(best_review["texto"])[:200] + "..."
-        autor = formatear_autor(best_review.get("autor"))
-
-        # Cache key única por tema de búsqueda
-        topic_key = (
-            "-".join(sorted(list(search_terms))) if search_terms else "general"
-        )
+        # 3. GENERACIÓN DE DESCRIPCIÓN
+        topic_key = "-".join(sorted(list(search_terms))) if search_terms else "general"
         cache_key = f"desc_{nombre_real}_{topic_key}_{sanitize_tone(tone)}"
-
         desc = cache.get_json("desc", cache_key)
 
         if desc:
-            tasks.append(
-                {
-                    "type": "cached",
-                    "val": desc,
-                    "row": row,
-                    "frase": frase,
-                    "autor": autor,
-                    "nombre_real": nombre_real,
-                }
-            )
+            tasks.append({
+                "type": "cached", "val": desc, "row": row,
+                "frase": frase, "autor": autor, "nombre_real": nombre_real,
+            })
         else:
-            # El prompt le dice al LLM qué buscar
-            if final_search_terms:
-                contexto_extra = f"El usuario busca conceptos relacionados con: '{', '.join(final_search_terms)}'. Si aparecen en las reviews, MENCIONALO."
-            else:
-                contexto_extra = ""
-
-            # Reutilizamos la función helper
+            contexto_extra = f"El usuario busca conceptos relacionados con: '{', '.join(final_search_terms)}'. Si aparecen, MENCIONALO." if final_search_terms else ""
             task_coro = generar_descripcion_async_tematica(
                 llm, nombre_real, sample_text, tone, contexto_extra
             )
-            tasks.append(
-                {
-                    "type": "generate",
-                    "val": task_coro,
-                    "row": row,
-                    "frase": frase,
-                    "autor": autor,
-                    "nombre_real": nombre_real,
-                    "cache_key": cache_key,
-                }
-            )
+            tasks.append({
+                "type": "generate", "val": task_coro, "row": row,
+                "frase": frase, "autor": autor, "nombre_real": nombre_real,
+                "cache_key": cache_key,
+            })
 
     # Ejecución Async
     generations_needed = [t["val"] for t in tasks if t["type"] == "generate"]
@@ -1935,46 +1897,39 @@ async def responder_followup_gen(restaurante, query, df, llm, tone="cordial"):
     except Exception as e:
         logger.error(f"Error responder_followup: {e}")
         yield {"type": "token", "content": "Tuve un error procesando tu pregunta."}
-def obtener_evidencia_para_juez(candidatos, df, keywords):
-    """Worker function to be run in a thread to gather evidence for the Judge LLM."""
+def obtener_evidencia_para_juez(candidatos, df_lugares_ref, keywords):
+    """LAZY v8: Usa resumen_reviews de df_lugares (936 filas) en vez de 155k reviews."""
     texto_validacion = ""
     for local in candidatos[:10]:
-        if local not in df.index:
+        if local not in df_lugares_ref.index:
             continue
-            
-        # O(1) indexed lookup instead of O(N) linear scan
-        reviews_local = df.loc[[local]]
-        row = reviews_local.iloc[0]
-        
+
+        row = df_lugares_ref.loc[local]
+        if isinstance(row, pd.DataFrame): row = row.iloc[0]
+
         rating = safe_float(row.get("rating_gral", 0))
         total_reviews = safe_int(row.get("total_reviews_google", 0))
-        all_reviews = reviews_local["texto"].fillna("").astype(str)
+        resumen = safe_str(row.get("resumen_reviews", ""))
 
-        evidence_reviews = []
-        found_evidence = False
+        if not resumen or len(resumen) < 20:
+            resumen = f"Restaurante en Neuquén con {total_reviews} reseñas."
+
+        # Buscar evidencia en el resumen
+        snippet = resumen[:700].replace("\n", " ")
+        prefix = "RESUMEN:"
 
         if keywords:
-            # Optimize: use a single regex for all keywords instead of nested loop
             pattern = "|".join([re.escape(k) for k in keywords])
-            matches = all_reviews[all_reviews.str.lower().str.contains(pattern, regex=True, na=False)]
-            if not matches.empty:
-                evidence_reviews = matches.head(2).tolist()
-                found_evidence = True
-
-        if found_evidence:
-            snippet = " ... ".join(evidence_reviews)[:700]
-            prefix = "EVIDENCIA:"
-        else:
-            snippet = " ... ".join(all_reviews.head(5).tolist())[:700]
-            prefix = "RESEÑAS:"
+            if re.search(pattern, resumen, re.IGNORECASE):
+                prefix = "EVIDENCIA:"
 
         texto_validacion += f'- LOCAL: {local} (⭐{rating} - {total_reviews} reseñas)\n  {prefix} "...{snippet}..."\n\n'
     return texto_validacion
 
-async def verificar_candidatos_con_llm(candidatos, df, query, llm):
+async def verificar_candidatos_con_llm(candidatos, df_lugares_ref, query, llm):
     """
-    JUEZ SEMÁNTICO (V3 - INDEXADO + THREADED):
-    Optimizado para evitar bloqueos del event loop y escaneos lineales.
+    JUEZ SEMÁNTICO (V4 - LAZY):
+    Usa df_lugares.resumen_reviews en vez de reviews individuales.
     """
     if not candidatos:
         return []
@@ -1983,8 +1938,8 @@ async def verificar_candidatos_con_llm(candidatos, df, query, llm):
     words = query.lower().split()
     keywords = [w for w in words if len(w) > 3 and w not in stop_short]
 
-    # Offload evidence gathering to thread (regex on thousands of rows is CPU-bound)
-    texto_validacion = await asyncio.to_thread(obtener_evidencia_para_juez, candidatos, df, keywords)
+    # Evidencia desde resumen_reviews (936 filas, instantáneo)
+    texto_validacion = await asyncio.to_thread(obtener_evidencia_para_juez, candidatos, df_lugares_ref, keywords)
 
     prompt = f"""
     Eres un validador de catálogo, NO un crítico. Query: "{query}"
@@ -2144,29 +2099,32 @@ def obtener_categorias_desde_keywords(keywords, synonyms):
 
 
 def procesar_recomendacion_pesado(
-    candidatos_crudos, df_ref, df_lugares_ref, keywords, synonyms, es_query_generica, zona_detectada
+    candidatos_crudos, df_lugares_ref, keywords, synonyms, es_query_generica, zona_detectada
 ):
     """
     Función síncrona para ejecutar las operaciones pesadas de Pandas/CPU fuera del event loop.
+    LAZY v8: Ya no usa df de reviews (155k). Solo usa df_lugares (936 filas).
     Retorna (candidatos_a_verificar, grupo_alta_relevancia).
     """
     # 1. Filtro de zona inicial
     if zona_detectada:
         candidatos_crudos = aplicar_filtro_zona(candidatos_crudos, None, zona_detectada, verbose=False)
 
-    # 2. HYBRID INJECTION
-    if keywords:
-        df_para_inyectar = df_ref
+    # 2. HYBRID INJECTION (ahora sobre resumen_reviews de df_lugares — 936 filas)
+    if keywords and "resumen_reviews" in df_lugares_ref.columns:
+        df_para_buscar = df_lugares_ref
         if zona_detectada:
             locales_en_zona = aplicar_filtro_zona(df_lugares_ref.index.tolist(), None, zona_detectada, verbose=False)
-            df_para_inyectar = df_ref.loc[df_ref.index.isin(locales_en_zona)]
+            valid_locales = [l for l in locales_en_zona if l in df_lugares_ref.index]
+            if valid_locales:
+                df_para_buscar = df_lugares_ref.loc[valid_locales]
 
         for kw in keywords:
             if len(kw) < 4: continue
-            mask = df_para_inyectar["texto"].str.contains(re.escape(kw), case=False, na=False)
+            mask = df_para_buscar["resumen_reviews"].str.contains(re.escape(kw), case=False, na=False)
             if mask.any():
-                counts = df_para_inyectar[mask]["restaurante"].value_counts()
-                for cand in counts.head(10).index.tolist():
+                matches = df_para_buscar[mask].index.tolist()
+                for cand in matches[:10]:
                     if cand not in candidatos_crudos:
                         candidatos_crudos.append(cand)
 
@@ -2180,7 +2138,7 @@ def procesar_recomendacion_pesado(
                 candidatos_limpios.append(local)
     candidatos_crudos = candidatos_limpios
 
-    # 4. RELEVANCIA Y SORTING
+    # 4. RELEVANCIA Y SORTING (ahora sobre resumen_reviews)
     filtro_terms = [t.lower() for t in (set(keywords) | set(synonyms or [])) if len(t) > 3]
     grupo_alta = []
     grupo_baja = []
@@ -2193,11 +2151,12 @@ def procesar_recomendacion_pesado(
 
     if es_query_generica:
         grupo_alta = candidatos_crudos
-    elif filtro_terms:
+    elif filtro_terms and "resumen_reviews" in df_lugares_ref.columns:
         patron = "|".join([re.escape(t) for t in filtro_terms])
         for local in candidatos_crudos:
-            if local in df_ref.index:
-                if df_ref.loc[[local]]["texto"].fillna("").str.contains(patron, case=False, na=False).any():
+            if local in df_lugares_ref.index:
+                resumen = safe_str(df_lugares_ref.loc[local].get("resumen_reviews", "")).lower()
+                if re.search(patron, resumen):
                     grupo_alta.append(local)
                     continue
             grupo_baja.append(local)
@@ -2209,6 +2168,7 @@ def procesar_recomendacion_pesado(
 
     candidatos_verif = (grupo_alta[:12] + grupo_baja[:12])[:12]
     return candidatos_verif, grupo_alta
+
 
 
 async def procesar_consulta_gen(
@@ -2612,14 +2572,14 @@ async def procesar_consulta_gen(
             # ESTRATEGIA A: MODO GENÉRICO (Búsqueda por Categoría)
             if es_query_generica:
                 print(f"[DEBUG] 🚀 MODO GENÉRICO detectado para categorias: {categorias_detectadas[:3]}...", flush=True)
-                if "categoria" in df.columns:
-                    mask_cat = df["categoria"].isin(categorias_detectadas)
+                if "categoria" in df_lugares.columns:
+                    mask_cat = df_lugares["categoria"].isin(categorias_detectadas)
                     if mask_cat.any():
-                        candidatos_crudos = df[mask_cat]["restaurante"].unique().tolist()
+                        candidatos_crudos = df_lugares[mask_cat]["restaurante"].unique().tolist()
                         print(f"[DEBUG] 🏷️ Candidatos encontrados por categoría: {len(candidatos_crudos)}", flush=True)
                         skip_juez = True
                 else:
-                    logger.warning("⚠️ Columna 'categoria' no encontrada en df.")
+                    logger.warning("⚠️ Columna 'categoria' no encontrada en df_lugares.")
 
             # ESTRATEGIA B: MODO ESPECÍFICO (Vector Search + Hybrid)
             if not candidatos_crudos:
@@ -2631,7 +2591,6 @@ async def procesar_consulta_gen(
             candidatos_a_verificar, grupo_alta_relevancia = await asyncio.to_thread(
                 procesar_recomendacion_pesado,
                 candidatos_crudos,
-                df,
                 df_lugares,
                 keywords,
                 synonyms,
@@ -2660,7 +2619,7 @@ async def procesar_consulta_gen(
             else:
                 t0 = time.time()
                 locales_verificados = await verificar_candidatos_con_llm(
-                    candidatos_a_verificar, df, query_para_juez, llm_mini
+                    candidatos_a_verificar, df_lugares, query_para_juez, llm_mini
                 )
                 t1 = time.time()
                 print(f"[TIMING] Juez LLM took {t1-t0:.2f}s", flush=True)
@@ -2719,8 +2678,8 @@ async def procesar_consulta_gen(
             t2 = time.time()
             todos_los_locales = exactos + relacionados  # Up to 10 cards total
 
-            # Helper para el contexto RÁPIDO (O(1) lookups)
-            def construir_contexto_rapido(nombres, df_lugares_ref, df_reviews_ref):
+            # Helper para el contexto RÁPIDO — usa solo df_lugares.resumen_reviews
+            def construir_contexto_rapido(nombres, df_lugares_ref):
                 contexto = ""
                 for nom in nombres:
                     if nom not in df_lugares_ref.index:
@@ -2730,30 +2689,20 @@ async def procesar_consulta_gen(
 
                     rat = safe_float(row_l.get("rating_gral"))
                     revs = safe_int(row_l.get("total_reviews_google"))
-
-                    # Priorizamos el resumen inteligente IA
                     resumen_ia = safe_str(row_l.get("resumen_reviews"))
-                    if resumen_ia and len(resumen_ia) > 30:
-                        texto_final = resumen_ia[:600].replace("\n", " ")
-                    else:
-                        # Fallback a snippet de reseñas indexado
-                        if nom in df_reviews_ref.index:
-                            reviews_local = df_reviews_ref.loc[[nom]]
-                            texto_final = safe_str(reviews_local.iloc[0].get("texto", ""))[:400].replace("\n", " ")
-                        else:
-                            texto_final = "No hay descripción disponible."
+                    texto_final = resumen_ia[:600].replace("\n", " ") if resumen_ia and len(resumen_ia) > 30 else "Restaurante popular en Neuquén."
 
                     contexto += f"- {nom} ({rat}⭐, {revs} res): {texto_final}...\n"
                 return contexto
 
-            detalles_exactos = construir_contexto_rapido(exactos, df_lugares, df)
-            detalles_relacionados = construir_contexto_rapido(relacionados, df_lugares, df)
+            detalles_exactos = construir_contexto_rapido(exactos, df_lugares)
+            detalles_relacionados = construir_contexto_rapido(relacionados, df_lugares)
 
             # Start background task
             card_task = asyncio.create_task(
                 obtener_restaurant_cards(
                     todos_los_locales,
-                    df,
+                    df_lugares,
                     llm_mini,
                     query,
                     tone,
@@ -2916,36 +2865,54 @@ def read_root():
 
 @app.get("/health")
 def health_check():
-    return {"status": "healthy", "df_size": len(df) if df is not None else 0}
+    return {
+        "status": "healthy",
+        "version": SERVER_VERSION,
+        "lugares": len(df_lugares) if df_lugares is not None else 0,
+        "reviews": "LAZY_MODE",
+    }
 
 
 @app.get("/restaurant/{nombre}", response_model=RestaurantDetail)
 async def get_restaurant_detail(
     nombre: str, topic: Optional[str] = None, tone: Optional[str] = None
 ):
-    global df, llm_mini
+    global df_lugares, llm_mini
     if not nombre:
         raise HTTPException(status_code=404)
-    mask = df["restaurante"].str.lower() == nombre.lower()
-    if not mask.any():
+
+    # Buscar en df_lugares
+    if df_lugares is None or nombre.lower() not in [n.lower() for n in df_lugares.index.tolist()]:
         raise HTTPException(status_code=404, detail="No encontrado")
 
-    rest_df = df[mask]
-    row = rest_df.iloc[0]
-    nombre_real = safe_str(row["restaurante"])
+    # Encontrar el nombre exacto
+    nombre_exacto = None
+    for n in df_lugares.index.tolist():
+        if n.lower() == nombre.lower():
+            nombre_exacto = n
+            break
+    if not nombre_exacto:
+        raise HTTPException(status_code=404, detail="No encontrado")
 
-    sorted_reviews = rankear_reviews_por_topico(rest_df, topic)
+    row = df_lugares.loc[nombre_exacto]
+    if isinstance(row, pd.DataFrame): row = row.iloc[0]
+    nombre_real = safe_str(row.get("restaurante", nombre_exacto))
+
+    # Lazy-load reviews para este restaurante
+    reviews_df = await obtener_reviews_por_local([nombre_exacto])
     reviews_list = []
-    for _, r in sorted_reviews.head(8).iterrows():
-        if len(safe_str(r.get("texto"))) > 10:
-            reviews_list.append(
-                ReviewDetail(
-                    autor=formatear_autor(r.get("autor")),
-                    rating=safe_int(r.get("rating_user")),
-                    texto=safe_str(r.get("texto"))[:2000],
-                    fecha=safe_str(r.get("fecha")),
+    if not reviews_df.empty:
+        sorted_reviews = rankear_reviews_por_topico(reviews_df, topic)
+        for _, r in sorted_reviews.head(8).iterrows():
+            if len(safe_str(r.get("texto"))) > 10:
+                reviews_list.append(
+                    ReviewDetail(
+                        autor=formatear_autor(r.get("autor")),
+                        rating=safe_int(r.get("rating_user")),
+                        texto=safe_str(r.get("texto"))[:2000],
+                        fecha=safe_str(r.get("fecha")),
+                    )
                 )
-            )
 
     tone = sanitize_tone(tone)
     cache_key = f"{nombre_real}_{topic}_{tone}" if topic else f"{nombre_real}__{tone}"
@@ -3017,7 +2984,7 @@ async def chat_stream(req: QueryRequest, request: Request):
 
         try:
             async for event in procesar_consulta_gen(
-                req.query, df, vectorstore, llm_mini, llm_smart, ctx, user_ip=client_ip
+                req.query, df_lugares, vectorstore, llm_mini, llm_smart, ctx, user_ip=client_ip
             ):
                 # Update accumulators
                 if event["type"] == "token":
