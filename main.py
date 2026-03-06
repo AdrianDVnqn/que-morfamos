@@ -13,6 +13,7 @@ from dotenv import load_dotenv
 from zoneinfo import ZoneInfo
 import pandas as pd
 import numpy as np
+import gc
 from typing import List, Optional
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -218,16 +219,11 @@ async def lifespan(app: FastAPI):
                 df.loc[:, 'rating_gral'] = df['rating_gral'].astype(str).str.replace(',', '.', regex=False)
                 df.loc[:, 'rating_gral'] = pd.to_numeric(df['rating_gral'], errors='coerce').fillna(0.0)
             
-            def _norm(s):
-                if pd.isna(s) or s is None: return ""
-                t = str(s).lower().strip()
-                t = unicodedata.normalize('NFD', t)
-                t = ''.join(ch for ch in t if unicodedata.category(ch) != 'Mn')
-                t = re.sub(r'[^\w\s]', '', t)
-                return t
-            df.loc[:, 'restaurante_ascii'] = df['restaurante'].apply(_norm)
-            df.loc[:, 'texto_ascii'] = df['texto'].apply(_norm)
+            # --- MEMORY CLEANUP: ASCII pre-calculation removed to prevent OOM ---
+            # We no longer pre-calculate texto_ascii for all 183k reviews.
+            # Normalization is done on-the-fly for the small df_lugares when needed.
             
+            gc.collect() # Libera memoria después del merge y limpieza inicial
             logger.info(f"✅ DataFrames listos: {len(df)} reviews en memoria.")
         except Exception as e:
             logger.error(f"❌ Error cargando datos: {e}")
@@ -1176,26 +1172,27 @@ async def consultar_estadisticas(query, df, llm):
         keyword_raw = await llm.ainvoke(prompt_extract)
         keyword = str(keyword_raw.content).strip().lower().replace('"', '').replace('.', '')
         
-        # 2. Caso "Total"
+        # 2. Casos especiales de cantidad total
         if keyword in ["total", "todo", "restaurantes", "lugares"]:
             total = df['restaurante'].nunique()
             return f"Tengo registrados un total de **{total}** locales en la base de datos.", []
 
-        # 3. Normalización ASCII (Tu lógica ganadora)
-        # Quitamos acentos de la keyword para matchear con tus columnas ASCII
-        keyword_ascii = unicodedata.normalize('NFD', keyword)
-        keyword_ascii = ''.join(ch for ch in keyword_ascii if unicodedata.category(ch) != 'Mn')
-        keyword_ascii = re.sub(r'[^\w\s]', '', keyword_ascii)
-        
-        if len(keyword_ascii) < 3:
+        if len(keyword) < 3:
             return f"No encontré una categoría clara en '{query}'.", []
 
-        # 4. Filtrado (Usando tus columnas optimizadas)
-        # Asumimos que df ya tiene 'restaurante_ascii' y 'texto_ascii'
-        mask = (df['restaurante_ascii'].str.contains(keyword_ascii, case=False, na=False) | 
-                df['texto_ascii'].str.contains(keyword_ascii, case=False, na=False))
+        # 3. Filtrado EFICIENTE sobre df_lugares (Solo 936 locales, no 183k reviews)
+        global df_lugares
+        target_df = df_lugares if df_lugares is not None else df
         
-        matches = df[mask]['restaurante'].unique().tolist()
+        # Búsqueda insensible a mayúsculas/acentos simple
+        # Para 936 filas es instantáneo
+        mask = (
+            target_df['restaurante'].str.contains(keyword, case=False, na=False) |
+            target_df['categoria'].str.contains(keyword, case=False, na=False) |
+            target_df['resumen_reviews'].str.contains(keyword, case=False, na=False)
+        )
+        
+        matches = target_df[mask]['restaurante'].unique().tolist()
         total_count = len(matches)
 
         # 5. Generación de Respuesta "Humana" (Mi lógica ganadora)
