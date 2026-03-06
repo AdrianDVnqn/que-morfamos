@@ -198,14 +198,21 @@ async def lifespan(app: FastAPI):
             df_lugares = pd.read_sql(query_lugares, engine)
             logger.info(f"📊 Lugares cargados: {len(df_lugares)} locales")
 
-            # Combinar datos mínimos en DF de reviews para filtros rápidos de zona/cat
-            # Pero SIN el resumen_reviews que es el que pesa
+            # Combinar metadatos de lugares (sin texto pesado) para filtros de zona/categoria
+            # Solo columnas ligeras: NO resumen_reviews
             df = df.merge(df_lugares.drop(columns=['resumen_reviews']), on='restaurante', how='left')
             
-            cols = ['restaurante', 'texto', 'direccion', 'barrio', 'zona', 'autor', 'fecha']
-            for col in cols:
+            # Fix OOM: NO usamos .astype(str) en columnas de texto porque convierte
+            # a NumPy array de ancho fijo (<U4097) que consume ~2.8GB en 183k filas.
+            # Usamos fillna() sobre object dtype nativo que Pandas retorna de SQL.
+            cols_ligeras = ['restaurante', 'direccion', 'barrio', 'zona', 'autor', 'fecha']
+            for col in cols_ligeras:
                 if col in df.columns:
-                    df.loc[:, col] = df[col].fillna("").astype(str).str.strip()
+                    df[col] = df[col].fillna("").str.strip()
+            
+            # 'texto' solo se limpia con fillna(""): sin strip() ni astype() para no explotar RAM.
+            if 'texto' in df.columns:
+                df['texto'] = df['texto'].fillna("")
             
             # --- FILTRO GEOGRÁFICO: Solo Neuquén Capital ---
             # Antes era solo por CP (Q8300/1/2), pero Google no siempre lo provee.
