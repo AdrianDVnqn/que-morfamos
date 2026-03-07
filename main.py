@@ -2954,12 +2954,12 @@ async def get_restaurant_detail(
                 )
     print(f"[DETAIL] {nombre_real} | Reviews fetch+rank: {time.time() - t1:.2f}s ({len(reviews_list)} reviews)", flush=True)
 
-    cache_key = f"{nombre_real}_{topic}_{tone}" if topic else f"{nombre_real}__{tone}"
+    cache_key = f"{nombre_real}_{topic}_{tone}" if topic and topic not in ["undefined", "null"] else f"{nombre_real}__{tone}"
     analisis = await cache.get_json("detail_topic", cache_key)
     if analisis:
         print(f"[DETAIL] {nombre_real} | Analysis CACHE HIT", flush=True)
     else:
-        if not topic:
+        if not topic or topic in ["undefined", "null"]:
             # Bypass LLM: Return pre-calculated summary from df_lugares if no specific topic was requested
             analisis = {
                 "resumen": safe_str(row.get("resumen_reviews", "Restaurante recomendado en Neuquén.")),
