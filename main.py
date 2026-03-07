@@ -33,7 +33,7 @@ from langchain_postgres import PGVector
 from sqlalchemy import create_engine
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
-from upstash_redis import Redis
+from upstash_redis.asyncio import Redis
 from rapidfuzz import process, fuzz
 
 
@@ -80,41 +80,41 @@ class RedisCacheManager:
             return "unknown"
         return str(key).lower().strip().replace(" ", "_")
 
-    def get_json(self, prefix, key):
+    async def get_json(self, prefix, key):
         if not self.client:
             return None
         full_key = f"{prefix}:{self._sanitize_key(key)}"
         try:
-            data = self.client.get(full_key)
+            data = await self.client.get(full_key)
             if data:
                 return data if isinstance(data, dict) else json.loads(data)
             return None
         except:
             return None
 
-    def set_json(self, prefix, key, value_dict, expire=604800):
+    async def set_json(self, prefix, key, value_dict, expire=604800):
         if not self.client:
             return
         full_key = f"{prefix}:{self._sanitize_key(key)}"
         try:
             json_str = json.dumps(value_dict, ensure_ascii=False)
-            self.client.set(full_key, json_str, ex=expire)
+            await self.client.set(full_key, json_str, ex=expire)
         except:
             pass
 
-    def set_value(self, key, value, expire=None):
+    async def set_value(self, key, value, expire=None):
         if not self.client:
             return
         try:
-            self.client.set(key, value, ex=expire)
+            await self.client.set(key, value, ex=expire)
         except:
             pass
 
-    def get_value(self, key):
+    async def get_value(self, key):
         if not self.client:
             return None
         try:
-            return self.client.get(key)
+            return await self.client.get(key)
         except:
             return None
 
@@ -429,7 +429,7 @@ async def astream_buffer(llm, prompt, cache_key=None, cache_instance=None):
         yield token
 
     if cache_key and cache_instance:
-        cache_instance.set_json("resumen_texto", cache_key, buffer)
+        await cache_instance.set_json("resumen_texto", cache_key, buffer)
 
 
 class DoubleSlashMiddleware(BaseHTTPMiddleware):
@@ -1194,7 +1194,7 @@ async def obtener_restaurant_cards(
         # 3. GENERACIÓN DE DESCRIPCIÓN
         topic_key = "-".join(sorted(list(search_terms))) if search_terms else "general"
         cache_key = f"desc_{nombre_real}_{topic_key}_{sanitize_tone(tone)}"
-        desc = cache.get_json("desc", cache_key)
+        desc = await cache.get_json("desc", cache_key)
 
         if desc:
             tasks.append({
@@ -1224,7 +1224,7 @@ async def obtener_restaurant_cards(
         else:
             descripcion = results[gen_idx]
             gen_idx += 1
-            cache.set_json("desc", item["cache_key"], descripcion)
+            await cache.set_json("desc", item["cache_key"], descripcion)
 
         cards.append(
             RestaurantCard(
@@ -1303,7 +1303,7 @@ async def analizar_query_semantica(query, llm, last_entity=None):
     if last_entity:
         cache_key += f"_{last_entity.replace(' ', '_')}"
 
-    cached = cache.get_json("analysis", cache_key)
+    cached = await cache.get_json("analysis", cache_key)
     if cached:
         return cached
 
@@ -1353,7 +1353,7 @@ async def analizar_query_semantica(query, llm, last_entity=None):
         if "synonyms" not in data:
             data["synonyms"] = []
 
-        cache.set_json("analysis", cache_key, data)
+        await cache.set_json("analysis", cache_key, data)
         return data
     except:
         return {
@@ -1728,7 +1728,7 @@ async def resumir_opiniones_local_gen(
         if topic
         else f"{restaurante}__{sanitize_tone(tone)}"
     )
-    cached_text = cache.get_json("resumen_texto", cache_key)
+    cached_text = await cache.get_json("resumen_texto", cache_key)
     if cached_text:
         msg = f"Acá te paso la data de **{restaurante}**:"
         yield {"type": "token", "content": msg}
@@ -2186,6 +2186,8 @@ async def procesar_consulta_gen(
       - {"type": "debug", "message": "..."}
       - {"type": "error", "message": "..."}
     """
+    if user_ip and await cache.get_value(f"ban:{user_ip}"):
+        raise HTTPException(status_code=403, detail="Baneado por exceso de requests")
     if ctx is None:
         ctx = {}
     t_start = time.time()
@@ -2198,7 +2200,7 @@ async def procesar_consulta_gen(
     # ==========================================
     # 1. CAPA DE SEGURIDAD (NUCLEAR)
     # ==========================================
-    if user_ip and cache.get_value(f"ban:{user_ip}"):
+    if user_ip and await cache.get_value(f"ban:{user_ip}"):
         yield {"type": "meta", "mode": "blocked"}
         yield {"type": "token", "content": "⛔ Sistema bloqueado."}
         return
@@ -2266,8 +2268,10 @@ async def procesar_consulta_gen(
     
     async def _cached_vector_search(query_text):
         """Vector search con caché Redis de 7 días."""
+        if not vectorstore:
+            return []
         cache_key = query_text.lower().strip()[:100]  # normalizar key
-        cached = cache.get_json("vsearch", cache_key)
+        cached = await cache.get_json("vsearch", cache_key)
         if cached:
             print(f"[TIMING] Vector Search HIT (Redis cache)", flush=True)
             return cached
@@ -2284,8 +2288,9 @@ async def procesar_consulta_gen(
             if nom and nom not in seen:
                 seen.add(nom)
                 result.append(nom)
-        print(f"[TIMING] Vector Search took {time.time()-t0:.2f}s", flush=True)
-        cache.set_json("vsearch", cache_key, result, expire=604800)  # 7 días
+        t1 = time.time()
+        print(f"[TIMING] Vector Search took {t1-t0:.2f}s", flush=True)
+        await cache.set_json("vsearch", cache_key, result, expire=604800)  # 7 días
         return result
     
     # Lanzar ambos en paralelo
@@ -2438,12 +2443,10 @@ async def procesar_consulta_gen(
                             nombre_final = event["restaurante"]
                         # If found, propagate meta
                         # yield event # Or wait? stream reader handles meta.
-                        # Usually we yield meta at end or inline.
                         # resumir_opiniones_local_gen yields token content.
                         # We should yield meta too for context update?
                         # The original code only captured nombre_final and yielded meta later?
                         # No, detecting loop logic:
-                        # Original:
                         # elif event["type"] == "meta": if "restaurante": nombre_final...
                         # It did NOT yield the meta event?
                         # Wait, let's look at `resumir_opiniones_local_gen` output. It yields meta.
@@ -2873,7 +2876,7 @@ def read_root():
 
 
 @app.get("/health")
-def health_check():
+async def health_check():
     return {
         "status": "healthy",
         "version": SERVER_VERSION,
@@ -2894,7 +2897,7 @@ async def get_restaurant_detail(
     # === CHECK FULL-RESPONSE CACHE ===
     tone = sanitize_tone(tone)
     full_cache_key = f"detail_full_{nombre}_{topic}_{tone}"
-    cached_full = cache.get_json("detail_full", full_cache_key)
+    cached_full = await cache.get_json("detail_full", full_cache_key)
     if cached_full:
         print(f"[DETAIL] {nombre} | CACHE HIT | {time.time() - t_start:.2f}s", flush=True)
         return RestaurantDetail(**cached_full)
@@ -2936,7 +2939,7 @@ async def get_restaurant_detail(
     print(f"[DETAIL] {nombre_real} | Reviews fetch+rank: {time.time() - t1:.2f}s ({len(reviews_list)} reviews)", flush=True)
 
     cache_key = f"{nombre_real}_{topic}_{tone}" if topic else f"{nombre_real}__{tone}"
-    analisis = cache.get_json("detail_topic", cache_key)
+    analisis = await cache.get_json("detail_topic", cache_key)
     if analisis:
         print(f"[DETAIL] {nombre_real} | Analysis CACHE HIT", flush=True)
     else:
@@ -2956,7 +2959,7 @@ async def get_restaurant_detail(
             res = await llm_mini.ainvoke(prompt_txt)
             clean = res.content.strip().replace("```json", "").replace("```", "")
             analisis = json.loads(clean)
-            cache.set_json("detail_topic", cache_key, analisis)
+            await cache.set_json("detail_topic", cache_key, analisis)
         except:
             analisis = {
                 "resumen": "Info no disponible momentáneamente.",
@@ -2982,7 +2985,7 @@ async def get_restaurant_detail(
 
     # Cache full response (TTL managed by Redis/Upstash)
     try:
-        cache.set_json("detail_full", full_cache_key, result.model_dump())
+        await cache.set_json("detail_full", full_cache_key, result.model_dump())
     except:
         pass  # Don't fail the request if caching fails
 
