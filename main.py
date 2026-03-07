@@ -2973,11 +2973,15 @@ async def chat_stream(req: QueryRequest, request: Request):
     client_ip = extract_client_ip(request)
 
     async def event_generator():
+        t_gen_start = time.time()
+        first_token_sent = False
+
         # === FLUSH PROXY BUFFER ===
         # Fly.io's reverse proxy buffers small response chunks.
         # Send a 4KB padding to exceed the proxy's buffer threshold,
         # forcing it to forward all subsequent chunks immediately.
         yield ": " + " " * 4096 + "\n\n"
+        print(f"[STREAM] {time.time() - t_gen_start:.2f}s | Flush padding sent (4KB)", flush=True)
 
         # Accumulators for Logging and Context
         full_text = ""
@@ -3000,6 +3004,9 @@ async def chat_stream(req: QueryRequest, request: Request):
                 # Update accumulators
                 if event["type"] == "token":
                     full_text += event["content"]
+                    if not first_token_sent:
+                        first_token_sent = True
+                        print(f"[STREAM] {time.time() - t_gen_start:.2f}s | First token YIELDED to client", flush=True)
                 elif event["type"] == "debug":
                     # Capturar intent del debug message para el log final
                     msg = event.get("message", "")
