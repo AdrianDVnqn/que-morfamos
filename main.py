@@ -2883,8 +2883,17 @@ async def get_restaurant_detail(
     nombre: str, topic: Optional[str] = None, tone: Optional[str] = None
 ):
     global df_lugares, llm_mini
+    t_start = time.time()
     if not nombre:
         raise HTTPException(status_code=404)
+
+    # === CHECK FULL-RESPONSE CACHE ===
+    tone = sanitize_tone(tone)
+    full_cache_key = f"detail_full_{nombre}_{topic}_{tone}"
+    cached_full = cache.get_json("detail_full", full_cache_key)
+    if cached_full:
+        print(f"[DETAIL] {nombre} | CACHE HIT | {time.time() - t_start:.2f}s", flush=True)
+        return RestaurantDetail(**cached_full)
 
     # Buscar en df_lugares
     if df_lugares is None or nombre.lower() not in [n.lower() for n in df_lugares.index.tolist()]:
@@ -2902,8 +2911,10 @@ async def get_restaurant_detail(
     row = df_lugares.loc[nombre_exacto]
     if isinstance(row, pd.DataFrame): row = row.iloc[0]
     nombre_real = safe_str(row.get("restaurante", nombre_exacto))
+    print(f"[DETAIL] {nombre_real} | Metadata lookup: {time.time() - t_start:.2f}s", flush=True)
 
     # Lazy-load reviews para este restaurante
+    t1 = time.time()
     reviews_df = await obtener_reviews_por_local([nombre_exacto])
     reviews_list = []
     if not reviews_df.empty:
@@ -2918,11 +2929,14 @@ async def get_restaurant_detail(
                         fecha=safe_str(r.get("fecha")),
                     )
                 )
+    print(f"[DETAIL] {nombre_real} | Reviews fetch+rank: {time.time() - t1:.2f}s ({len(reviews_list)} reviews)", flush=True)
 
-    tone = sanitize_tone(tone)
     cache_key = f"{nombre_real}_{topic}_{tone}" if topic else f"{nombre_real}__{tone}"
     analisis = cache.get_json("detail_topic", cache_key)
-    if not analisis:
+    if analisis:
+        print(f"[DETAIL] {nombre_real} | Analysis CACHE HIT", flush=True)
+    else:
+        t2 = time.time()
         sample = " | ".join([r.texto[:150] for r in reviews_list[:5]])
         contexto_tema = (
             f"IMPORTANTE: El usuario busca '{topic}'. Resalta qué dicen las reseñas sobre eso."
@@ -2945,8 +2959,9 @@ async def get_restaurant_detail(
                 "positivos": [],
                 "negativos": [],
             }
+        print(f"[DETAIL] {nombre_real} | LLM analysis: {time.time() - t2:.2f}s", flush=True)
 
-    return RestaurantDetail(
+    result = RestaurantDetail(
         nombre=nombre_real,
         rating=safe_float(row.get("rating_gral")),
         total_reviews=safe_int(row.get("total_reviews_google")),
@@ -2960,6 +2975,15 @@ async def get_restaurant_detail(
         aspectos_negativos=analisis.get("negativos", []),
         reviews=reviews_list,
     )
+
+    # Cache full response (TTL managed by Redis/Upstash)
+    try:
+        cache.set_json("detail_full", full_cache_key, result.model_dump())
+    except:
+        pass  # Don't fail the request if caching fails
+
+    print(f"[DETAIL] {nombre_real} | TOTAL: {time.time() - t_start:.2f}s", flush=True)
+    return result
 
 
 @app.post("/chat/stream")
