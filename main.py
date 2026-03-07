@@ -429,7 +429,7 @@ async def astream_buffer(llm, prompt, cache_key=None, cache_instance=None):
         yield token
 
     if cache_key and cache_instance:
-        await cache_instance.set_json("resumen_texto", cache_key, buffer)
+        asyncio.create_task(cache_instance.set_json("resumen_texto", cache_key, buffer))
 
 
 class DoubleSlashMiddleware(BaseHTTPMiddleware):
@@ -1173,6 +1173,8 @@ async def obtener_restaurant_cards(
 
     final_search_terms = [k for k in search_terms if len(k) > 3]
 
+    card_items = []
+
     for nombre in nombres_restaurantes:
         if not nombre or nombre not in df_lugares_ref.index:
             continue
@@ -1191,40 +1193,54 @@ async def obtener_restaurant_cards(
             frase = sample_text
         autor = "Google Reviews"
 
-        # 3. GENERACIÓN DE DESCRIPCIÓN
+        # 3. Preparación para CACHE GET
         topic_key = "-".join(sorted(list(search_terms))) if search_terms else "general"
         cache_key = f"desc_{nombre_real}_{topic_key}_{sanitize_tone(tone)}"
-        desc = await cache.get_json("desc", cache_key)
+        
+        card_items.append({
+            "nombre": nombre, "nombre_real": nombre_real, "row": row, 
+            "sample_text": sample_text, "frase": frase, "autor": autor, 
+            "cache_key": cache_key
+        })
 
+    # Ejecución Async CACHÉ GET
+    cache_tasks = [cache.get_json("desc", item["cache_key"]) for item in card_items]
+    cached_descs = await asyncio.gather(*cache_tasks) if cache_tasks else []
+
+    contexto_extra = f"El usuario busca conceptos relacionados con: '{', '.join(final_search_terms)}'. Si aparecen, MENCIONALO." if final_search_terms else ""
+
+    tasks = []
+    for i, item in enumerate(card_items):
+        desc = cached_descs[i] if i < len(cached_descs) else None
         if desc:
             tasks.append({
-                "type": "cached", "val": desc, "row": row,
-                "frase": frase, "autor": autor, "nombre_real": nombre_real,
+                "type": "cached", "val": desc, "row": item["row"],
+                "frase": item["frase"], "autor": item["autor"], "nombre_real": item["nombre_real"]
             })
         else:
-            contexto_extra = f"El usuario busca conceptos relacionados con: '{', '.join(final_search_terms)}'. Si aparecen, MENCIONALO." if final_search_terms else ""
             task_coro = generar_descripcion_async_tematica(
-                llm, nombre_real, sample_text, tone, contexto_extra
+                llm, item["nombre_real"], item["sample_text"], tone, contexto_extra
             )
             tasks.append({
-                "type": "generate", "val": task_coro, "row": row,
-                "frase": frase, "autor": autor, "nombre_real": nombre_real,
-                "cache_key": cache_key,
+                "type": "generate", "val": task_coro, "row": item["row"],
+                "frase": item["frase"], "autor": item["autor"], "nombre_real": item["nombre_real"],
+                "cache_key": item["cache_key"],
             })
 
-    # Ejecución Async
+    # Ejecución Async de LLM Generations
     generations_needed = [t["val"] for t in tasks if t["type"] == "generate"]
     if generations_needed:
         results = await asyncio.gather(*generations_needed)
 
     gen_idx = 0
+    cards = []
     for item in tasks:
         if item["type"] == "cached":
             descripcion = item["val"]
         else:
             descripcion = results[gen_idx]
             gen_idx += 1
-            await cache.set_json("desc", item["cache_key"], descripcion)
+            asyncio.create_task(cache.set_json("desc", item["cache_key"], descripcion))
 
         cards.append(
             RestaurantCard(
@@ -1353,7 +1369,7 @@ async def analizar_query_semantica(query, llm, last_entity=None):
         if "synonyms" not in data:
             data["synonyms"] = []
 
-        await cache.set_json("analysis", cache_key, data)
+        asyncio.create_task(cache.set_json("analysis", cache_key, data))
         return data
     except:
         return {
@@ -2290,7 +2306,7 @@ async def procesar_consulta_gen(
                 result.append(nom)
         t1 = time.time()
         print(f"[TIMING] Vector Search took {t1-t0:.2f}s", flush=True)
-        await cache.set_json("vsearch", cache_key, result, expire=604800)  # 7 días
+        asyncio.create_task(cache.set_json("vsearch", cache_key, result, expire=604800))  # 7 días
         return result
     
     # Lanzar ambos en paralelo
@@ -2642,7 +2658,7 @@ async def procesar_consulta_gen(
             locales_rechazados = set(candidatos_a_verificar) - set(locales_verificados)
 
             # Separar EXACTOS (aprobados por juez) y RELACIONADOS (alta relevancia no aprobados)
-            exactos = locales_verificados[:6]  # Máximo 6 exactos (antes 4)
+            exactos = locales_verificados[:3]  # Máximo 3 exactos (antes 6)
 
             # Relacionados: tomamos de alta relevancia, excluyendo los que ya son exactos Y los que fueron RECHAZADOS por el juez
             relacionados = [
@@ -2650,8 +2666,8 @@ async def procesar_consulta_gen(
                 for loc in grupo_alta_relevancia
                 if loc not in exactos and loc not in locales_rechazados
             ][
-                :4
-            ]  # Máximo 4 relacionados (antes 3)
+                :2
+            ]  # Máximo 2 relacionados (antes 4)
 
             print(f"[DEBUG] 🎯 Exactos: {exactos}", flush=True)
             print(f"[DEBUG] 🚫 Rechazados filtrados: {locales_rechazados}", flush=True)
@@ -2959,7 +2975,7 @@ async def get_restaurant_detail(
             res = await llm_mini.ainvoke(prompt_txt)
             clean = res.content.strip().replace("```json", "").replace("```", "")
             analisis = json.loads(clean)
-            await cache.set_json("detail_topic", cache_key, analisis)
+            asyncio.create_task(cache.set_json("detail_topic", cache_key, analisis))
         except:
             analisis = {
                 "resumen": "Info no disponible momentáneamente.",
@@ -2985,7 +3001,7 @@ async def get_restaurant_detail(
 
     # Cache full response (TTL managed by Redis/Upstash)
     try:
-        await cache.set_json("detail_full", full_cache_key, result.model_dump())
+        asyncio.create_task(cache.set_json("detail_full", full_cache_key, result.model_dump()))
     except:
         pass  # Don't fail the request if caching fails
 
