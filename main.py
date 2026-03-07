@@ -2732,7 +2732,7 @@ async def procesar_consulta_gen(
                     "1. Recomienda los EXACTOS primero.\n"
                     "2. Menciona los RELACIONADOS como alternativa.\n"
                     "3. Usa la info provista para describir qué tienen de bueno.\n"
-                    "4. IMPORTANTE: Usa Markdown. Resalta nombres de lugares con **negritas**."
+                    "4. IMPORTANTE: Inicia cada recomendación con el formato estricto: '**Nombre del Lugar** - (⭐ Rating, N reseñas):' seguido de tu descripción."
                 )
             elif exactos:
                 prompt_rag = (
@@ -2742,7 +2742,7 @@ async def procesar_consulta_gen(
                     f"INSTRUCCIONES:\n"
                     "1. Confirma que encontraste lo que buscaba.\n"
                     "2. Describelos usando la info provista.\n"
-                    "3. IMPORTANTE: Usa Markdown. Resalta nombres de lugares con **negritas**."
+                    "3. IMPORTANTE: Inicia cada recomendación con el formato estricto: '**Nombre del Lugar** - (⭐ Rating, N reseñas):' seguido de tu descripción."
                 )
             else:
                 prompt_rag = (
@@ -2752,7 +2752,7 @@ async def procesar_consulta_gen(
                     f"INSTRUCCIONES:\n"
                     "1. Aclara que no encontraste match exacto.\n"
                     "2. Ofrece estos relacionados.\n"
-                    "3. IMPORTANTE: Usa Markdown. Resalta nombres de lugares con **negritas**."
+                    "3. IMPORTANTE: Inicia cada recomendación con el formato estricto: '**Nombre del Lugar** - (⭐ Rating, N reseñas):' seguido de tu descripción."
                 )
 
             t_stream_start = time.time()
@@ -2959,30 +2959,36 @@ async def get_restaurant_detail(
     if analisis:
         print(f"[DETAIL] {nombre_real} | Analysis CACHE HIT", flush=True)
     else:
-        t2 = time.time()
-        sample = " | ".join([r.texto[:150] for r in reviews_list[:5]])
-        contexto_tema = (
-            f"IMPORTANTE: El usuario busca '{topic}'. Resalta qué dicen las reseñas sobre eso."
-            if topic
-            else ""
-        )
-        prefix = tone_system_instruction(tone)
-        prompt_txt = f"""{prefix}\nAnaliza "{nombre_real}". {contexto_tema}
-        Responde SOLO JSON válido:
-        {{"resumen": "descripción de 2 oraciones...", "positivos": ["p1", "p2"], "negativos": ["n1"]}}
-        Reviews: {sample}"""
-        try:
-            res = await llm_mini.ainvoke(prompt_txt)
-            clean = res.content.strip().replace("```json", "").replace("```", "")
-            analisis = json.loads(clean)
-            asyncio.create_task(cache.set_json("detail_topic", cache_key, analisis))
-        except:
+        if not topic:
+            # Bypass LLM: Return pre-calculated summary from df_lugares if no specific topic was requested
             analisis = {
-                "resumen": "Info no disponible momentáneamente.",
+                "resumen": safe_str(row.get("resumen_reviews", "Restaurante recomendado en Neuquén.")),
                 "positivos": [],
                 "negativos": [],
             }
-        print(f"[DETAIL] {nombre_real} | LLM analysis: {time.time() - t2:.2f}s", flush=True)
+        else:
+            t2 = time.time()
+            sample = " | ".join([r.texto[:150] for r in reviews_list[:5]])
+            contexto_tema = (
+                f"IMPORTANTE: El usuario busca '{topic}'. Resalta qué dicen las reseñas sobre eso."
+            )
+            prefix = tone_system_instruction(tone)
+            prompt_txt = f"""{prefix}\nAnaliza "{nombre_real}". {contexto_tema}
+            Responde SOLO JSON válido:
+            {{"resumen": "descripción de 2 oraciones...", "positivos": ["p1", "p2"], "negativos": ["n1"]}}
+            Reviews: {sample}"""
+            try:
+                res = await llm_mini.ainvoke(prompt_txt)
+                clean = res.content.strip().replace("```json", "").replace("```", "")
+                analisis = json.loads(clean)
+                asyncio.create_task(cache.set_json("detail_topic", cache_key, analisis))
+            except:
+                analisis = {
+                    "resumen": "Info no disponible momentáneamente.",
+                    "positivos": [],
+                    "negativos": [],
+                }
+            print(f"[DETAIL] {nombre_real} | LLM analysis: {time.time() - t2:.2f}s", flush=True)
 
     result = RestaurantDetail(
         nombre=nombre_real,
