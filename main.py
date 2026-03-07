@@ -506,7 +506,8 @@ def safe_str(val):
 
 def safe_float(val):
     try:
-        return float(val) if pd.notna(val) else 0.0
+        v = float(val) if pd.notna(val) else 0.0
+        return 0.0 if (v != v) else v  # NaN check: NaN != NaN
     except:
         return 0.0
 
@@ -865,14 +866,17 @@ def obtener_coordenadas(nombres, df=None):
             mask = df["restaurante"].str.lower() == nom.lower()
             if mask.any():
                 r = df[mask].iloc[0]
-                locs.append({
-                    "nombre": safe_str(r.get("restaurante")),
-                    "lat": safe_float(r.get("latitud")),
-                    "lng": safe_float(r.get("longitud")),
-                    "direccion": safe_str(r.get("direccion")),
-                    "rating": safe_float(r.get("rating_gral")),
-                    "total_reviews": safe_int(r.get("total_reviews_google"))
-                })
+                lat = safe_float(r.get("latitud"))
+                lng = safe_float(r.get("longitud"))
+                if lat != 0 and lng != 0:
+                    locs.append({
+                        "nombre": safe_str(r.get("restaurante")),
+                        "lat": lat,
+                        "lng": lng,
+                        "direccion": safe_str(r.get("direccion")),
+                        "rating": safe_float(r.get("rating_gral")),
+                        "total_reviews": safe_int(r.get("total_reviews_google"))
+                    })
         return locs
 
     # Método optimizado O(1)
