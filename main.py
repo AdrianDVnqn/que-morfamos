@@ -2907,8 +2907,19 @@ async def procesar_consulta(
     return full_text, mode, pend, locs, cards, det
 
 
+@app.get("/debug/db")
+async def debug_db():
+    global db_engine
+    if db_engine is None: return {"error": "no db"}
+    try:
+        count = pd.read_sql("SELECT count(*) FROM reviews", db_engine).iloc[0,0]
+        sample = pd.read_sql("SELECT restaurante FROM reviews LIMIT 5", db_engine)
+        return {"count": int(count), "sample": sample["restaurante"].tolist()}
+    except Exception as e:
+        return {"error": str(e)}
+
 # ==========================================
-# 7. ENDPOINTS
+# 4. ENDPOINTS CORE
 # ==========================================
 
 
