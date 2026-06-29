@@ -1387,7 +1387,11 @@ def detectar_mencion_exacta(query, df):
     FIX v7.4: Devuelve el NÚCLEO para permitir menús de opciones.
     """
     if df is None or df.empty:
-        return None
+        global df_lugares
+        if df_lugares is not None and not df_lugares.empty:
+            df = df_lugares
+        else:
+            return None
     q_norm = query.lower().strip()
 
     # HEURISTIC SAFEGUARD: Si la query pide recomendación explícita, NO buscamos match exacto/parcial.
@@ -2520,7 +2524,7 @@ async def procesar_consulta_gen(
                 del ctx[var]
 
         try:
-            if df is None or df.empty:
+            if df_lugares is None or df_lugares.empty:
                 yield {
                     "type": "meta",
                     "mode": "rag",
