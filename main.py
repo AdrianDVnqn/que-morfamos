@@ -217,7 +217,7 @@ KEYWORD_TO_CATEGORIES = {
 # ==========================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global df, df_lugares, vectorstore, llm_mini, llm_smart
+    global df, df_lugares, vectorstore, llm_mini, llm_smart, db_engine
     startup_dt = datetime.now(ZoneInfo("America/Argentina/Buenos_Aires")).strftime(
         "%Y-%m-%d %H:%M:%S ART"
     )
