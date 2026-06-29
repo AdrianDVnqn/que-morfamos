@@ -355,9 +355,14 @@ def _fetch_reviews_sync(nombres: list, limit_per_local: int = 15):
     # Use parameterized query for safety
     placeholders = ", ".join([f"'{n.replace(chr(39), chr(39)+chr(39))}'" for n in nombres])
     query = f"""
-        SELECT restaurante, autor, rating_user, texto, fecha_aproximada as fecha
-        FROM reviews
-        WHERE restaurante IN ({placeholders})
+        SELECT restaurante, autor, rating_user, texto, fecha
+        FROM (
+            SELECT restaurante, autor, rating_user, texto, fecha_aproximada as fecha,
+                   ROW_NUMBER() OVER(PARTITION BY restaurante ORDER BY fecha_aproximada DESC) as rn
+            FROM reviews
+            WHERE restaurante IN ({placeholders})
+        ) t
+        WHERE rn <= {limit_per_local}
     """
     try:
         result = pd.read_sql(query, db_engine)
@@ -1173,6 +1178,9 @@ async def obtener_restaurant_cards(
 
     final_search_terms = [k for k in search_terms if len(k) > 3]
 
+    # 1.5 Fetch real reviews para usarlos como cita destacada en las cards
+    real_reviews_df = await obtener_reviews_por_local(nombres_restaurantes, limit_per_local=3)
+
     card_items = []
 
     for nombre in nombres_restaurantes:
@@ -1183,15 +1191,29 @@ async def obtener_restaurant_cards(
         if isinstance(row, pd.DataFrame): row = row.iloc[0]
         nombre_real = safe_str(row.get("restaurante", nombre))
 
-        # 2. SAMPLE TEXT desde resumen_reviews (disponible en df_lugares)
+        # 2. SAMPLE TEXT desde resumen_reviews para el LLM (descripción general)
         resumen = safe_str(row.get("resumen_reviews", ""))
-        if resumen and len(resumen) > 30:
-            sample_text = resumen[:3000]
-            frase = resumen[:200] + "..."
+        sample_text = resumen[:3000] if (resumen and len(resumen) > 30) else f"Restaurante en Neuquén con {safe_int(row.get('total_reviews_google', 0))} reseñas."
+        
+        # 3. Extraer una reseña real para la tarjeta (frase destacada)
+        real_review_text = ""
+        real_review_autor = "Google Reviews"
+        
+        if not real_reviews_df.empty and nombre_real in real_reviews_df.index:
+            rest_reviews = real_reviews_df.loc[[nombre_real]]
+            if not rest_reviews.empty:
+                for _, rv in rest_reviews.iterrows():
+                    if len(str(rv.get("texto", ""))) > 20:
+                        real_review_text = str(rv["texto"])
+                        real_review_autor = formatear_autor(str(rv.get("autor", "Google Reviews")))
+                        break
+                        
+        if real_review_text:
+            frase = f'"{real_review_text[:200]}..."'
+            autor = real_review_autor
         else:
-            sample_text = f"Restaurante en Neuquén con {safe_int(row.get('total_reviews_google', 0))} reseñas."
-            frase = sample_text
-        autor = "Google Reviews"
+            frase = resumen[:200] + "..." if resumen else sample_text
+            autor = "Google Reviews"
 
         # 3. Preparación para CACHE GET
         topic_key = "-".join(sorted(list(search_terms))) if search_terms else "general"
