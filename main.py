@@ -45,12 +45,21 @@ logging.basicConfig(
 )
 logger = logging.getLogger("QueMorfamos")
 
+
+def _normalizar_busqueda(texto):
+    if not texto:
+        return ""
+    texto_norm = unicodedata.normalize("NFD", str(texto).lower().strip())
+    return "".join(ch for ch in texto_norm if unicodedata.category(ch) != "Mn")
+
 # ==========================================
 # 1. CONFIGURACIÓN DE ENTORNO
 # ==========================================
 load_dotenv("mis_claves.env")
 
 DATABASE_URL = os.getenv("DATABASE_URL")
+if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = "postgresql://" + DATABASE_URL[len("postgres://"):]
 COLLECTION_NAME = os.getenv("COLLECTION_NAME", "reviews_embeddings")
 UPSTASH_REDIS_REST_URL = os.getenv("UPSTASH_REDIS_REST_URL")
 UPSTASH_REDIS_REST_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN")
@@ -63,6 +72,16 @@ SERVER_VERSION = (
 )
 
 logger.info(f"🔌 Iniciando BACKEND {SERVER_VERSION} con Colección: '{COLLECTION_NAME}'")
+
+
+def _normalizar_postgres_url(url):
+    if not url:
+        return url
+    if url.startswith("postgres://"):
+        return "postgresql+psycopg://" + url[len("postgres://"):]
+    if url.startswith("postgresql://") and "+psycopg" not in url:
+        return "postgresql+psycopg://" + url[len("postgresql://"):]
+    return url
 
 
 class RedisCacheManager:
@@ -233,7 +252,7 @@ async def lifespan(app: FastAPI):
 
     if DATABASE_URL:
         try:
-            db_engine = create_engine(DATABASE_URL)
+            db_engine = create_engine(_normalizar_postgres_url(DATABASE_URL))
 
             # LAZY ARCHITECTURE v8: Solo cargamos df_lugares (936 filas)
             # Las reviews (155k+) se consultan bajo demanda por restaurante.
@@ -281,7 +300,7 @@ async def lifespan(app: FastAPI):
     try:
         embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
         vectorstore = PGVector(
-            connection=DATABASE_URL,
+            connection=_normalizar_postgres_url(DATABASE_URL),
             embeddings=embeddings,
             collection_name=COLLECTION_NAME,
             use_jsonb=True,
@@ -995,7 +1014,7 @@ def check_keyword_ban(query):
         "merca",
         "porro",
     ]
-    q_norm = query.lower()
+    q_norm = _normalizar_busqueda(query)
     for word in banned_words:
         # Buscamos la palabra exacta o rodeada de espacios/signos
         pattern = r"(?<!\w)" + re.escape(word) + r"(?!\w)"
@@ -1327,7 +1346,7 @@ def obtener_restaurant_cards_simple(nombres_restaurantes, df):
 
 async def analizar_query_semantica(query, llm, last_entity=None):
     """USA LLM_SMART. Retorna: {tipo, intencion, target_name, keywords, synonyms, donde}"""
-    q_lower = query.lower()
+    q_lower = _normalizar_busqueda(query)
 
     # Bypass para seguridad (comida/niños)
     is_safe_bypass = False
@@ -1414,7 +1433,7 @@ def detectar_mencion_exacta(query, df):
             df = df_lugares
         else:
             return None
-    q_norm = query.lower().strip()
+    q_norm = _normalizar_busqueda(query)
 
     # HEURISTIC SAFEGUARD: Si la query pide recomendación explícita, NO buscamos match exacto/parcial.
     # Esto previene que "mejores bares en el oeste" matchee con el lugar "Oeste".
@@ -1459,7 +1478,7 @@ def detectar_mencion_exacta(query, df):
         "zona río",
     ]
 
-    if any(kw in q_norm for kw in rec_keywords):
+    if any(_normalizar_busqueda(kw) in q_norm for kw in rec_keywords):
         print(
             f"[DEBUG] 🛡️ Heuristic blocked Exact Match: Detected recommendation intent in '{query}'",
             flush=True,
@@ -1573,7 +1592,7 @@ def detectar_mencion_exacta(query, df):
     nombres.sort(key=len, reverse=True)
 
     for nombre_real in nombres:
-        nombre_lower = nombre_real.lower().strip()
+        nombre_lower = _normalizar_busqueda(nombre_real)
 
         # 1. Match Exacto Total (Solo si es idéntico)
         if nombre_lower == q_norm:
@@ -1633,8 +1652,8 @@ async def consultar_estadisticas(query, df, llm):
         Responde SOLO la palabra clave en singular y minúscula. Si pregunta por todo, responde "total".
         """
         keyword_raw = await llm.ainvoke(prompt_extract)
-        keyword = (
-            str(keyword_raw.content).strip().lower().replace('"', "").replace(".", "")
+        keyword = _normalizar_busqueda(
+            str(keyword_raw.content).replace('"', "").replace(".", "")
         )
 
         # 2. Casos especiales de cantidad total
@@ -1655,9 +1674,9 @@ async def consultar_estadisticas(query, df, llm):
         # Búsqueda insensible a mayúsculas/acentos simple
         # Para 936 filas es instantáneo
         mask = (
-            target_df["restaurante"].str.contains(keyword, case=False, na=False)
-            | target_df["categoria"].str.contains(keyword, case=False, na=False)
-            | target_df["resumen_reviews"].str.contains(keyword, case=False, na=False)
+            target_df["restaurante"].fillna("").map(_normalizar_busqueda).str.contains(keyword, na=False, regex=False)
+            | target_df["categoria"].fillna("").map(_normalizar_busqueda).str.contains(keyword, na=False, regex=False)
+            | target_df["resumen_reviews"].fillna("").map(_normalizar_busqueda).str.contains(keyword, na=False, regex=False)
         )
 
         matches = target_df[mask]["restaurante"].unique().tolist()
@@ -1709,11 +1728,11 @@ async def resumir_opiniones_local_gen(
     if not query_str:
         yield {"type": "error", "text": "Nombre vacío."}
         return
-    q_clean = query_str.lower().strip()
+    q_clean = _normalizar_busqueda(query_str)
     encontrados = []
 
     # 2. Búsqueda de coincidencias
-    mask_exact = df["restaurante"].str.lower() == q_clean
+    mask_exact = df["restaurante"].fillna("").str.lower().map(_normalizar_busqueda) == q_clean
     if mask_exact.any():
         encontrados = [df[mask_exact].iloc[0]["restaurante"]]
     else:
@@ -1723,7 +1742,9 @@ async def resumir_opiniones_local_gen(
         else:
             mask = (
                 df["restaurante"]
+                .fillna("")
                 .str.lower()
+                .map(_normalizar_busqueda)
                 .str.contains(q_clean, na=False, regex=False)
             )
             candidatos = df[mask]["restaurante"].unique().tolist()
@@ -1981,7 +2002,7 @@ async def verificar_candidatos_con_llm(candidatos, df_lugares_ref, query, llm):
         return []
 
     stop_short = ["que", "los", "las", "con", "para", "donde", "hay", "lugar"]
-    words = query.lower().split()
+    words = _normalizar_busqueda(query).split()
     keywords = [w for w in words if len(w) > 3 and w not in stop_short]
 
     # Evidencia desde resumen_reviews (936 filas, instantáneo)
@@ -2312,7 +2333,7 @@ async def procesar_consulta_gen(
         """Vector search con caché Redis de 7 días."""
         if not vectorstore:
             return []
-        cache_key = query_text.lower().strip()[:100]  # normalizar key
+        cache_key = _normalizar_busqueda(query_text)[:100]  # normalizar key
         cached = await cache.get_json("vsearch", cache_key)
         if cached:
             print(f"[TIMING] Vector Search HIT (Redis cache)", flush=True)
