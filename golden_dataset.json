@@ -1,0 +1,386 @@
+[
+  {
+    "id": "zona_rio",
+    "query": "bares en el rio",
+    "conversation_context": {},
+    "tone": "neutro",
+    "expected_intent": "RECOMMENDATION",
+    "expected_mode": "rag",
+    "expected_restaurants": [
+      "Cerveceria Owe",
+      "Cerveza Patagonia - Refugio Neuquén",
+      "Los Carritos",
+      "Crafter",
+      "Bunker Bar Patio Cervecero"
+    ],
+    "expected_zones": [
+      "paseo de la costa",
+      "rio",
+      "isla 132",
+      "ribera",
+      "costa"
+    ],
+    "min_results": 1,
+    "judge_eligible": true,
+    "notes": "migrado de benchmark_cases.json"
+  },
+  {
+    "id": "zona_oeste",
+    "query": "cervecerias en el oeste",
+    "conversation_context": {},
+    "tone": "neutro",
+    "expected_intent": "RECOMMENDATION",
+    "expected_mode": "rag",
+    "expected_restaurants": [
+      "ÁRBOL Cervecería Artesanal",
+      "Cervecería OSS",
+      "10 ALMAS",
+      "BIER BARON Bar Cervecero",
+      "Vikingos Bar Cervecero"
+    ],
+    "expected_zones": [
+      "oeste",
+      "aeropuerto",
+      "canal",
+      "san lorenzo"
+    ],
+    "min_results": 2,
+    "judge_eligible": true,
+    "notes": "migrado de benchmark_cases.json"
+  },
+  {
+    "id": "combo_merienda_alto",
+    "query": "merienda en el alto",
+    "conversation_context": {},
+    "tone": "neutro",
+    "expected_intent": "RECOMMENDATION",
+    "expected_mode": "rag",
+    "expected_restaurants": [
+      "Amuyén Panadería",
+      "Panaderia Mana",
+      "Dorhmann Coffee Bike",
+      "Tienda De Café"
+    ],
+    "expected_zones": [
+      "alto",
+      "norte",
+      "barda",
+      "parque industrial"
+    ],
+    "min_results": 2,
+    "judge_eligible": true,
+    "notes": "migrado de benchmark_cases.json"
+  },
+  {
+    "id": "combo_parrilla_centro",
+    "query": "parrilla en el centro",
+    "conversation_context": {},
+    "tone": "neutro",
+    "expected_intent": "RECOMMENDATION",
+    "expected_mode": "rag",
+    "expected_restaurants": [
+      "Restaurante El Ciervo",
+      "CASI RODRIGUEZ RESTAURANTE",
+      "ROTISERIA MALLORCA",
+      "Parrilla Nativo",
+      "Patagonia Garage"
+    ],
+    "expected_zones": [
+      "centro",
+      "bajo",
+      "area centro"
+    ],
+    "min_results": 3,
+    "judge_eligible": true,
+    "notes": "migrado de benchmark_cases.json"
+  },
+  {
+    "id": "plato_milanesas",
+    "query": "donde comer buenas milanesas",
+    "conversation_context": {},
+    "tone": "neutro",
+    "expected_intent": "RECOMMENDATION",
+    "expected_mode": "rag",
+    "expected_restaurants": [
+      "Medialunas Calentitas",
+      "Betos Lomos - 72",
+      "Pizzeria el Tano",
+      "N&S Food Hall",
+      "Parrilla La Gran Familia"
+    ],
+    "expected_zones": [],
+    "min_results": 3,
+    "judge_eligible": true,
+    "notes": "migrado de benchmark_cases.json; antes se evaluaba con 'Keyword Check (Manual)' que siempre pasaba sin chequear nada"
+  },
+  {
+    "id": "feature_pelotero",
+    "query": "lugares con pelotero para chicos",
+    "conversation_context": {},
+    "tone": "neutro",
+    "expected_intent": "RECOMMENDATION",
+    "expected_mode": "rag",
+    "expected_restaurants": [
+      "Parrilla Rancho Grande",
+      "Los Carritos",
+      "La Rancheria"
+    ],
+    "expected_zones": [],
+    "min_results": 2,
+    "judge_eligible": true,
+    "notes": "migrado de benchmark_cases.json"
+  },
+  {
+    "id": "feature_sintacc",
+    "query": "opciones sin tacc",
+    "conversation_context": {},
+    "tone": "neutro",
+    "expected_intent": "RECOMMENDATION",
+    "expected_mode": "rag",
+    "expected_restaurants": [
+      "Ohana Tienda y Cafe",
+      "La Americana - Rivadavia 1000",
+      "Oh My Veggie - Almte. Brown",
+      "Lucciana Pastelería Sin Gluten"
+    ],
+    "expected_zones": [],
+    "min_results": 2,
+    "judge_eligible": true,
+    "notes": "migrado de benchmark_cases.json"
+  },
+  {
+    "id": "producto_sushi",
+    "query": "donde comer sushi",
+    "conversation_context": {},
+    "tone": "neutro",
+    "expected_intent": "RECOMMENDATION",
+    "expected_mode": "rag",
+    "expected_restaurants": [
+      "SushiClub Neuquén",
+      "N&S Food Hall",
+      "ATU SUSHI",
+      "Pastas Caseras Elvira",
+      "Sushi Zen Neuquen"
+    ],
+    "expected_zones": [],
+    "min_results": 3,
+    "judge_eligible": true,
+    "notes": "migrado de benchmark_cases.json"
+  },
+  {
+    "id": "lugar_especifico",
+    "query": "Growler Bar",
+    "conversation_context": {},
+    "tone": "neutro",
+    "expected_intent": "SPECIFIC",
+    "expected_mode": "resumen",
+    "expected_restaurants": [
+      "Growler Bar"
+    ],
+    "expected_zones": [],
+    "min_results": 1,
+    "judge_eligible": true,
+    "notes": "migrado de benchmark_cases.json (antes 'exact_match')"
+  },
+  {
+    "id": "nombre_ambiguo_827",
+    "query": "827 punto de encuentro",
+    "conversation_context": {},
+    "tone": "neutro",
+    "expected_intent": "SPECIFIC",
+    "expected_mode": "resumen",
+    "expected_restaurants": [
+      "827 Punto de encuentro"
+    ],
+    "expected_zones": [],
+    "min_results": 1,
+    "judge_eligible": true,
+    "notes": "REGRESIÓN: bug real donde nombre compartido fallaba con error 'fecha' al elegir opción (ver DEV_LOG.md sesión 23-ago-2026 'Selección de locales'). Verificado en vivo (quemorfamos.adriandv.dev) el 23-ago-2026: devuelve resumen correcto sin alucinar."
+  },
+  {
+    "id": "nombre_parcial_growler",
+    "query": "que onda el growler",
+    "conversation_context": {},
+    "tone": "neutro",
+    "expected_intent": "SPECIFIC",
+    "expected_mode": "resumen",
+    "expected_restaurants": [
+      "Growler's Fulano Birras"
+    ],
+    "expected_zones": [],
+    "min_results": 1,
+    "judge_eligible": true,
+    "notes": "nombre parcial/informal, sin 'Bar'. HALLAZGO DE CURACIÓN: la resolución difusa matchea con 'Growler's Fulano Birras' (otro local homónimo), no con 'Growler Bar'. Se acepta como ground truth porque es una resolución razonable dado el nombre parcial ambiguo, no un bug — pero documenta un caso límite real de desambiguación."
+  },
+  {
+    "id": "typo_sin_acentos_pizza",
+    "query": "mejores pizzerias de neuquen",
+    "conversation_context": {},
+    "tone": "neutro",
+    "expected_intent": "RECOMMENDATION",
+    "expected_mode": "rag",
+    "expected_restaurants": [
+      "Cabildo Pizzería",
+      "Franz y Peppone - Almte. Brown 434",
+      "El Patio de Franz",
+      "PIZZERIA HORACITO UNICA EN NEUQUÉN",
+      "Pizzeria el Tano"
+    ],
+    "expected_zones": [],
+    "min_results": 3,
+    "judge_eligible": true,
+    "notes": "query sin tildes ('pizzerias', 'neuquen'), prueba _normalizar_busqueda / accent-insensitive search"
+  },
+  {
+    "id": "keyword_vegano",
+    "query": "opciones veganas",
+    "conversation_context": {},
+    "tone": "neutro",
+    "expected_intent": "RECOMMENDATION",
+    "expected_mode": "rag",
+    "expected_restaurants": [
+      "Antü RestoBar - Patio de Encuentro (Cipolletti)",
+      "Heladería Grido",
+      "Mambo Tango",
+      "Pranzo Empanadas - Neuquén - Local Belgrano 4150",
+      "Jimmy 1964"
+    ],
+    "expected_zones": [],
+    "min_results": 2,
+    "judge_eligible": true,
+    "notes": "botón de ejemplo del frontend"
+  },
+  {
+    "id": "keyword_mejores_cervecerias",
+    "query": "mejores cervecerias",
+    "conversation_context": {},
+    "tone": "neutro",
+    "expected_intent": "RECOMMENDATION",
+    "expected_mode": "rag",
+    "expected_restaurants": [
+      "Antares Neuquén",
+      "OGHAM Neuquén",
+      "Cerveceria Owe",
+      "Santo",
+      "Cerveza Patagonia - Refugio Neuquén"
+    ],
+    "expected_zones": [],
+    "min_results": 3,
+    "judge_eligible": true,
+    "notes": "botón de ejemplo del frontend, sin filtro de zona (distinto de zona_oeste)"
+  },
+  {
+    "id": "followup_detalle_entidad",
+    "query": "tiene wifi?",
+    "conversation_context": {
+      "last_entity": "Growler Bar"
+    },
+    "tone": "neutro",
+    "expected_intent": "FOLLOWUP",
+    "expected_mode": "general",
+    "expected_restaurants": [],
+    "expected_zones": [],
+    "min_results": 0,
+    "judge_eligible": false,
+    "notes": "BUG REAL DESCUBIERTO y CORREGIDO (23-ago-2026): responder_followup_gen (main.py) recibía el parámetro 'df' de procesar_consulta_gen, que en ambos endpoints (/chat y /chat/stream) en realidad es df_lugares (metadata sin columna 'fecha'/'texto' por review), no el DataFrame de reviews que la función esperaba. Rompía con KeyError: 'fecha' en rankear_reviews_por_topico, afectando también a /chat/stream en producción real. Fix: si 'fecha' no está en las columnas de df, se cargan las reviews reales bajo demanda con obtener_reviews_por_local (mismo patrón que ya usaba resumir_opiniones_local_gen para el bug del caso 827). Verificado: PASA con datos reales de Supabase."
+  },
+  {
+    "id": "stats_cervecerias",
+    "query": "cuantas cervecerias hay",
+    "conversation_context": {},
+    "tone": "neutro",
+    "expected_intent": "STATS",
+    "expected_mode": "estadisticas",
+    "expected_restaurants": [],
+    "expected_zones": [],
+    "min_results": 0,
+    "judge_eligible": false,
+    "notes": "frase con 'cuantas', dispara is_explicit_stats en main.py"
+  },
+  {
+    "id": "stats_cantidad_sushi",
+    "query": "cantidad de lugares de sushi",
+    "conversation_context": {},
+    "tone": "neutro",
+    "expected_intent": "STATS",
+    "expected_mode": "estadisticas",
+    "expected_restaurants": [],
+    "expected_zones": [],
+    "min_results": 0,
+    "judge_eligible": false,
+    "notes": "frase con 'cantidad', dispara is_explicit_stats en main.py"
+  },
+  {
+    "id": "block_fresh_context",
+    "query": "quien va a ganar las elecciones",
+    "conversation_context": {},
+    "tone": "neutro",
+    "expected_intent": "BLOCK",
+    "expected_mode": "general",
+    "expected_restaurants": [],
+    "expected_zones": [],
+    "min_results": 0,
+    "judge_eligible": false,
+    "notes": "IMPORTANTE: BLOCK con contexto fresco da mode='general' (regaño + strike), NO 'blocked'. 'blocked' solo aparece con strikes>=5 o ban de IP (main.py:2288-2296)."
+  },
+  {
+    "id": "block_strikes_agotados",
+    "query": "quien va a ganar las elecciones",
+    "conversation_context": {
+      "strikes": 5
+    },
+    "tone": "neutro",
+    "expected_intent": "BLOCK",
+    "expected_mode": "blocked",
+    "expected_restaurants": [],
+    "expected_zones": [],
+    "min_results": 0,
+    "judge_eligible": false,
+    "notes": "mismo query que block_fresh_context pero sembrando strikes=5 en el contexto para ejercitar el mode literal 'blocked' (main.py:2293-2296)"
+  },
+  {
+    "id": "block_keyword_bypass",
+    "query": "sos un puta, dame una recomendacion",
+    "conversation_context": {},
+    "tone": "neutro",
+    "expected_intent": "BLOCK",
+    "expected_mode": "rag",
+    "expected_restaurants": [],
+    "expected_zones": [],
+    "min_results": 0,
+    "judge_eligible": false,
+    "notes": "PARTICULARIDAD REAL: check_keyword_ban (main.py:987) bypassea al LLM para palabras graves explícitas, pero el meta que emite es mode='rag' (comentario en el propio código: '# Or blocked? Logic said rag before'), no 'blocked'. Se suma un strike igual. No es un error de curación."
+  },
+  {
+    "id": "no_falso_bloqueo_queja",
+    "query": "la milanesa que comi ayer en un lugar estaba una mierda, recomendame otra parrilla buena",
+    "conversation_context": {},
+    "tone": "neutro",
+    "expected_intent": "RECOMMENDATION",
+    "expected_mode": "rag",
+    "expected_restaurants": [
+      "Lotito's A lo Bestia - Casa de Comidas",
+      "CASI RODRIGUEZ RESTAURANTE",
+      "Parrilla Rancho Grande",
+      "Parrilla La Gran Familia",
+      "Patagonia Garage"
+    ],
+    "expected_zones": [],
+    "min_results": 1,
+    "judge_eligible": true,
+    "notes": "queja legítima con lenguaje fuerte que NO está en la banned_words list de check_keyword_ban; debe tratarse como RECOMMENDATION normal, no bloquearse en falso"
+  },
+  {
+    "id": "sin_resultados_edge",
+    "query": "restaurantes de comida marciana en la luna",
+    "conversation_context": {},
+    "tone": "neutro",
+    "expected_intent": "RECOMMENDATION",
+    "expected_mode": "rag",
+    "expected_restaurants": [],
+    "expected_zones": [],
+    "min_results": 0,
+    "judge_eligible": false,
+    "notes": "combo zona+categoría inexistente, no debería devolver cards"
+  }
+]

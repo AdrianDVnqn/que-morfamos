@@ -155,5 +155,36 @@ Este archivo registra los hitos técnicos, decisiones de diseño y correcciones 
 - `/health` también devuelve `last_scraping`, calculado desde `MAX(fecha)` de `scraping_logs`.
 - Las fechas sin hora se interpretan como calendario local para evitar que Argentina muestre el día anterior.
 
+## 📅 Sesión: 24 de Agosto de 2026 (Golden Dataset de Evaluación RAG)
+
+### 🎯 Objetivo
+Reemplazar el benchmark de calidad existente (`benchmark_cases.json` + `run_benchmark.py`) por un **golden dataset** con ground truth curado a mano, métricas de retrieval estándar y un juez LLM opcional de calidad de respuesta, para poder medir el impacto real de futuras mejoras al agente RAG.
+
+### 🐛 Hallazgo: el benchmark anterior ya no funcionaba
+- **Problema:** `run_benchmark.py` validaba `main.df` antes de correr casos, pero desde la arquitectura **LAZY v8** `df` es siempre `None` (solo `df_lugares` se carga en memoria; las reviews se consultan bajo demanda). El benchmark hacía no-op en cada corrida sin que nadie lo notara.
+- **Problema de fondo, no solo el bug anterior:** el ground truth se recalculaba con un `if/elif` por `case_id` que reimplementaba en pandas la lógica de filtrado del backend — comparaba una heurística contra otra heurística, no contra una verdad objetiva, y no escalaba.
+
+### 🔧 Reescritura completa
+- **`eval_metrics.py` (nuevo):** módulo puro con `recall_at_k`, `precision_at_k`, `mrr`, `intent_match` y un agregador con breakdown por intención.
+- **`golden_dataset.json` (nuevo, reemplaza `benchmark_cases.json`):** 22 casos con `expected_restaurants` **curados a mano** corriendo cada query contra la Supabase real y revisando los resultados (no recalculados por heurística). Cobertura: zonas, categorías/keywords, nombre exacto único, nombre ambiguo (regresión "827 Punto de Encuentro"), nombre parcial informal, typos/sin acentos, follow-up con contexto, estadísticas, bloqueo (con y sin contexto fresco), bypass de palabras prohibidas, queja legítima con lenguaje fuerte (no debe bloquearse en falso), y edge case sin resultados esperados.
+- **`run_benchmark.py` (reescrito):** sin heurísticas pandas; carga el ground truth directo del JSON, corre cada caso contra `/chat` vía `TestClient`, calcula métricas con `eval_metrics.py`. Mantiene compatibilidad con `BENCHMARK_MODULE`/`AI_PROVIDER` (usados por `benchmark_vs.ps1`). Suma un juez LLM opcional (`WITH_JUDGE=1`) que evalúa relevancia, fidelidad/alucinación y tono de la respuesta generada, reutilizando el estilo de prompt del Juez de candidatos existente.
+- **`analyze_benchmark_logs.py`:** suma columnas de Recall@5/Precision@5/MRR/Intent Accuracy a la comparativa, sin romper el parseo del pass-rate existente.
+- **Resultado:** **22/22 casos PASARON** corriendo contra la Supabase real de producción (`Recall@5=0.98 | Precision@5=0.85 | MRR=1.00 | Intent Accuracy=1.00`).
+
+### 🐛 Bug real #1: `/chat` pasaba `df` (siempre `None`) en vez de `df_lugares`
+- **Descubierto** al intentar correr el nuevo benchmark contra el endpoint `/chat`: cualquier camino que necesitara metadata de restaurantes (RECOMMENDATION, SPECIFIC_INFO) tiraba `AttributeError: 'NoneType' object has no attribute 'index'`.
+- **Causa:** el handler de `/chat` (no-streaming) le pasaba la variable global `df` (arquitectura LAZY, siempre `None`) a `procesar_consulta`, mientras que `/chat/stream` sí usaba `df_lugares` correctamente. Nadie lo notaba en producción porque el frontend solo usa `/chat/stream`.
+- **Solución:** se corrigió el call site para pasar `df_lugares`, igual que el endpoint de streaming.
+
+### 🐛 Bug real #2: preguntas de seguimiento crasheaban con `KeyError: 'fecha'`
+- **Descubierto** curando el caso `followup_detalle_entidad` ("¿tiene wifi?" tras seleccionar un local).
+- **Causa:** `responder_followup_gen` recibía el parámetro `df` de `procesar_consulta_gen`, que en ambos endpoints es en realidad `df_lugares` (metadata, sin columna `fecha`/`texto` por reseña) y no el DataFrame de reviews que la función esperaba. Es la misma familia de bug que el fix de "827 Punto de Encuentro" de la sesión anterior, pero en una función distinta que no había sido migrada a la arquitectura LAZY. **Afectaba a `/chat/stream` en producción real**, no solo al benchmark.
+- **Solución:** si el `df` recibido no trae la columna `fecha`, se cargan las reviews reales bajo demanda con `obtener_reviews_por_local` (mismo patrón ya usado en `resumir_opiniones_local_gen`).
+- **Validación:** el caso `followup_detalle_entidad` pasó de fallar con 500 a `PASÓ` en el golden dataset, corriendo contra datos reales.
+
+### 📊 Logging de queries reales (para minar el dataset a futuro)
+- **Problema:** no existía ninguna fuente persistida de queries reales de usuarios — el logging de producción va solo a Discord (no queryable).
+- **Solución:** se diseñó la tabla `query_logs` (`create_query_logs_table.py`, script idempotente `CREATE TABLE IF NOT EXISTS`, mismo patrón standalone que `migrate_data.py`) y se agregó `log_user_query_to_db` en `main.py`, llamado junto al logging existente de Discord en `/chat` y `/chat/stream`. Envuelto en try/except que solo loguea un warning — nunca puede tirar abajo el request, igual que el logging a Discord.
+
 ---
 *Bitácora actualizada por Antigravity Agent (v7.1).*

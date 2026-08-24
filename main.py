@@ -30,7 +30,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_postgres import PGVector
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from upstash_redis.asyncio import Redis
@@ -745,6 +745,58 @@ async def _send_discord_webhook(content: str) -> None:
         await asyncio.to_thread(_post_sync)
     except Exception as e:
         logger.warning(f"⚠️ No se pudo enviar log a Discord: {e}")
+
+
+async def log_user_query_to_db(
+    query: str,
+    mode: str = None,
+    intencion: str = None,
+    zona_detectada: str = None,
+    restaurants: list = None,
+    response_time: float = None,
+    tone: str = None,
+    ai_provider: str = None,
+    used_cache: bool = False,
+) -> None:
+    """
+    Persiste la query real en la tabla query_logs (Supabase) para minar casos reales
+    a futuro para el golden dataset. Nunca debe poder tirar abajo el request: cualquier
+    falla (tabla inexistente, DB caída) se traga con un warning, igual que el logging a Discord.
+    """
+    global db_engine
+    if db_engine is None:
+        return
+
+    def _insert():
+        with db_engine.connect() as conn:
+            conn.execute(
+                text(
+                    """
+                    INSERT INTO query_logs
+                    (query, mode, intencion, zona_detectada, restaurants_returned,
+                     response_time_seconds, tone, ai_provider, used_cache)
+                    VALUES (:query, :mode, :intencion, :zona, :restaurants,
+                            :rt, :tone, :provider, :cache)
+                    """
+                ),
+                {
+                    "query": query,
+                    "mode": mode,
+                    "intencion": intencion,
+                    "zona": zona_detectada,
+                    "restaurants": restaurants or [],
+                    "rt": response_time,
+                    "tone": tone,
+                    "provider": ai_provider,
+                    "cache": used_cache,
+                },
+            )
+            conn.commit()
+
+    try:
+        await asyncio.to_thread(_insert)
+    except Exception as e:
+        logger.warning(f"⚠️ No se pudo loguear query a DB: {e}")
 
 
 async def log_user_query_to_discord(
@@ -1939,8 +1991,18 @@ async def responder_followup_gen(restaurante, query, df, llm, tone="cordial"):
         return
 
     # 2. Get reviews and filter by topic/relevance
+    # df puede ser metadata (df_lugares, sin 'fecha' por review) según quien llame;
+    # si no trae reviews reales, las traemos bajo demanda (mismo patrón que resumir_opiniones_local_gen).
+    reviews_df = df
+    if "fecha" not in reviews_df.columns:
+        reviews_df = await obtener_reviews_por_local([restaurante])
+
+    if reviews_df.empty:
+        yield {"type": "token", "content": f"No encontré reseñas para {restaurante}."}
+        return
+
     # reusing logic from rankear_reviews_por_topico
-    sorted_reviews = rankear_reviews_por_topico(df[mask], query)
+    sorted_reviews = rankear_reviews_por_topico(reviews_df[reviews_df["restaurante"] == restaurante], query)
 
     # Take top 15 reviews to have enough context
     reviews_txt = "\n".join(
@@ -2921,7 +2983,7 @@ async def procesar_consulta(
 ):
     """
     Wrapper legacy that consumes the generator and returns the full response tuple.
-    Returns: (resp, mode, pend, locs, cards, det)
+    Returns: (resp, mode, pend, locs, cards, det, zona)
     """
     full_text = ""
     mode = "general"
@@ -2929,6 +2991,7 @@ async def procesar_consulta(
     locs = []
     pend = None
     det = ""  # Not really used in gen yet, but kept for signature
+    zona = None
 
     async for event in procesar_consulta_gen(
         query, df, vectorstore, llm_mini, llm_smart, ctx, user_ip
@@ -2944,9 +3007,11 @@ async def procesar_consulta(
                 locs = event["locs"]
             if "pending" in event:
                 pend = event["pending"]
+            if "zona" in event:
+                zona = event["zona"]
             # Intent is not returned in tuple
 
-    return full_text, mode, pend, locs, cards, det
+    return full_text, mode, pend, locs, cards, det, zona
 
 
 @app.get("/debug/db")
@@ -3243,6 +3308,18 @@ async def chat_stream(req: QueryRequest, request: Request):
                 zona_detectada=zona,
             )
         )
+        asyncio.create_task(
+            log_user_query_to_db(
+                req.query,
+                mode=mode,
+                zona_detectada=zona,
+                restaurants=restaurants,
+                response_time=response_time,
+                tone=req.tone,
+                ai_provider=ai_provider,
+                used_cache=False,
+            )
+        )
 
     return StreamingResponse(
         event_generator(),
@@ -3268,8 +3345,8 @@ async def chat(req: QueryRequest, request: Request):
 
         client_ip = extract_client_ip(request)
 
-        resp, mode, pend, locs, cards, det = await procesar_consulta(
-            req.query, df, vectorstore, llm_mini, llm_smart, ctx, user_ip=client_ip
+        resp, mode, pend, locs, cards, det, zona = await procesar_consulta(
+            req.query, df_lugares, vectorstore, llm_mini, llm_smart, ctx, user_ip=client_ip
         )
 
         # Calcular tiempo de respuesta
@@ -3299,6 +3376,18 @@ async def chat(req: QueryRequest, request: Request):
                 ai_provider=ai_provider,
                 context_info=ctx,
                 strikes=ctx.get("strikes", 0),
+            )
+        )
+        asyncio.create_task(
+            log_user_query_to_db(
+                req.query,
+                mode=mode,
+                zona_detectada=zona,
+                restaurants=restaurants,
+                response_time=response_time,
+                tone=req.tone,
+                ai_provider=ai_provider,
+                used_cache=False,
             )
         )
 
