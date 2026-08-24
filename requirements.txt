@@ -11,3 +11,4 @@ python-dotenv
 upstash-redis
 pyarrow
 rapidfuzz
+langsmith

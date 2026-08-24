@@ -34,7 +34,6 @@
     "expected_restaurants": [
       "ÁRBOL Cervecería Artesanal",
       "Cervecería OSS",
-      "10 ALMAS",
       "BIER BARON Bar Cervecero",
       "Vikingos Bar Cervecero"
     ],
@@ -46,7 +45,7 @@
     ],
     "min_results": 2,
     "judge_eligible": true,
-    "notes": "migrado de benchmark_cases.json"
+    "notes": "RE-CURADO (24-ago-2026): se sacó '10 ALMAS' — categoría 'Bar' de espectáculos/shows en vivo, su resumen no menciona cerveza artesanal ni cervecería en absoluto."
   },
   {
     "id": "combo_merienda_alto",
@@ -79,8 +78,6 @@
     "expected_intent": "RECOMMENDATION",
     "expected_mode": "rag",
     "expected_restaurants": [
-      "Restaurante El Ciervo",
-      "CASI RODRIGUEZ RESTAURANTE",
       "ROTISERIA MALLORCA",
       "Parrilla Nativo",
       "Patagonia Garage"
@@ -92,7 +89,7 @@
     ],
     "min_results": 3,
     "judge_eligible": true,
-    "notes": "migrado de benchmark_cases.json"
+    "notes": "RE-CURADO (24-ago-2026): se sacaron 'Restaurante El Ciervo' (categoría 'Spanish restaurant', sin mención explícita de parrilla/asado en su resumen) y 'CASI RODRIGUEZ RESTAURANTE' (bodegón genérico, categoría 'Argentinian restaurant', sin mención de parrilla) — aceptados originalmente solo porque el RAG los devolvió, sin verificar categoría/evidencia real. Los 3 restantes sí mencionan parrilla/asado explícitamente en sus reseñas."
   },
   {
     "id": "plato_milanesas",
@@ -122,13 +119,17 @@
     "expected_mode": "rag",
     "expected_restaurants": [
       "Parrilla Rancho Grande",
-      "Los Carritos",
-      "La Rancheria"
+      "N&S Food Hall",
+      "827 Punto de encuentro",
+      "Parrillas Gatica",
+      "Frosts Frineve Creams",
+      "Un Altra Volta",
+      "Heladería Costa Piré"
     ],
     "expected_zones": [],
     "min_results": 2,
     "judge_eligible": true,
-    "notes": "migrado de benchmark_cases.json"
+    "notes": "RE-CURADO (24-ago-2026) tras detectar un error grave: la curación original aceptó sin verificar lo que devolvía el RAG (Los Carritos, La Rancheria), que en realidad NO tienen pelotero según sus propias reseñas ('no cuenta con pelotero'/'no cuenta con áreas de entretenimiento como pelotero'). Búsqueda independiente en resumen_reviews de TODA la base (no solo lo que trajo el RAG) confirmó 7 lugares con mención POSITIVA y explícita de pelotero. HALLAZGO IMPORTANTE: '827 Punto de encuentro' tiene pelotero confirmado ('pelotero gigante para niños') pero el RAG actual NO lo devuelve para esta query — gap de recall real, no error de curación. Reportado por el usuario."
   },
   {
     "id": "feature_sintacc",
@@ -159,13 +160,12 @@
       "SushiClub Neuquén",
       "N&S Food Hall",
       "ATU SUSHI",
-      "Pastas Caseras Elvira",
       "Sushi Zen Neuquen"
     ],
     "expected_zones": [],
     "min_results": 3,
     "judge_eligible": true,
-    "notes": "migrado de benchmark_cases.json"
+    "notes": "RE-CURADO (24-ago-2026): se sacó 'Pastas Caseras Elvira' — categoría oficial 'Noodle shop' (fideos caseros), no tiene relación con sushi; fue aceptado originalmente solo por venir del output del RAG. 'N&S Food Hall' se mantiene: su resumen confirma explícitamente que ofrece sushi entre sus puestos."
   },
   {
     "id": "lugar_especifico",
@@ -239,16 +239,17 @@
     "expected_intent": "RECOMMENDATION",
     "expected_mode": "rag",
     "expected_restaurants": [
-      "Antü RestoBar - Patio de Encuentro (Cipolletti)",
-      "Heladería Grido",
-      "Mambo Tango",
-      "Pranzo Empanadas - Neuquén - Local Belgrano 4150",
-      "Jimmy 1964"
+      "Ratas Veganas",
+      "Oh My Veggie - Almte. Brown",
+      "Oh My Veggie - Avenida Argentina 368",
+      "BIO ZEN",
+      "Mama's cook",
+      "Ohana Tienda y Cafe"
     ],
     "expected_zones": [],
     "min_results": 2,
     "judge_eligible": true,
-    "notes": "botón de ejemplo del frontend"
+    "notes": "RE-CURADO (24-ago-2026): la lista original (Antü RestoBar, Heladería Grido, Mambo Tango, Pranzo Empanadas, Jimmy 1964) fue aceptada del output del RAG sin verificar — NINGUNO de esos 5 es realmente un lugar con opciones veganas confirmadas en sus reseñas (son genéricos: heladera de cadena, pizzería, empanadería). Reemplazado por 6 lugares verificados con texto completo de resumen_reviews que confirman oferta vegana explícita (incluye 'Ratas Veganas', categoría oficial 'Vegan restaurant', que el RAG ni siquiera devolvía). Esto expone un gap de recall/precision real del RAG para búsquedas de comida vegana, no solo un error de curación."
   },
   {
     "id": "keyword_mejores_cervecerias",
@@ -261,13 +262,12 @@
       "Antares Neuquén",
       "OGHAM Neuquén",
       "Cerveceria Owe",
-      "Santo",
       "Cerveza Patagonia - Refugio Neuquén"
     ],
     "expected_zones": [],
     "min_results": 3,
     "judge_eligible": true,
-    "notes": "botón de ejemplo del frontend, sin filtro de zona (distinto de zona_oeste)"
+    "notes": "RE-CURADO (24-ago-2026): se sacó 'Santo' — categoría 'Bar' genérico de microcentro, sin mención de cerveza artesanal/cervecería en su resumen."
   },
   {
     "id": "followup_detalle_entidad",
@@ -359,8 +359,6 @@
     "expected_intent": "RECOMMENDATION",
     "expected_mode": "rag",
     "expected_restaurants": [
-      "Lotito's A lo Bestia - Casa de Comidas",
-      "CASI RODRIGUEZ RESTAURANTE",
       "Parrilla Rancho Grande",
       "Parrilla La Gran Familia",
       "Patagonia Garage"
@@ -368,7 +366,7 @@
     "expected_zones": [],
     "min_results": 1,
     "judge_eligible": true,
-    "notes": "queja legítima con lenguaje fuerte que NO está en la banned_words list de check_keyword_ban; debe tratarse como RECOMMENDATION normal, no bloquearse en falso"
+    "notes": "RE-CURADO (24-ago-2026), mismo problema que combo_parrilla_centro: se sacaron 'Lotito's A lo Bestia - Casa de Comidas' y 'CASI RODRIGUEZ RESTAURANTE' (bodegones genéricos sin mención de parrilla en sus reseñas) que habían sido aceptados solo por venir del output del RAG. Reportado por el usuario como ejemplo concreto del problema de curación."
   },
   {
     "id": "sin_resultados_edge",

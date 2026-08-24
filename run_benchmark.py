@@ -8,6 +8,7 @@ from colorama import Fore, Style, init
 from fastapi.testclient import TestClient
 
 from eval_metrics import evaluate_case, aggregate, PLACEHOLDER
+from judge import judge_answer_quality
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -22,46 +23,6 @@ init()
 
 GOLDEN_FILE = "golden_dataset.json"
 WITH_JUDGE = os.getenv("WITH_JUDGE", "0") == "1"
-
-JUDGE_PROMPT_TEMPLATE = """
-Eres un evaluador de calidad de respuestas de un chatbot de recomendaciones gastronómicas.
-Query del usuario: "{query}"
-
-Respuesta generada por el chatbot:
-\"\"\"
-{reply}
-\"\"\"
-
-Restaurantes que el chatbot devolvió como tarjetas: {actual_names}
-Restaurantes que se esperaban como resultado correcto (ground truth curado): {expected_names}
-
-TAREA: Evaluá la respuesta generada, no la elección de restaurantes (eso ya se mide aparte).
-
-Responde JSON estricto:
-{{
-    "relevancia": <entero 1-5, 5 = responde exactamente lo que se pidió>,
-    "fidelidad_ok": <bool, true si no inventa datos que no podrían salir de reseñas reales>,
-    "alucinacion_detalle": "<string vacío si fidelidad_ok=true, si no explicá qué se inventó>",
-    "tono_ok": <bool, true si el tono es coherente y no es robótico/plano>
-}}
-"""
-
-
-def judge_answer_quality(case, reply, actual_names):
-    """Judge opcional de calidad de respuesta (no de retrieval). Reutiliza el estilo de prompt
-    del Juez de candidatos existente en main.py (JSON estricto en español)."""
-    prompt = JUDGE_PROMPT_TEMPLATE.format(
-        query=case["query"],
-        reply=reply[:3000],
-        actual_names=actual_names,
-        expected_names=case.get("expected_restaurants", []),
-    )
-    try:
-        res = main.llm_smart.invoke(prompt)
-        clean = res.content.strip().replace("```json", "").replace("```", "")
-        return json.loads(clean)
-    except Exception as e:
-        return {"error": str(e)}
 
 
 def run_single_case(client, case):
@@ -95,7 +56,9 @@ def run_single_case(client, case):
     result["reply"] = reply
 
     if WITH_JUDGE and not result["skipped"] and case.get("judge_eligible", True):
-        result["judge"] = judge_answer_quality(case, reply, card_names)
+        result["judge"] = judge_answer_quality(
+            main.llm_smart, case["query"], reply, card_names, case.get("expected_restaurants", [])
+        )
 
     return result
 
