@@ -1,0 +1,11 @@
+# Agent Behavior & Rules (Backend Repo)
+
+## Documentation
+- **ALWAYS** update `DEV_LOG.md` before committing significant code, configuration, or behavior changes. Include the problem, cause, solution, and validation in the same commit when applicable.
+
+## Terminal & Shell (PowerShell)
+- **DO NOT use `&&`** chaining in Windows PowerShell commands. Use `;` instead.
+
+## Code Quality
+- Keep backend changes focused and preserve existing public APIs unless the task requires otherwise.
+- Use Spanish for comments and development log entries when practical.

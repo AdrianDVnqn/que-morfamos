@@ -138,5 +138,20 @@ Este archivo registra los hitos técnicos, decisiones de diseño y correcciones 
 - **Generación de Tarjetas:** Reducida de 85s a <15s netos (tiempo del LLM) eliminando escaneos lineales redundantes.
 - **Integridad:** Corregidos errores de estructura en `main.py`.
 
+## 📅 Sesión: 23 de Agosto de 2026 (Selección de locales)
+
+### 🐛 Corrección de selección por menú
+- **Problema:** Al buscar un local con un nombre compartido, como `827 Punto de encuentro`, el sistema mostraba correctamente el menú de opciones, pero al elegir una opción fallaba con el error `'fecha'` y no devolvía el restaurante.
+- **Causa:** La ruta de selección mezclaba el DataFrame de metadata (`df_lugares`) con el DataFrame de reseñas. El resumen intentaba ordenar metadata como si tuviera la columna `fecha`. Además, la detección podía devolver solo una palabra distintiva, como `Encuentro`, en lugar del nombre canónico completo.
+- **Solución:**
+    - Se priorizan coincidencias de nombre completo y se conserva el nombre canónico del registro.
+    - `resumir_opiniones_local_gen` usa `df_lugares` para metadata y carga las reseñas bajo demanda desde `reviews`.
+    - La ruta tolera locales sin reseñas sin intentar ordenar un DataFrame vacío o incompleto.
+- **Validación:** Compilación con `python -m py_compile main.py` y prueba aislada con nombres ambiguos, devolviendo correctamente `827 Punto de encuentro`.
+
+### 🗓️ Fecha visible de actualización del backend
+- Se agregó `backend_updated_at` al endpoint `/health` para que el frontend pueda mostrar `Backend actualizado` con una fecha explícita.
+- La fecha se mantiene junto a `SERVER_VERSION` y debe actualizarse cuando se publique un cambio relevante del backend.
+
 ---
 *Bitácora actualizada por Antigravity Agent (v7.1).*

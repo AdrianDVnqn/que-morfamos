@@ -70,6 +70,7 @@ THEIPAPI_KEY = os.getenv("THEIPAPI_KEY")
 SERVER_VERSION = (
     "v8.0"  # 2026-03-06: LAZY reviews architecture — only df_lugares (936 rows) in memory
 )
+SERVER_UPDATED_AT = "2026-03-06"
 
 logger.info(f"🔌 Iniciando BACKEND {SERVER_VERSION} con Colección: '{COLLECTION_NAME}'")
 
@@ -2974,6 +2975,7 @@ async def health_check():
     return {
         "status": "healthy",
         "version": SERVER_VERSION,
+        "backend_updated_at": SERVER_UPDATED_AT,
         "lugares": len(df_lugares) if df_lugares is not None else 0,
         "reviews": "LAZY_MODE",
     }
