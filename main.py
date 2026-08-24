@@ -52,6 +52,26 @@ def _normalizar_busqueda(texto):
     texto_norm = unicodedata.normalize("NFD", str(texto).lower().strip())
     return "".join(ch for ch in texto_norm if unicodedata.category(ch) != "Mn")
 
+
+NEGATION_RE = re.compile(r"\b(no|sin|carece|falta|ausencia)\b")
+
+
+def _mencion_positiva(texto, termino, ventana=70):
+    """True si `termino` aparece en `texto` sin una negación cercana hacia atrás
+    (ej. "no cuenta con pelotero" no cuenta como mención positiva de "pelotero").
+    resumen_reviews mezcla menciones positivas y negativas de la misma feature para
+    todos los locales, así que un str.contains simple genera falsos positivos."""
+    if not texto or not termino:
+        return False
+    texto_lower = texto.lower()
+    termino_lower = termino.lower()
+    for m in re.finditer(re.escape(termino_lower), texto_lower):
+        inicio = max(0, m.start() - ventana)
+        ventana_texto = texto_lower[inicio:m.start()]
+        if not NEGATION_RE.search(ventana_texto):
+            return True
+    return False
+
 # ==========================================
 # 1. CONFIGURACIÓN DE ENTORNO
 # ==========================================
@@ -197,14 +217,17 @@ KEYWORD_TO_CATEGORIES = {
     "cafe": ["Cafe", "Coffee shop", "Cafeteria", "Espresso bar"],
     "cafeteria": ["Cafe", "Coffee shop", "Cafeteria"],
     # Parrillas / Carnes
+    # "Argentinian restaurant" se sacó del mapeo (25-ago-2026): es una categoría de Google
+    # demasiado amplia — cualquier bodegón cae ahí aunque no sirva parrilla/asado — y en Modo
+    # Genérico se aprueba sin pasar por el Juez, así que colaba falsos positivos como
+    # "CASI RODRIGUEZ RESTAURANTE" para queries de "parrilla". Ver DEV_LOG sesión 25-ago-2026.
     "parrilla": [
         "Barbecue restaurant",
         "Steak house",
         "Grill",
         "Chophouse restaurant",
-        "Argentinian restaurant",
     ],
-    "asado": ["Barbecue restaurant", "Steak house", "Grill", "Argentinian restaurant"],
+    "asado": ["Barbecue restaurant", "Steak house", "Grill"],
     "carne": ["Steak house", "Barbecue restaurant", "Chophouse restaurant"],
     # Hamburguesas
     "hamburguesa": ["Hamburger restaurant", "Fast food restaurant", "Bar & grill"],
@@ -2047,8 +2070,13 @@ async def responder_followup_gen(restaurante, query, df, llm, tone="cordial"):
     except Exception as e:
         logger.error(f"Error responder_followup: {e}")
         yield {"type": "token", "content": "Tuve un error procesando tu pregunta."}
-def obtener_evidencia_para_juez(candidatos, df_lugares_ref, keywords):
-    """LAZY v8: Usa resumen_reviews de df_lugares (936 filas) en vez de 155k reviews."""
+def obtener_evidencia_para_juez(candidatos, df_lugares_ref, keywords, ventana=300):
+    """LAZY v8: Usa resumen_reviews de df_lugares (936 filas) en vez de 155k reviews.
+    Extrae la ventana de texto alrededor de la mención real de la keyword (si existe) en vez
+    de un prefijo fijo de 700 caracteres: un prefijo fijo describe la especialidad principal
+    del local (párrafo 1 del resumen) y suele perderse características como "vegano"/"sin TACC"
+    que viven más adelante (párrafo 3) — el Juez terminaba evaluando a ciegas y aprobando por
+    default (ver DEV_LOG sesión 25-ago-2026, bug de evidencia ciega)."""
     texto_validacion = ""
     for local in candidatos[:10]:
         if local not in df_lugares_ref.index:
@@ -2064,14 +2092,20 @@ def obtener_evidencia_para_juez(candidatos, df_lugares_ref, keywords):
         if not resumen or len(resumen) < 20:
             resumen = f"Restaurante en Neuquén con {total_reviews} reseñas."
 
-        # Buscar evidencia en el resumen
-        snippet = resumen[:700].replace("\n", " ")
+        # Buscar evidencia real: ventana alrededor de la primera mención de alguna keyword.
+        snippet = None
         prefix = "RESUMEN:"
-
-        if keywords:
-            pattern = "|".join([re.escape(k) for k in keywords])
-            if re.search(pattern, resumen, re.IGNORECASE):
+        for k in (keywords or []):
+            match = re.search(re.escape(k), resumen, re.IGNORECASE)
+            if match:
+                inicio = max(0, match.start() - ventana)
+                fin = min(len(resumen), match.end() + ventana)
+                snippet = resumen[inicio:fin].replace("\n", " ")
                 prefix = "EVIDENCIA:"
+                break
+
+        if snippet is None:
+            snippet = resumen[:700].replace("\n", " ")
 
         texto_validacion += f'- LOCAL: {local} (⭐{rating} - {total_reviews} reseñas)\n  {prefix} "...{snippet}..."\n\n'
     return texto_validacion
@@ -2254,13 +2288,30 @@ def procesar_recomendacion_pesado(
     """
     Función síncrona para ejecutar las operaciones pesadas de Pandas/CPU fuera del event loop.
     LAZY v8: Ya no usa df de reviews (155k). Solo usa df_lugares (936 filas).
-    Retorna (candidatos_a_verificar, grupo_alta_relevancia).
+    Retorna (candidatos_a_verificar, grupo_alta_relevancia, candidatos_confiables).
+
+    candidatos_confiables: subset de candidatos_a_verificar que vino de una fuente ya validada
+    (Modo Genérico por categoria oficial, o vector search en modo específico) — el caller puede
+    saltar el Juez para estos. Los agregados acá por Hybrid Injection (texto libre sobre
+    resumen_reviews) NO se consideran confiables y deben pasar por el Juez, incluso en Modo
+    Genérico: `categoria` suele ser demasiado genérica para conceptos que son más "característica
+    del menú" que "tipo de negocio" (ej. BIO ZEN es "Restaurant" en Google pese a ser vegetariano).
     """
     # 1. Filtro de zona inicial
     if zona_detectada:
         candidatos_crudos = aplicar_filtro_zona(candidatos_crudos, None, zona_detectada, verbose=False)
 
-    # 2. HYBRID INJECTION (ahora sobre resumen_reviews de df_lugares — 936 filas)
+    candidatos_confiables = set(candidatos_crudos)
+
+    def calc_score(nombre):
+        if nombre not in df_lugares_ref.index: return 0
+        r = df_lugares_ref.loc[nombre]
+        if isinstance(r, pd.DataFrame): r = r.iloc[0]
+        return safe_float(r.get("rating_gral")) + (math.log10(safe_int(r.get("total_reviews_google")) + 1) * 2.7)
+
+    # 2. HYBRID INJECTION (ahora sobre resumen_reviews de df_lugares — 936 filas, negation-aware).
+    # Corre siempre, incluso en Modo Genérico: los candidatos que agrega acá quedan FUERA de
+    # candidatos_confiables, así que el caller los manda igual al Juez (ver docstring arriba).
     if keywords and "resumen_reviews" in df_lugares_ref.columns:
         df_para_buscar = df_lugares_ref
         if zona_detectada:
@@ -2271,12 +2322,17 @@ def procesar_recomendacion_pesado(
 
         for kw in keywords:
             if len(kw) < 4: continue
-            mask = df_para_buscar["resumen_reviews"].str.contains(re.escape(kw), case=False, na=False)
-            if mask.any():
-                matches = df_para_buscar[mask].index.tolist()
-                for cand in matches[:10]:
-                    if cand not in candidatos_crudos:
-                        candidatos_crudos.append(cand)
+            matches = [
+                nombre for nombre, resumen in df_para_buscar["resumen_reviews"].items()
+                if _mencion_positiva(safe_str(resumen), kw)
+            ]
+            # Ordenar por score (rating + popularidad) antes de cortar: sin esto, el orden de
+            # iteración de la tabla es esencialmente arbitrario y descarta buenos matches
+            # (ej. BIO ZEN quedaba en la posición 58/70 para "vegano" y nunca entraba al top 10).
+            matches.sort(key=calc_score, reverse=True)
+            for cand in matches[:10]:
+                if cand not in candidatos_crudos:
+                    candidatos_crudos.append(cand)
 
     # 3. HARD FILTER (reviews >= 30)
     candidatos_limpios = []
@@ -2293,20 +2349,13 @@ def procesar_recomendacion_pesado(
     grupo_alta = []
     grupo_baja = []
 
-    def calc_score(nombre):
-        if nombre not in df_lugares_ref.index: return 0
-        r = df_lugares_ref.loc[nombre]
-        if isinstance(r, pd.DataFrame): r = r.iloc[0]
-        return safe_float(r.get("rating_gral")) + (math.log10(safe_int(r.get("total_reviews_google")) + 1) * 2.7)
-
     if es_query_generica:
         grupo_alta = candidatos_crudos
     elif filtro_terms and "resumen_reviews" in df_lugares_ref.columns:
-        patron = "|".join([re.escape(t) for t in filtro_terms])
         for local in candidatos_crudos:
             if local in df_lugares_ref.index:
-                resumen = safe_str(df_lugares_ref.loc[local].get("resumen_reviews", "")).lower()
-                if re.search(patron, resumen):
+                resumen = safe_str(df_lugares_ref.loc[local].get("resumen_reviews", ""))
+                if any(_mencion_positiva(resumen, t) for t in filtro_terms):
                     grupo_alta.append(local)
                     continue
             grupo_baja.append(local)
@@ -2317,7 +2366,7 @@ def procesar_recomendacion_pesado(
     grupo_baja.sort(key=calc_score, reverse=True)
 
     candidatos_verif = (grupo_alta[:12] + grupo_baja[:12])[:12]
-    return candidatos_verif, grupo_alta
+    return candidatos_verif, grupo_alta, candidatos_confiables
 
 
 
@@ -2741,7 +2790,7 @@ async def procesar_consulta_gen(
             # --- OPERACIONES PESADAS (OFFLOAD TO THREAD) ---
             # Filtro de zona, Hybrid Injection, Hard Filter y Ranking se hacen en un thread aparte.
             t_pesado_start = time.time()
-            candidatos_a_verificar, grupo_alta_relevancia = await asyncio.to_thread(
+            candidatos_a_verificar, grupo_alta_relevancia, candidatos_confiables = await asyncio.to_thread(
                 procesar_recomendacion_pesado,
                 candidatos_crudos,
                 df_lugares,
@@ -2767,8 +2816,24 @@ async def procesar_consulta_gen(
                 print(f"[DEBUG] 🧹 Query para Juez (sin ubicación): '{query_para_juez}'", flush=True)
 
             if skip_juez:
-                locales_verificados = candidatos_a_verificar
-                print(f"[DEBUG] ⏩ Saltando Juez LLM (Modo Genérico activo)", flush=True)
+                # Modo Genérico: los candidatos que vinieron de categoria oficial (confiables) se
+                # aprueban directo. Los que Hybrid Injection sumó por texto (ej. BIO ZEN, "Restaurant"
+                # genérico en Google pero vegetariano según reseñas) NO son confiables — la categoria
+                # no los respalda, así que igual pasan por el Juez antes de mostrarse.
+                confiables_en_verif = [c for c in candidatos_a_verificar if c in candidatos_confiables]
+                sin_validar = [c for c in candidatos_a_verificar if c not in candidatos_confiables]
+                print(f"[DEBUG] ⏩ Modo Genérico: {len(confiables_en_verif)} confiables por categoria, "
+                      f"{len(sin_validar)} sumados por texto van al Juez", flush=True)
+                if sin_validar:
+                    t0 = time.time()
+                    aprobados_texto = await verificar_candidatos_con_llm(
+                        sin_validar, df_lugares, query_para_juez, llm_mini
+                    )
+                    t1 = time.time()
+                    print(f"[TIMING] Juez LLM (candidatos por texto) took {t1-t0:.2f}s", flush=True)
+                else:
+                    aprobados_texto = []
+                locales_verificados = confiables_en_verif + aprobados_texto
             else:
                 t0 = time.time()
                 locales_verificados = await verificar_candidatos_con_llm(

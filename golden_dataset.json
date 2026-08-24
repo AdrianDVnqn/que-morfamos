@@ -103,12 +103,16 @@
       "Betos Lomos - 72",
       "Pizzeria el Tano",
       "N&S Food Hall",
-      "Parrilla La Gran Familia"
+      "Parrilla La Gran Familia",
+      "Restaurante Estación Q",
+      "El Tío",
+      "Cabildo Pizzería",
+      "Ache"
     ],
     "expected_zones": [],
     "min_results": 3,
     "judge_eligible": true,
-    "notes": "migrado de benchmark_cases.json; antes se evaluaba con 'Keyword Check (Manual)' que siempre pasaba sin chequear nada"
+    "notes": "migrado de benchmark_cases.json; antes se evaluaba con 'Keyword Check (Manual)' que siempre pasaba sin chequear nada. AMPLIADO (25-ago-2026): tras el fix de negación + orden por popularidad en Hybrid Injection, el RAG empezó a encontrar lugares más populares (3700-4500 reseñas) con evidencia genuina de milanesa que mi curación original no tenía — ej. 'Restaurante Estación Q' tiene la 'Milanesa del Bosque' como plato insignia. Verificado leyendo resumen_reviews completo de cada uno."
   },
   {
     "id": "feature_pelotero",
@@ -244,12 +248,14 @@
       "Oh My Veggie - Avenida Argentina 368",
       "BIO ZEN",
       "Mama's cook",
-      "Ohana Tienda y Cafe"
+      "Ohana Tienda y Cafe",
+      "Franz y Peppone - Almte. Brown 434",
+      "Lucciano's Paseo de la Costa · Neuquén"
     ],
     "expected_zones": [],
     "min_results": 2,
     "judge_eligible": true,
-    "notes": "RE-CURADO (24-ago-2026): la lista original (Antü RestoBar, Heladería Grido, Mambo Tango, Pranzo Empanadas, Jimmy 1964) fue aceptada del output del RAG sin verificar — NINGUNO de esos 5 es realmente un lugar con opciones veganas confirmadas en sus reseñas (son genéricos: heladera de cadena, pizzería, empanadería). Reemplazado por 6 lugares verificados con texto completo de resumen_reviews que confirman oferta vegana explícita (incluye 'Ratas Veganas', categoría oficial 'Vegan restaurant', que el RAG ni siquiera devolvía). Esto expone un gap de recall/precision real del RAG para búsquedas de comida vegana, no solo un error de curación."
+    "notes": "RE-CURADO (24-ago-2026): la lista original (Antü RestoBar, Heladería Grido, Mambo Tango, Pranzo Empanadas, Jimmy 1964) fue aceptada del output del RAG sin verificar — NINGUNO de esos 5 es realmente un lugar con opciones veganas confirmadas en sus reseñas (son genéricos: heladera de cadena, pizzería, empanadería). Reemplazado por 6 lugares verificados con texto completo de resumen_reviews que confirman oferta vegana explícita. NOTA (25-ago-2026): tras el fix del bug de Hybrid Injection, el RAG pasó a devolver 'Cuchí' (categoría 'Vegetarian restaurant', 313 reseñas, resumen confirma 'fuerte identidad vegetariana y vegana') — inicialmente se agregó al dataset, pero el usuario confirmó que el local cerró hace ~1 año. Se excluye del ground truth: el dato de la base está desactualizada (el scraper no revalida cierres de forma periódica), no es un problema del fix. AMPLIADO (25-ago-2026), tras el fix de evidencia del Juez (obtener_evidencia_para_juez ya no manda un prefijo ciego de 700 caracteres): se sumaron 'Franz y Peppone - Almte. Brown 434' (calzones veganos confirmados) y 'Lucciano's Paseo de la Costa · Neuquén' (helados veganos de excelente calidad según reseñas) — lugares de menú mixto con opciones veganas reales, no dedicados 100% vegetarianos, pero igualmente válidos para 'opciones veganas'. Queda como hallazgo aparte: 'Ratas Veganas' (Vegan restaurant, 15 reseñas) y otro candidato por categoría quedan excluidos por el hard filter de total_reviews_google>=30 (main.py, procesar_recomendacion_pesado) — limitación real y preexistente, distinta del bug arreglado."
   },
   {
     "id": "keyword_mejores_cervecerias",
