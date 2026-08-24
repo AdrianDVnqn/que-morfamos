@@ -1425,7 +1425,7 @@ def detectar_mencion_exacta(query, df):
     """
     Detecta si el usuario nombró un lugar exacto.
     FIX v7.5: Agregados 'helado', 'heladeria' a la blacklist para evitar matches falsos.
-    FIX v7.4: Devuelve el NÚCLEO para permitir menús de opciones.
+    Devuelve el nombre canónico completo para resolver correctamente el registro.
     """
     if df is None or df.empty:
         global df_lugares
@@ -1591,6 +1591,13 @@ def detectar_mencion_exacta(query, df):
     nombres = df["restaurante"].unique().tolist()
     nombres.sort(key=len, reverse=True)
 
+    # Priorizar el nombre completo cuando la query lo contiene. Esto evita que
+    # un nombre parcial como "Encuentro" gane frente a "827 Punto de encuentro".
+    for nombre_real in nombres:
+        nombre_lower = _normalizar_busqueda(nombre_real)
+        if nombre_lower and (nombre_lower in q_norm or q_norm in nombre_lower):
+            return nombre_real
+
     for nombre_real in nombres:
         nombre_lower = _normalizar_busqueda(nombre_real)
 
@@ -1612,7 +1619,7 @@ def detectar_mencion_exacta(query, df):
                 # Si el núcleo detectado está en la lista negra (ej: "Helados"), LO IGNORAMOS.
                 if core_name in generic_blocklist:
                     continue
-                return core_name.title()
+                return nombre_real
 
         # 3. Match Palabra Distintiva
         distinctive_parts = [p for p in core_parts if p not in stopwords]
@@ -1626,7 +1633,7 @@ def detectar_mencion_exacta(query, df):
 
                 pattern_dist = r"(?<!\w)" + re.escape(clean_part) + r"(?!\w)"
                 if re.search(pattern_dist, q_norm):
-                    return clean_part.title()
+                    return nombre_real
 
     return None
 
@@ -1728,26 +1735,36 @@ async def resumir_opiniones_local_gen(
     if not query_str:
         yield {"type": "error", "text": "Nombre vacío."}
         return
+    # df_lugares contiene metadata; las reseñas se consultan solo para este local.
+    metadata_df = df_lugares if df_lugares is not None and not df_lugares.empty else df
+    reviews_df = df if df is not None else pd.DataFrame()
+    if "fecha" not in reviews_df.columns:
+        reviews_df = await obtener_reviews_por_local([query_str])
+
+    if metadata_df is None or metadata_df.empty:
+        yield {"type": "error", "text": f"No tengo info de **{query_str}**. Probá con otro nombre."}
+        return
+
     q_clean = _normalizar_busqueda(query_str)
     encontrados = []
 
     # 2. Búsqueda de coincidencias
-    mask_exact = df["restaurante"].fillna("").str.lower().map(_normalizar_busqueda) == q_clean
+    mask_exact = metadata_df["restaurante"].fillna("").map(_normalizar_busqueda) == q_clean
     if mask_exact.any():
-        encontrados = [df[mask_exact].iloc[0]["restaurante"]]
+        encontrados = [metadata_df[mask_exact].iloc[0]["restaurante"]]
     else:
         if es_seleccion_directa:
             if mask_exact.any():
-                encontrados = [df[mask_exact].iloc[0]["restaurante"]]
+                encontrados = [metadata_df[mask_exact].iloc[0]["restaurante"]]
         else:
             mask = (
-                df["restaurante"]
+                metadata_df["restaurante"]
                 .fillna("")
                 .str.lower()
                 .map(_normalizar_busqueda)
                 .str.contains(q_clean, na=False, regex=False)
             )
-            candidatos = df[mask]["restaurante"].unique().tolist()
+            candidatos = metadata_df[mask]["restaurante"].unique().tolist()
 
             if len(candidatos) == 1:
                 encontrados = candidatos
@@ -1757,8 +1774,8 @@ async def resumir_opiniones_local_gen(
                 # Menú de opciones
                 labels = []
                 for r in encontrados:
-                    mask_r = df["restaurante"] == r
-                    rowr = df[mask_r].iloc[0]
+                    mask_r = metadata_df["restaurante"] == r
+                    rowr = metadata_df[mask_r].iloc[0]
                     ubi = (
                         safe_str(rowr.get("direccion"))
                         or safe_str(rowr.get("zona"))
@@ -1803,7 +1820,7 @@ async def resumir_opiniones_local_gen(
 
     # 5. Preparación de Datos para el Prompt
     # Obtenemos la fila de datos para sacar la ubicación real
-    row_data = df[df["restaurante"] == restaurante].iloc[0]
+    row_data = metadata_df[metadata_df["restaurante"] == restaurante].iloc[0]
 
     zona_str = safe_str(row_data.get("zona")).lower()
     dir_str = safe_str(row_data.get("direccion")).lower()
@@ -1821,9 +1838,12 @@ async def resumir_opiniones_local_gen(
     ):  # Si tiene zona pero no es otra ciudad (ej: "Alta Barda")
         ubicacion_real = f"Neuquén Capital (Zona {safe_str(row_data.get('zona'))})"
 
-    sorted_reviews = rankear_reviews_por_topico(
-        df[df["restaurante"] == restaurante], topic
-    )
+    if reviews_df.empty:
+        sorted_reviews = reviews_df
+    else:
+        sorted_reviews = rankear_reviews_por_topico(
+            reviews_df[reviews_df["restaurante"] == restaurante], topic
+        )
     reviews_txt = "\n".join(
         [safe_str(r.get("texto"))[:200] for _, r in sorted_reviews.head(10).iterrows()]
     )
