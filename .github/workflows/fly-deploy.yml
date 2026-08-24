@@ -13,6 +13,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: superfly/flyctl-actions/setup-flyctl@master
-      - run: flyctl deploy --remote-only
+      - run: |
+          COMMIT_DATE=$(git show -s --format=%cI "$GITHUB_SHA")
+          flyctl deploy --remote-only --build-arg BACKEND_UPDATED_AT="$COMMIT_DATE"
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}

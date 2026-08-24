@@ -151,7 +151,9 @@ Este archivo registra los hitos técnicos, decisiones de diseño y correcciones 
 
 ### 🗓️ Fecha visible de actualización del backend
 - Se agregó `backend_updated_at` al endpoint `/health` para que el frontend pueda mostrar `Backend actualizado` con una fecha explícita.
-- La fecha se mantiene junto a `SERVER_VERSION` y debe actualizarse cuando se publique un cambio relevante del backend.
+- La fecha se inyecta automáticamente desde la fecha ISO del commit desplegado por GitHub Actions mediante un argumento de build de Docker.
+- `/health` también devuelve `last_scraping`, calculado desde `MAX(fecha)` de `scraping_logs`.
+- Las fechas sin hora se interpretan como calendario local para evitar que Argentina muestre el día anterior.
 
 ---
 *Bitácora actualizada por Antigravity Agent (v7.1).*

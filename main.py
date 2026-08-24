@@ -70,7 +70,7 @@ THEIPAPI_KEY = os.getenv("THEIPAPI_KEY")
 SERVER_VERSION = (
     "v8.0"  # 2026-03-06: LAZY reviews architecture — only df_lugares (936 rows) in memory
 )
-SERVER_UPDATED_AT = "2026-03-06"
+SERVER_UPDATED_AT = os.getenv("BACKEND_UPDATED_AT", "unknown")
 
 logger.info(f"🔌 Iniciando BACKEND {SERVER_VERSION} con Colección: '{COLLECTION_NAME}'")
 
@@ -2972,10 +2972,25 @@ def read_root():
 
 @app.get("/health")
 async def health_check():
+    last_scraping = None
+    if db_engine is not None:
+        try:
+            latest_log = await asyncio.to_thread(
+                pd.read_sql,
+                "SELECT MAX(fecha) AS last_scraping FROM scraping_logs",
+                db_engine,
+            )
+            value = latest_log.iloc[0]["last_scraping"]
+            if pd.notna(value):
+                last_scraping = value.isoformat() if hasattr(value, "isoformat") else str(value)
+        except Exception as e:
+            logger.warning("Última actualización no disponible: %s", e)
+
     return {
         "status": "healthy",
         "version": SERVER_VERSION,
         "backend_updated_at": SERVER_UPDATED_AT,
+        "last_scraping": last_scraping,
         "lugares": len(df_lugares) if df_lugares is not None else 0,
         "reviews": "LAZY_MODE",
     }
