@@ -16,3 +16,6 @@ mis_claves.env
 # OS
 .DS_Store
 Thumbs.db
+
+# Notas locales, no se suben al repo
+LANGSMITH_GUIDE.md

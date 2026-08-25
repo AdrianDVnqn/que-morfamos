@@ -1431,8 +1431,8 @@ async def analizar_query_semantica(query, llm, last_entity=None):
         if safe in q_lower:
             is_safe_bypass = True
 
-    # Cambiamos v86 a v90 para invalidar cache con el nuevo esquema
-    cache_key = f"analysis_v90_{q_lower.strip()}"
+    # v91: keywords ahora puede incluir múltiples conceptos (ver regla 3 del prompt) — invalida cache vieja
+    cache_key = f"analysis_v91_{q_lower.strip()}"
     if last_entity:
         cache_key += f"_{last_entity.replace(' ', '_')}"
 
@@ -1460,20 +1460,29 @@ async def analizar_query_semantica(query, llm, last_entity=None):
        - "pasteleria en el rio" -> RECOMMENDATION (Busca el producto, no un local llamado 'Pasteleria').
        - "Que onda Pasteleria Najuian?" -> SPECIFIC.
     
+    3. KEYWORDS MÚLTIPLES: Si la query combina una categoría/producto CON una característica o
+       amenity DISTINTA (ej: "parrilla con pelotero", "pizzeria sin tacc", "bar con juegos para
+       chicos"), "keywords" debe incluir AMBOS términos por separado — uno por concepto. NO
+       metas la característica como si fuera sinónimo del producto.
+       - "parrilla con pelotero" -> keywords: ["parrilla", "pelotero"]
+       - "pizzeria sin tacc" -> keywords: ["pizzeria", "sin tacc"]
+       - "bares" (un solo concepto) -> keywords: ["bar"], synonyms: ["cerveceria", "pub"]
+
     Responde SOLO JSON:
     {{
         "intencion": "RECOMMENDATION",
-        "tipo": "PRODUCTO", 
+        "tipo": "PRODUCTO",
         "target_name": null,
-        "keywords": ["bar"], 
+        "keywords": ["bar"],
         "synonyms": ["cerveceria", "pub"],
         "donde": "rio"
     }}
-    
+
     Campos:
     - "target_name": Solo si es SPECIFIC, pon el nombre del lugar limpio.
     - "donde": La zona detectada (rio, centro, alto, oeste, etc) o null.
-    - "keywords": La palabra clave principal (singular).
+    - "keywords": Lista de conceptos distintos de la query (ver regla 3). Si hay uno solo, singular.
+    - "synonyms": Sinónimos del/de los concepto(s) en "keywords" (no un concepto nuevo).
     """
     try:
         res = await llm.ainvoke(template)
@@ -2346,12 +2355,15 @@ def procesar_recomendacion_pesado(
 
     # 4. RELEVANCIA Y SORTING (ahora sobre resumen_reviews)
     filtro_terms = [t.lower() for t in (set(keywords) | set(synonyms or [])) if len(t) > 3]
+    keywords_core = [k.lower() for k in keywords if len(k) > 3]  # conceptos distintos (no sinónimos), para rankear por cobertura
     grupo_alta = []
     grupo_baja = []
+    usa_match_count = False
 
     if es_query_generica:
         grupo_alta = candidatos_crudos
     elif filtro_terms and "resumen_reviews" in df_lugares_ref.columns:
+        usa_match_count = True
         for local in candidatos_crudos:
             if local in df_lugares_ref.index:
                 resumen = safe_str(df_lugares_ref.loc[local].get("resumen_reviews", ""))
@@ -2362,7 +2374,20 @@ def procesar_recomendacion_pesado(
     else:
         grupo_alta = candidatos_crudos
 
-    grupo_alta.sort(key=calc_score, reverse=True)
+    def match_count(nombre):
+        if nombre not in df_lugares_ref.index:
+            return 0
+        resumen = safe_str(df_lugares_ref.loc[nombre].get("resumen_reviews", ""))
+        return sum(1 for k in keywords_core if _mencion_positiva(resumen, k))
+
+    if usa_match_count and len(keywords_core) > 1:
+        # Query con más de un concepto (ej. "parrilla" + "pelotero"): un lugar que cubre AMBOS
+        # debe ganarle a uno más popular que solo cubre uno — si no, un match genuino pero poco
+        # popular (ej. "827 Punto de Encuentro", 183 reseñas) nunca llega al Juez ni a
+        # "Relacionados" porque queda tapado por lugares con más reseñas que matchean a medias.
+        grupo_alta.sort(key=lambda n: (match_count(n), calc_score(n)), reverse=True)
+    else:
+        grupo_alta.sort(key=calc_score, reverse=True)
     grupo_baja.sort(key=calc_score, reverse=True)
 
     candidatos_verif = (grupo_alta[:12] + grupo_baja[:12])[:12]

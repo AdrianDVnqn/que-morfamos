@@ -103,7 +103,6 @@
       "Betos Lomos - 72",
       "Pizzeria el Tano",
       "N&S Food Hall",
-      "Parrilla La Gran Familia",
       "Restaurante Estación Q",
       "El Tío",
       "Cabildo Pizzería",
@@ -112,7 +111,7 @@
     "expected_zones": [],
     "min_results": 3,
     "judge_eligible": true,
-    "notes": "migrado de benchmark_cases.json; antes se evaluaba con 'Keyword Check (Manual)' que siempre pasaba sin chequear nada. AMPLIADO (25-ago-2026): tras el fix de negación + orden por popularidad en Hybrid Injection, el RAG empezó a encontrar lugares más populares (3700-4500 reseñas) con evidencia genuina de milanesa que mi curación original no tenía — ej. 'Restaurante Estación Q' tiene la 'Milanesa del Bosque' como plato insignia. Verificado leyendo resumen_reviews completo de cada uno."
+    "notes": "migrado de benchmark_cases.json; antes se evaluaba con 'Keyword Check (Manual)' que siempre pasaba sin chequear nada. AMPLIADO (25-ago-2026): tras el fix de negación + orden por popularidad en Hybrid Injection, el RAG empezó a encontrar lugares más populares (3700-4500 reseñas) con evidencia genuina de milanesa que mi curación original no tenía — ej. 'Restaurante Estación Q' tiene la 'Milanesa del Bosque' como plato insignia. Verificado leyendo resumen_reviews completo de cada uno. ELIMINADO (25-ago-2026): 'Parrilla La Gran Familia' — se descubrió que estaba mal geolocalizado (contaminación del scraper: su dirección real es 'Neuquén 2252, CABA', Buenos Aires, a 980km de la ciudad). Se borró de la base de producción (lugares/reviews/review_history/embedding) y del golden dataset. Ver DEV_LOG sesión 25-ago-2026."
   },
   {
     "id": "feature_pelotero",
@@ -366,13 +365,12 @@
     "expected_mode": "rag",
     "expected_restaurants": [
       "Parrilla Rancho Grande",
-      "Parrilla La Gran Familia",
       "Patagonia Garage"
     ],
     "expected_zones": [],
     "min_results": 1,
     "judge_eligible": true,
-    "notes": "RE-CURADO (24-ago-2026), mismo problema que combo_parrilla_centro: se sacaron 'Lotito's A lo Bestia - Casa de Comidas' y 'CASI RODRIGUEZ RESTAURANTE' (bodegones genéricos sin mención de parrilla en sus reseñas) que habían sido aceptados solo por venir del output del RAG. Reportado por el usuario como ejemplo concreto del problema de curación."
+    "notes": "RE-CURADO (24-ago-2026), mismo problema que combo_parrilla_centro: se sacaron 'Lotito's A lo Bestia - Casa de Comidas' y 'CASI RODRIGUEZ RESTAURANTE' (bodegones genéricos sin mención de parrilla en sus reseñas) que habían sido aceptados solo por venir del output del RAG. Reportado por el usuario como ejemplo concreto del problema de curación. ELIMINADO (25-ago-2026): 'Parrilla La Gran Familia' — mal geolocalizado (en realidad está en Buenos Aires, no en Neuquén), se borró de la base de producción. Ver DEV_LOG sesión 25-ago-2026."
   },
   {
     "id": "sin_resultados_edge",
