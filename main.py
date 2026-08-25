@@ -53,7 +53,7 @@ def _normalizar_busqueda(texto):
     return "".join(ch for ch in texto_norm if unicodedata.category(ch) != "Mn")
 
 
-NEGATION_RE = re.compile(r"\b(no|sin|carece|falta|ausencia)\b")
+NEGATION_RE = re.compile(r"\b(no|ni|sin|carece|falta|ausencia)\b")
 
 
 def _mencion_positiva(texto, termino, ventana=70):
@@ -1431,8 +1431,8 @@ async def analizar_query_semantica(query, llm, last_entity=None):
         if safe in q_lower:
             is_safe_bypass = True
 
-    # v91: keywords ahora puede incluir múltiples conceptos (ver regla 3 del prompt) — invalida cache vieja
-    cache_key = f"analysis_v91_{q_lower.strip()}"
+    # v92: "pelotero" ahora suma sinónimos amplios de juegos infantiles (ver regla 4) — invalida cache vieja
+    cache_key = f"analysis_v92_{q_lower.strip()}"
     if last_entity:
         cache_key += f"_{last_entity.replace(' ', '_')}"
 
@@ -1467,6 +1467,13 @@ async def analizar_query_semantica(query, llm, last_entity=None):
        - "parrilla con pelotero" -> keywords: ["parrilla", "pelotero"]
        - "pizzeria sin tacc" -> keywords: ["pizzeria", "sin tacc"]
        - "bares" (un solo concepto) -> keywords: ["bar"], synonyms: ["cerveceria", "pub"]
+
+    4. "PELOTERO" ES UN CONCEPTO AMPLIO: a un padre le importa que el chico se entretenga, no
+       específicamente que haya una pileta de pelotas. Si la query menciona "pelotero" (o
+       "juegos para chicos"/"entretenimiento para niños"), agregá a "synonyms" términos
+       relacionados como "juegos infantiles", "juegos para niños", "área de juegos" — así un
+       lugar con hamaca/tobogán/juegos de plaza (sin la palabra "pelotero" en su reseña) también
+       cuenta como respuesta válida.
 
     Responde SOLO JSON:
     {{

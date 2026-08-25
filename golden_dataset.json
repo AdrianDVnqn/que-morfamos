@@ -124,7 +124,6 @@
       "Parrilla Rancho Grande",
       "N&S Food Hall",
       "827 Punto de encuentro",
-      "Parrillas Gatica",
       "Frosts Frineve Creams",
       "Un Altra Volta",
       "Heladería Costa Piré"
@@ -132,7 +131,7 @@
     "expected_zones": [],
     "min_results": 2,
     "judge_eligible": true,
-    "notes": "RE-CURADO (24-ago-2026) tras detectar un error grave: la curación original aceptó sin verificar lo que devolvía el RAG (Los Carritos, La Rancheria), que en realidad NO tienen pelotero según sus propias reseñas ('no cuenta con pelotero'/'no cuenta con áreas de entretenimiento como pelotero'). Búsqueda independiente en resumen_reviews de TODA la base (no solo lo que trajo el RAG) confirmó 7 lugares con mención POSITIVA y explícita de pelotero. HALLAZGO IMPORTANTE: '827 Punto de encuentro' tiene pelotero confirmado ('pelotero gigante para niños') pero el RAG actual NO lo devuelve para esta query — gap de recall real, no error de curación. Reportado por el usuario."
+    "notes": "RE-CURADO (24-ago-2026): se sacaron 'Los Carritos'/'La Rancheria' (no tienen pelotero según sus reseñas). HALLAZGO: '827 Punto de encuentro' tiene pelotero confirmado pero el RAG no lo devolvía — gap de recall real, arreglado 25-ago (ver DEV_LOG). RE-VERIFICADO (25-ago-2026) contra reseñas CRUDAS: se detectó que el resumen_reviews de 4 lugares (Parrillas Gatica, Frosts Frineve Creams, Un Altra Volta, Heladería Costa Piré) alucinaba la palabra 'pelotero' sin respaldo textual — causa raíz encontrada y arreglada en el prompt de generar_resumen_reviews (repo scraper). DECISIÓN DE PRODUCTO (25-ago-2026, discutida con el usuario): distinguir 'pelotero' literal de 'juegos infantiles' genéricos (hamaca, tobogán, calesita) es demasiado estricto — a un padre le interesa que el chico se entretenga, no la pileta de pelotas específicamente. Se ensanchó el concepto en el router (sinónimos: 'juegos infantiles', 'juegos para niños', 'área de juegos'), así que 'Frosts Frineve Creams', 'Un Altra Volta' y 'Heladería Costa Piré' vuelven a expected_restaurants — SÍ tienen reseñas reales confirmando juegos para niños, solo que no usan la palabra 'pelotero'. 'Parrillas Gatica' queda excluido: además de no tener 'pelotero', tampoco tiene NINGUNA mención de juegos/niños/hamaca/tobogán en sus 40 reseñas reales — y es un predio municipal de parrillas públicas (BYO), no un local comercial, dato aportado por el usuario que lo conoce en persona."
   },
   {
     "id": "feature_sintacc",
