@@ -76,6 +76,32 @@ def zone_match(expected_zones: list, cards: list) -> tuple:
     return passed, matched, total
 
 
+def category_match(expected_categories: list, cards: list, k: int = 5, min_ratio: float = 0.6) -> tuple:
+    """
+    Chequea qué fracción de las cards devueltas cae en alguna de las categorías esperadas.
+
+    Para queries de categoría ("mejores pizzerías") una lista curada de nombres es el modelo de
+    evaluación equivocado: hay 52 pizzerías en la base y el ground truth elige 5, así que el
+    sistema puede devolver 5 pizzerías legítimas y sacar recall 0.20. Lo que importa realmente
+    es si lo que devolvió ES de la categoría pedida, no si adivinó una lista subjetiva.
+
+    Retorna (passed, matched, total).
+    """
+    if not expected_categories:
+        return True, 0, len(cards or [])
+
+    top_k = (cards or [])[:k]
+    if not top_k:
+        return False, 0, 0
+
+    patrones = [c.lower() for c in expected_categories]
+    matched = sum(
+        1 for card in top_k
+        if any(p in str(card.get("categoria", "")).lower() for p in patrones)
+    )
+    return (matched / len(top_k)) >= min_ratio, matched, len(top_k)
+
+
 def evaluate_case(case: dict, actual_mode: str, actual_names: list, k: int = 5, cards: list = None) -> dict:
     """
     Evalúa un único caso del golden dataset contra la respuesta real del backend.
@@ -113,12 +139,17 @@ def evaluate_case(case: dict, actual_mode: str, actual_names: list, k: int = 5, 
     recall = recall_at_k(expected_restaurants, actual_names, k)
     precision = precision_at_k(expected_restaurants, actual_names, k)
     score_mrr = mrr(expected_restaurants, actual_names)
+    cat_ok, cat_matched, cat_total = category_match(case.get("expected_category", []), cards or [], k)
 
     if expected_empty:
         # Caso que debe NO devolver resultados. Antes esto era un pass automático (la condición
         # `not expected_restaurants` cortocircuitaba `passed`), así que el único test de "no
         # encontré nada" era incapaz de fallar aunque el RAG devolviera 5 lugares reales.
         retrieval_ok = len(actual_names) == 0
+    elif case.get("expected_category"):
+        # Query de categoría: se juzga por la categoría de lo devuelto, no contra una lista
+        # subjetiva de nombres (ver category_match).
+        retrieval_ok = cat_ok and result["min_results_ok"]
     elif expected_restaurants and case.get("open_ended"):
         # Query abierta: hay muchos más lugares válidos que los que el sistema puede devolver
         # (el backend corta en 5 cards: 3 exactos + 2 relacionados), así que expected_restaurants
@@ -146,6 +177,9 @@ def evaluate_case(case: dict, actual_mode: str, actual_names: list, k: int = 5, 
         "zona_ok": zona_ok,
         "zona_matched": zona_matched,
         "zona_total": zona_total,
+        "cat_ok": cat_ok,
+        "cat_matched": cat_matched,
+        "cat_total": cat_total,
         "passed": passed,
     })
     return result

@@ -232,7 +232,10 @@
     "expected_zones": [],
     "min_results": 3,
     "judge_eligible": true,
-    "notes": "query sin tildes ('pizzerias', 'neuquen'), prueba _normalizar_busqueda / accent-insensitive search"
+    "notes": "query sin tildes ('pizzerias', 'neuquen'), prueba _normalizar_busqueda / accent-insensitive search MARCADO expected_category (25-ago-2026): hay 52 pizzerias en la base con >=30 resenas y este ground truth elegia 5 por nombre, asi que el sistema devolvia 5 pizzerias legitimas y sacaba recall 0.20 -> FALLO, castigado por acertar. Para queries de categoria lo que importa es si lo devuelto ES de la categoria pedida, no si adivino una lista subjetiva de \"las mejores\". expected_restaurants queda como referencia informativa.",
+    "expected_category": [
+      "pizza"
+    ]
   },
   {
     "id": "keyword_vegano",

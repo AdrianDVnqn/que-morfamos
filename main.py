@@ -55,6 +55,24 @@ def _normalizar_busqueda(texto):
 
 NEGATION_RE = re.compile(r"\b(no|ni|sin|carece|falta|ausencia)\b")
 
+# Keywords que describen el CONTENEDOR, no el contenido: matchean cientos de resúmenes y no
+# aportan señal para la inyección por texto ("restaurante" matchea 400 de 930 lugares). Sin este
+# filtro, una query sin respuesta posible como "comida marciana" igual traía 10 candidatos por el
+# "restaurante" que el router extrae de yapa. La comparación es por igualdad exacta, así que
+# keywords compuestas ("comida vegana", "comida japonesa") no se ven afectadas.
+KEYWORDS_GENERICAS = {
+    "restaurante", "restaurant", "restaurantes", "comida", "comidas", "lugar", "lugares",
+    "local", "locales", "sitio", "sitios", "negocio", "gastronomia", "gastronomía",
+    "opcion", "opciones", "opción",
+}
+
+# "Zonas" que en realidad son toda el área de cobertura: filtrar por ellas no acota nada y, peor,
+# no matchean el campo `zona`/`barrio` de ningún local (que guardan el barrio, no la ciudad).
+# Se comparan ya normalizadas (sin acentos) vía _normalizar_busqueda.
+ZONAS_NO_FILTRABLES = {
+    "neuquen", "neuquen capital", "capital", "ciudad", "ciudad de neuquen", "nqn",
+}
+
 
 def _mencion_positiva(texto, termino, ventana=70):
     """True si `termino` aparece en `texto` sin una negación cercana hacia atrás
@@ -361,6 +379,12 @@ async def lifespan(app: FastAPI):
         elif provider_mode == "openai":
             llm_mini = openai_mini
             llm_smart = openai_smart
+        elif provider_mode == "openai-mini":
+            # Todo con gpt-4o-mini. El backend hace ~8 llamadas LLM por consulta (router, Juez,
+            # generación de texto y una por card), así que usar gpt-4o para el "smart" sale ~17x
+            # más caro: con saldo acotado este modo rinde ~1200 consultas donde "openai" rinde ~70.
+            llm_mini = openai_mini
+            llm_smart = openai_mini
         else:  # hybrid
             llm_mini = openai_mini
             llm_smart = ds_instance if ds_instance else openai_smart
@@ -2204,7 +2228,9 @@ def aplicar_filtro_zona(candidatos, df, zona_buscada, verbose=True):
     if not zona_buscada or not candidatos:
         return candidatos
 
-    z_clean = zona_buscada.lower().strip()
+    # Se normalizan acentos en ambos lados: sin esto, 'neuquen' matcheaba 0 lugares y 'neuquén' 18,
+    # así que cualquier query escrita sin tildes (lo habitual) perdía el filtro de zona.
+    z_clean = _normalizar_busqueda(zona_buscada)
     search_terms = [z_clean]
 
     # Si busca "rio", "paseo" o "costa", ampliamos la búsqueda
@@ -2231,11 +2257,11 @@ def aplicar_filtro_zona(candidatos, df, zona_buscada, verbose=True):
     if isinstance(meta_df, pd.Series): meta_df = meta_df.to_frame().T
 
     for local, row in meta_df.iterrows():
-        geo_data = f"{safe_str(row.get('zona'))} {safe_str(row.get('barrio'))}".lower()
-        
+        geo_data = _normalizar_busqueda(f"{safe_str(row.get('zona'))} {safe_str(row.get('barrio'))}")
+
         # EXCLUSIÓN: "Río Negro" provincia
-        if "río negro" in geo_data or "rio negro" in geo_data:
-            geo_data_clean = geo_data.replace("río negro", "").replace("rio negro", "")
+        if "rio negro" in geo_data:
+            geo_data_clean = geo_data.replace("rio negro", "")
             if not any(term in geo_data_clean for term in search_terms):
                 continue
 
@@ -2330,14 +2356,21 @@ def procesar_recomendacion_pesado(
     # candidatos_confiables, así que el caller los manda igual al Juez (ver docstring arriba).
     if keywords and "resumen_reviews" in df_lugares_ref.columns:
         df_para_buscar = df_lugares_ref
+        zona_vacia = False
         if zona_detectada:
             locales_en_zona = aplicar_filtro_zona(df_lugares_ref.index.tolist(), None, zona_detectada, verbose=False)
             valid_locales = [l for l in locales_en_zona if l in df_lugares_ref.index]
             if valid_locales:
                 df_para_buscar = df_lugares_ref.loc[valid_locales]
+            else:
+                # La zona pedida no existe en la base (ej. "en la luna"). Antes esto degradaba en
+                # silencio a buscar en TODA la ciudad, ignorando la zona que el usuario pidió: el
+                # filtro de zona dejaba 0 candidatos y la inyección los repoblaba desde el corpus
+                # completo. Devolver vacío es la respuesta honesta.
+                zona_vacia = True
 
-        for kw in keywords:
-            if len(kw) < 4: continue
+        for kw in keywords if not zona_vacia else []:
+            if len(kw) < 4 or kw.lower().strip() in KEYWORDS_GENERICAS: continue
             matches = [
                 nombre for nombre, resumen in df_para_buscar["resumen_reviews"].items()
                 if _mencion_positiva(safe_str(resumen), kw)
@@ -2360,9 +2393,13 @@ def procesar_recomendacion_pesado(
                 candidatos_limpios.append(local)
     candidatos_crudos = candidatos_limpios
 
-    # 4. RELEVANCIA Y SORTING (ahora sobre resumen_reviews)
-    filtro_terms = [t.lower() for t in (set(keywords) | set(synonyms or [])) if len(t) > 3]
-    keywords_core = [k.lower() for k in keywords if len(k) > 3]  # conceptos distintos (no sinónimos), para rankear por cobertura
+    # 4. RELEVANCIA Y SORTING (ahora sobre resumen_reviews).
+    # Se descartan las keywords genéricas por el mismo motivo que en la inyección: "restaurante"
+    # matchea 400 de 930 resúmenes, así que mandaría todo a grupo_alta sin discriminar nada.
+    filtro_terms = [t.lower() for t in (set(keywords) | set(synonyms or []))
+                    if len(t) > 3 and t.lower().strip() not in KEYWORDS_GENERICAS]
+    keywords_core = [k.lower() for k in keywords
+                     if len(k) > 3 and k.lower().strip() not in KEYWORDS_GENERICAS]  # conceptos distintos, para rankear por cobertura
     grupo_alta = []
     grupo_baja = []
     usa_match_count = False
@@ -2381,18 +2418,29 @@ def procesar_recomendacion_pesado(
     else:
         grupo_alta = candidatos_crudos
 
-    def match_count(nombre):
-        if nombre not in df_lugares_ref.index:
-            return 0
-        resumen = safe_str(df_lugares_ref.loc[nombre].get("resumen_reviews", ""))
-        return sum(1 for k in keywords_core if _mencion_positiva(resumen, k))
+    def relevancia(nombre):
+        """Clave de orden en cascada: (conceptos cubiertos, fuerza de evidencia, popularidad).
 
-    if usa_match_count and len(keywords_core) > 1:
-        # Query con más de un concepto (ej. "parrilla" + "pelotero"): un lugar que cubre AMBOS
-        # debe ganarle a uno más popular que solo cubre uno — si no, un match genuino pero poco
-        # popular (ej. "827 Punto de Encuentro", 183 reseñas) nunca llega al Juez ni a
-        # "Relacionados" porque queda tapado por lugares con más reseñas que matchean a medias.
-        grupo_alta.sort(key=lambda n: (match_count(n), calc_score(n)), reverse=True)
+        1. `conceptos`: cuántas keywords distintas cubre. Para "parrilla con pelotero", un lugar
+           que cubre AMBAS le gana a uno más popular que solo cubre una (si no, un match genuino
+           pero poco popular como "827 Punto de Encuentro" nunca llega al Juez).
+        2. `evidencia`: cuántos términos del filtro (keyword + sinónimos) menciona. Desempata
+           cuando todos cubren el mismo concepto: para "sin tacc" todos los candidatos matchean
+           "sin tacc", pero los realmente aptos mencionan además "sin gluten"/"celíaco"/"libre de
+           gluten" (Lucciana matchea 4, Antares solo 1). Sin esto ordenaba por popularidad pura,
+           que acá está INVERSAMENTE correlacionada con ser correcto: las cervecerías de 5000
+           reseñas le ganaban a la pastelería sin gluten de 60.
+        3. `calc_score`: popularidad, como último desempate.
+        """
+        if nombre not in df_lugares_ref.index:
+            return (0, 0, 0)
+        resumen = safe_str(df_lugares_ref.loc[nombre].get("resumen_reviews", ""))
+        conceptos = sum(1 for k in keywords_core if _mencion_positiva(resumen, k))
+        evidencia = sum(1 for t in filtro_terms if _mencion_positiva(resumen, t))
+        return (conceptos, evidencia, calc_score(nombre))
+
+    if usa_match_count:
+        grupo_alta.sort(key=relevancia, reverse=True)
     else:
         grupo_alta.sort(key=calc_score, reverse=True)
     grupo_baja.sort(key=calc_score, reverse=True)
@@ -2532,6 +2580,10 @@ async def procesar_consulta_gen(
     keywords = analisis.get("keywords", [])
     synonyms = analisis.get("synonyms", [])
     zona_detectada = analisis.get("donde")
+    # "pizzerías de Neuquén" no pide una zona: pide la ciudad entera, que es todo el catálogo.
+    # Tratarlo como zona filtraba a cero y (desde el fix de zona inexistente) devolvía vacío.
+    if zona_detectada and _normalizar_busqueda(zona_detectada) in ZONAS_NO_FILTRABLES:
+        zona_detectada = None
     target_forced = analisis.get(
         "target_name"
     )  # Si es SPECIFIC, el LLM nos da el nombre

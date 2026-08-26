@@ -29,6 +29,8 @@ WITH_JUDGE = os.getenv("WITH_JUDGE", "0") == "1"
 # benchmark corre la suite N veces y reporta qué casos son inestables, para no confundir ruido
 # con una mejora real.
 REPEATS = int(os.getenv("BENCHMARK_REPEATS", "1"))
+# Texto con el que main.py responde cuando el LLM falla (main.py, except del CAMINO RAG).
+FALLBACK_ERROR_TEXT = "Tuve un problema técnico"
 
 
 def run_single_case(client, case):
@@ -57,6 +59,11 @@ def run_single_case(client, case):
     actual_mode = data.get("mode", "")
 
     result = evaluate_case(case, actual_mode, card_names, k=5, cards=cards)
+    # El backend atrapa los errores de LLM y responde 200 con un texto de fallback, así que un
+    # corte de la API (ej. saldo agotado en DeepSeek) se vería como si TODOS los casos fallaran
+    # a la vez. Sin esta marca, el modo estabilidad reporta eso como "±19 casos inestables"
+    # cuando en realidad no hay nada inestable: la API estaba caída.
+    result["api_error"] = reply.strip().startswith(FALLBACK_ERROR_TEXT)
     result["latency"] = latency
     result["cards"] = cards
     result["reply"] = reply
@@ -96,6 +103,10 @@ def print_case_result(case, result):
         print(f"   {Fore.RED}⚠️ Debía no devolver resultados y devolvió {len(result['cards'])}{Style.RESET_ALL}")
     if not result.get("zona_ok", True):
         print(f"   {Fore.RED}⚠️ Zona: 0/{result.get('zona_total')} cards caen en las zonas esperadas{Style.RESET_ALL}")
+    if case.get("expected_category"):
+        color = Fore.GREEN if result.get("cat_ok") else Fore.RED
+        print(f"   {color}Categoría: {result.get('cat_matched')}/{result.get('cat_total')} cards "
+              f"son {case['expected_category']}{Style.RESET_ALL}")
 
     if result["cards"]:
         names = [c.get("nombre") for c in result["cards"]]
@@ -144,6 +155,7 @@ def run_benchmark():
     with TestClient(main.app) as client:
         historial = {}
         pass_counts = []
+        api_errors_por_corrida = []
         results = []
 
         for corrida in range(REPEATS):
@@ -161,8 +173,12 @@ def run_benchmark():
                         historial.setdefault(case["id"], []).append(bool(result["passed"]))
             corrida_summary = aggregate(results)
             pass_counts.append(corrida_summary["n_passed"])
+            n_api_err = sum(1 for r in results if r.get("api_error"))
+            if n_api_err:
+                api_errors_por_corrida.append((corrida + 1, n_api_err))
             if REPEATS > 1:
-                print(f"   Corrida {corrida + 1}: {corrida_summary['n_passed']}/{corrida_summary['n_cases']} PASARON")
+                aviso = f" {Fore.RED}[{n_api_err} casos con la API caída]{Style.RESET_ALL}" if n_api_err else ""
+                print(f"   Corrida {corrida + 1}: {corrida_summary['n_passed']}/{corrida_summary['n_cases']} PASARON{aviso}")
 
         summary = aggregate(results)  # última corrida, para el detalle de métricas
 
@@ -187,6 +203,13 @@ def run_benchmark():
         if REPEATS > 1:
             print(f"\n   Pass count por corrida: {pass_counts} "
                   f"(min {min(pass_counts)}, max {max(pass_counts)})")
+            if api_errors_por_corrida:
+                print(f"\n   {Fore.RED}🚨 LA API DEL LLM FALLÓ DURANTE LA MEDICIÓN{Style.RESET_ALL}")
+                for corrida, n in api_errors_por_corrida:
+                    print(f"      Corrida {corrida}: {n} casos respondieron con el texto de fallback de error.")
+                print(f"   {Fore.RED}El reporte de estabilidad de abajo NO es confiable: los casos que "
+                      f"'fallaron' pueden haber fallado por la API caída, no por inestabilidad real. "
+                      f"Revisá saldo/credenciales del proveedor y volvé a correr.{Style.RESET_ALL}")
             print_flakiness(historial, REPEATS)
 
 
