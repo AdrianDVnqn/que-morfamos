@@ -122,17 +122,24 @@
     "expected_intent": "RECOMMENDATION",
     "expected_mode": "rag",
     "expected_restaurants": [
-      "Parrilla Rancho Grande",
-      "N&S Food Hall",
       "827 Punto de encuentro",
-      "Frosts Frineve Creams",
+      "Rio Juegos + Café",
+      "Heladería Costa Piré",
+      "McDonald's",
       "Un Altra Volta",
-      "Heladería Costa Piré"
+      "Mostaza - Eugenio Perticone 215",
+      "N&S Food Hall",
+      "El Carrito del Parque",
+      "Parrilla Rancho Grande",
+      "Ofelia Café & Resto",
+      "Morelia's",
+      "Frosts Frineve Creams"
     ],
     "expected_zones": [],
     "min_results": 2,
     "judge_eligible": true,
-    "notes": "RE-CURADO (24-ago-2026): se sacaron 'Los Carritos'/'La Rancheria' (no tienen pelotero según sus reseñas). HALLAZGO: '827 Punto de encuentro' tiene pelotero confirmado pero el RAG no lo devolvía — gap de recall real, arreglado 25-ago (ver DEV_LOG). RE-VERIFICADO (25-ago-2026) contra reseñas CRUDAS: se detectó que el resumen_reviews de 4 lugares (Parrillas Gatica, Frosts Frineve Creams, Un Altra Volta, Heladería Costa Piré) alucinaba la palabra 'pelotero' sin respaldo textual — causa raíz encontrada y arreglada en el prompt de generar_resumen_reviews (repo scraper). DECISIÓN DE PRODUCTO (25-ago-2026, discutida con el usuario): distinguir 'pelotero' literal de 'juegos infantiles' genéricos (hamaca, tobogán, calesita) es demasiado estricto — a un padre le interesa que el chico se entretenga, no la pileta de pelotas específicamente. Se ensanchó el concepto en el router (sinónimos: 'juegos infantiles', 'juegos para niños', 'área de juegos'), así que 'Frosts Frineve Creams', 'Un Altra Volta' y 'Heladería Costa Piré' vuelven a expected_restaurants — SÍ tienen reseñas reales confirmando juegos para niños, solo que no usan la palabra 'pelotero'. 'Parrillas Gatica' queda excluido: además de no tener 'pelotero', tampoco tiene NINGUNA mención de juegos/niños/hamaca/tobogán en sus 40 reseñas reales — y es un predio municipal de parrillas públicas (BYO), no un local comercial, dato aportado por el usuario que lo conoce en persona."
+    "notes": "RE-CURADO (24-ago-2026): se sacaron 'Los Carritos'/'La Rancheria' (no tienen pelotero según sus reseñas). HALLAZGO: '827 Punto de encuentro' tiene pelotero confirmado pero el RAG no lo devolvía — gap de recall real, arreglado 25-ago (ver DEV_LOG). RE-VERIFICADO (25-ago-2026) contra reseñas CRUDAS: se detectó que el resumen_reviews de 4 lugares (Parrillas Gatica, Frosts Frineve Creams, Un Altra Volta, Heladería Costa Piré) alucinaba la palabra 'pelotero' sin respaldo textual — causa raíz encontrada y arreglada en el prompt de generar_resumen_reviews (repo scraper). DECISIÓN DE PRODUCTO (25-ago-2026, discutida con el usuario): distinguir 'pelotero' literal de 'juegos infantiles' genéricos (hamaca, tobogán, calesita) es demasiado estricto — a un padre le interesa que el chico se entretenga, no la pileta de pelotas específicamente. Se ensanchó el concepto en el router (sinónimos: 'juegos infantiles', 'juegos para niños', 'área de juegos'), así que 'Frosts Frineve Creams', 'Un Altra Volta' y 'Heladería Costa Piré' vuelven a expected_restaurants — SÍ tienen reseñas reales confirmando juegos para niños, solo que no usan la palabra 'pelotero'. 'Parrillas Gatica' queda excluido: además de no tener 'pelotero', tampoco tiene NINGUNA mención de juegos/niños/hamaca/tobogán en sus 40 reseñas reales — y es un predio municipal de parrillas públicas (BYO), no un local comercial, dato aportado por el usuario que lo conoce en persona. RE-CURADO A FONDO (26-ago-2026) contra RESEÑAS CRUDAS de toda la base, no contra resumen_reviews: busqueda independiente del sistema (SQL sobre la tabla reviews) de todos los lugares con >=2 reseñas distintas mencionando el concepto. La lista anterior salia de leer resumen_reviews v1, que alucinaba caracteristicas, y era ademas MUY incompleta: dejaba afuera lugares con evidencia fuerte y real. Se excluye Cuchi (cerrado hace ~1 año, confirmado por el usuario) y Oh My Veggie - Av. Argentina 368 (0 reseñas mencionan vegano; estaba solo por el resumen alucinado). MARCADO open_ended: hay muchos mas lugares validos que los 5 slots que devuelve el backend, asi que el caso se evalua por PRECISION (los que devuelve, son validos?) y no por recall contra una muestra.",
+    "open_ended": true
   },
   {
     "id": "feature_sintacc",
@@ -245,19 +252,29 @@
     "expected_intent": "RECOMMENDATION",
     "expected_mode": "rag",
     "expected_restaurants": [
-      "Ratas Veganas",
       "Oh My Veggie - Almte. Brown",
-      "Oh My Veggie - Avenida Argentina 368",
-      "BIO ZEN",
-      "Mama's cook",
       "Ohana Tienda y Cafe",
-      "Franz y Peppone - Almte. Brown 434",
-      "Lucciano's Paseo de la Costa · Neuquén"
+      "Cervecería OSS",
+      "Flamas Burger Co",
+      "ÁRBOL Cervecería Artesanal",
+      "Magnolia Restaurante",
+      "El Patio de Franz",
+      "Mama's cook",
+      "OLIVIA Empanadas y Pizzas",
+      "1920. Caffè & Aperitivo",
+      "OLIVER BAR",
+      "Lucciano's Paseo de la Costa · Neuquén",
+      "Reymon Social Club",
+      "BIO ZEN",
+      "Ofelia Café & Resto",
+      "Merlí Helados Artesanales - San Martín 4442",
+      "Miguitas De Pan",
+      "Ratas Veganas"
     ],
     "expected_zones": [],
     "min_results": 2,
     "judge_eligible": true,
-    "notes": "RE-CURADO (24-ago-2026): la lista original (Antü RestoBar, Heladería Grido, Mambo Tango, Pranzo Empanadas, Jimmy 1964) fue aceptada del output del RAG sin verificar — NINGUNO de esos 5 es realmente un lugar con opciones veganas confirmadas en sus reseñas (son genéricos: heladera de cadena, pizzería, empanadería). Reemplazado por 6 lugares verificados con texto completo de resumen_reviews que confirman oferta vegana explícita. NOTA (25-ago-2026): tras el fix del bug de Hybrid Injection, el RAG pasó a devolver 'Cuchí' (categoría 'Vegetarian restaurant', 313 reseñas, resumen confirma 'fuerte identidad vegetariana y vegana') — inicialmente se agregó al dataset, pero el usuario confirmó que el local cerró hace ~1 año. Se excluye del ground truth: el dato de la base está desactualizada (el scraper no revalida cierres de forma periódica), no es un problema del fix. AMPLIADO (25-ago-2026), tras el fix de evidencia del Juez (obtener_evidencia_para_juez ya no manda un prefijo ciego de 700 caracteres): se sumaron 'Franz y Peppone - Almte. Brown 434' (calzones veganos confirmados) y 'Lucciano's Paseo de la Costa · Neuquén' (helados veganos de excelente calidad según reseñas) — lugares de menú mixto con opciones veganas reales, no dedicados 100% vegetarianos, pero igualmente válidos para 'opciones veganas'. Queda como hallazgo aparte: 'Ratas Veganas' (Vegan restaurant, 15 reseñas) y otro candidato por categoría quedan excluidos por el hard filter de total_reviews_google>=30 (main.py, procesar_recomendacion_pesado) — limitación real y preexistente, distinta del bug arreglado. MARCADO open_ended (25-ago-2026): hay muchos mas lugares validos en la base que los 5 que el backend puede devolver (3 exactos + 2 relacionados), asi que esta lista es una MUESTRA de respuestas aceptables, no exhaustiva. Con 8 esperados y 5 slots el recall maximo es 0.62 aunque acierte todo: por eso este caso se evalua por PRECISION (los que devuelve, son validos?) y no por recall contra una muestra arbitraria.",
+    "notes": "RE-CURADO (24-ago-2026): la lista original (Antü RestoBar, Heladería Grido, Mambo Tango, Pranzo Empanadas, Jimmy 1964) fue aceptada del output del RAG sin verificar — NINGUNO de esos 5 es realmente un lugar con opciones veganas confirmadas en sus reseñas (son genéricos: heladera de cadena, pizzería, empanadería). Reemplazado por 6 lugares verificados con texto completo de resumen_reviews que confirman oferta vegana explícita. NOTA (25-ago-2026): tras el fix del bug de Hybrid Injection, el RAG pasó a devolver 'Cuchí' (categoría 'Vegetarian restaurant', 313 reseñas, resumen confirma 'fuerte identidad vegetariana y vegana') — inicialmente se agregó al dataset, pero el usuario confirmó que el local cerró hace ~1 año. Se excluye del ground truth: el dato de la base está desactualizada (el scraper no revalida cierres de forma periódica), no es un problema del fix. AMPLIADO (25-ago-2026), tras el fix de evidencia del Juez (obtener_evidencia_para_juez ya no manda un prefijo ciego de 700 caracteres): se sumaron 'Franz y Peppone - Almte. Brown 434' (calzones veganos confirmados) y 'Lucciano's Paseo de la Costa · Neuquén' (helados veganos de excelente calidad según reseñas) — lugares de menú mixto con opciones veganas reales, no dedicados 100% vegetarianos, pero igualmente válidos para 'opciones veganas'. Queda como hallazgo aparte: 'Ratas Veganas' (Vegan restaurant, 15 reseñas) y otro candidato por categoría quedan excluidos por el hard filter de total_reviews_google>=30 (main.py, procesar_recomendacion_pesado) — limitación real y preexistente, distinta del bug arreglado. MARCADO open_ended (25-ago-2026): hay muchos mas lugares validos en la base que los 5 que el backend puede devolver (3 exactos + 2 relacionados), asi que esta lista es una MUESTRA de respuestas aceptables, no exhaustiva. Con 8 esperados y 5 slots el recall maximo es 0.62 aunque acierte todo: por eso este caso se evalua por PRECISION (los que devuelve, son validos?) y no por recall contra una muestra arbitraria. RE-CURADO A FONDO (26-ago-2026) contra RESEÑAS CRUDAS de toda la base, no contra resumen_reviews: busqueda independiente del sistema (SQL sobre la tabla reviews) de todos los lugares con >=2 reseñas distintas mencionando el concepto. La lista anterior salia de leer resumen_reviews v1, que alucinaba caracteristicas, y era ademas MUY incompleta: dejaba afuera lugares con evidencia fuerte y real. Se excluye Cuchi (cerrado hace ~1 año, confirmado por el usuario) y Oh My Veggie - Av. Argentina 368 (0 reseñas mencionan vegano; estaba solo por el resumen alucinado). MARCADO open_ended: hay muchos mas lugares validos que los 5 slots que devuelve el backend, asi que el caso se evalua por PRECISION (los que devuelve, son validos?) y no por recall contra una muestra.",
     "open_ended": true
   },
   {

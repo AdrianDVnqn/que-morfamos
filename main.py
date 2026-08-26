@@ -124,6 +124,18 @@ def _mencion_positiva(texto, termino, ventana=70):
     for m in re.finditer(re.escape(termino_lower), texto_lower):
         inicio = max(0, m.start() - ventana)
         ventana_texto = texto_lower[inicio:m.start()]
+        # Una negación de OTRA oración no niega a ésta. Sin este corte, en "...platos veganos y
+        # sin gluten. El ambiente es acogedor, con áreas de juegos para niños", el "sin" de "sin
+        # gluten" caía dentro de los 70 caracteres previos a "juegos" y lo daba por negado.
+        corte = max(ventana_texto.rfind("."), ventana_texto.rfind(";"), ventana_texto.rfind("\n"))
+        if corte != -1:
+            ventana_texto = ventana_texto[corte + 1:]
+        # "sin" forma parte de varias features POSITIVAS ("sin gluten", "sin TACC", "sin lactosa"):
+        # en "opciones veganas y sin gluten", buscar "gluten" encontraba ese "sin" en la ventana y
+        # devolvía False, justo al revés de lo que corresponde. Si el término va inmediatamente
+        # precedido por "sin", ese "sin" es parte de la feature, no una negación de ella.
+        if re.search(r"\bsin\s+$", ventana_texto):
+            return True
         if not NEGATION_RE.search(ventana_texto):
             return True
     return False
@@ -336,9 +348,17 @@ async def lifespan(app: FastAPI):
 
             # LAZY ARCHITECTURE v8: Solo cargamos df_lugares (936 filas)
             # Las reviews (155k+) se consultan bajo demanda por restaurante.
-            query_lugares = """
+            # RESUMEN_COLUMN permite evaluar los resúmenes regenerados (columna shadow
+            # `resumen_reviews_v2`) sin promoverlos: se corre el benchmark apuntando ahí y recién
+            # si mejora se promueve. Producción usa el default. Ver DEV_LOG 26-ago-2026.
+            col_resumen = os.getenv("RESUMEN_COLUMN", "resumen_reviews")
+            if col_resumen not in ("resumen_reviews", "resumen_reviews_v2"):
+                raise ValueError(f"RESUMEN_COLUMN inválida: {col_resumen}")
+            logger.info(f"📄 Columna de resúmenes: {col_resumen}")
+            query_lugares = f"""
                 SELECT nombre as restaurante, rating_gral, total_reviews_google, direccion,
-                       latitud, longitud, barrio, zona, categoria, resumen_reviews
+                       latitud, longitud, barrio, zona, categoria,
+                       {col_resumen} as resumen_reviews
                 FROM lugares
             """
             df_lugares = pd.read_sql(query_lugares, db_engine)

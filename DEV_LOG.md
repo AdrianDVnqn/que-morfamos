@@ -364,10 +364,73 @@ Tras quedarse sin saldo DeepSeek, se evaluaron alternativas con pruebas reales d
 - Nuevo modo `AI_PROVIDER=gemini` vía el endpoint compatible con OpenAI de Google (`generativelanguage.googleapis.com/v1beta/openai/`), mismo patrón que DeepSeek — sin SDK nuevo.
 - Los IDs de modelo son configurables por env (`OPENAI_MINI_MODEL`, `OPENAI_SMART_MODEL`, `GEMINI_MODEL`, `DEEPSEEK_MODEL`) para poder comparar proveedores contra el golden dataset sin tocar código.
 
-### 📝 Pendientes para retomar (no son bugs, son tareas abiertas)
-- **Minar `query_logs` para ampliar el golden dataset:** la tabla y el logging ya están activos en producción desde la sesión del 24-ago (ver arriba), pero todavía no se usó para nada — hay que esperar a que se acumulen suficientes queries reales y después revisarlas para sumar casos nuevos (o más realistas) al golden dataset. No hay una fecha ni un umbral definido; es simplemente "volver a esto en unas semanas".
-- **Tab de LangSmith en el dashboard (`que-morfamos-dashboard`):** se evaluó agregar una solapa propia para visualizar las corridas del golden dataset (el dashboard ya tiene el patrón — Next.js + Radix Tabs + d3 — y sería sencillo pegarle a la REST API de LangSmith desde ahí). Se decidió posponerlo: por ahora alcanza con la UI propia de LangSmith (`smith.langchain.com`, proyecto `que-morfamos`, dataset `que-morfamos-golden` → pestaña Experiments), que ya da comparación entre corridas sin construir nada. Retomar esto si en algún momento se quiere todo centralizado en el dashboard del portfolio en vez de saltar a otra pestaña.
-- **Bug preexistente encontrado al investigar `feature_sintacc`:** `exactos = locales_verificados[:3]` (`main.py`, cerca de `procesar_consulta_gen`) toma los primeros 3 aprobados por el Juez en orden de lista, no por relevancia — un lugar popular pero tangencial puede ganarle el lugar a uno más específico si el Juez es permisivo. Confirmado con experimento controlado que **no** es causado por los fixes de esta sesión (existía antes, committeado). Candidato para una futura sesión: ordenar `locales_verificados` por alguna señal de calidad/especificidad antes de cortar a 3.
+### 🧪 Regeneración de resúmenes: 4 iteraciones, shadow write, y la decisión de NO promover
+Objetivo: eliminar de la base los resúmenes con características inventadas (y, en el camino, los truncados). Se hizo con **shadow write** (blue-green para datos derivados): columnas y colección de vectores paralelas, sin tocar nunca lo que sirve producción. **Resultado: v4 tiene datos objetivamente mejores pero peor retrieval, así que NO se promovió.**
+
+**Infraestructura construida (`que-morfamos-scraper`):**
+- `deepseek_utils.py` → **`llm_utils.py`** (renombrado con `git mv`; ya no era específico de DeepSeek). Multi-proveedor vía `SUMMARY_PROVIDER` (deepseek|openai|gemini) y `SUMMARY_MODEL`. **Esto además desbloqueó el job semanal del scraper, que estaba muerto**: seguía cableado a DeepSeek, sin saldo desde el 26-ago. Verificado que ningún workflow de GitHub Actions referenciaba el módulo (invocan scripts, no el módulo) antes de renombrar.
+- `regenerar_resumenes.py` (nuevo): regeneración idempotente y resumible con shadow write a `resumen_reviews_v2` + `resumen_prompt_version` + `resumen_generado_at`, embeddings a la colección `reviews_embeddings_v2`, concurrencia 6, `--dry-run` con estimación de costo.
+- `regenerar_muestra.py` (nuevo): compara viejo vs nuevo sobre una muestra e incluye un **chequeo automático de groundedness** (¿alguna reseña cruda respalda cada característica que el resumen afirma?).
+- `main.py` (backend): `RESUMEN_COLUMN` para poder evaluar la columna shadow con el benchmark sin promover nada.
+
+**Las 4 iteraciones — cada fix destapó el siguiente:**
+1. **v2 — prompt sin alucinaciones.** El prompt viejo pedía literalmente incluir "términos de búsqueda probables (ej: … 'pelotero')". Corregido → afirmaciones sin respaldo **33 → 0**, truncados **127 → 0**, sin 3er párrafo **51 → 0**. Pero el benchmark cayó a **19/22**.
+2. **Diagnóstico:** el problema NO era el prompt sino el **muestreo**. `muestreo_estrategico` toma 50 reseñas (recientes/largas/extremas/random) y las 2 de 379 que mencionan "pelotero" en Parrilla Rancho Grande quedaban afuera **siempre**: el LLM nunca veía la evidencia. **La alucinación venía enmascarando un bug de muestreo preexistente.**
+3. **v3 — muestreo dirigido por característica**, con **cuota por grupo** (`FEATURE_GROUPS`, 3 reservados por característica). La cuota por grupo la planteó el usuario: sin ella, un lugar con 30 reseñas veganas llenaba los lugares reservados y las 2 de pelotero se perdían igual. Features detectables 11/18 → 14/18.
+4. **v4 — prompt simétrico + `temperature=0`.** v3 había quedado con sesgo negativo: leía *"pedimos un desayuno sin TACC y tuvimos variedad"* y escribía *"escasez de opciones sin gluten"*. Se agregaron reglas explícitas de "ni inventar ni negar". Y se bajó `temperature` de 0.3 a 0: con 0.3 dos corridas sobre las mismas reseñas daban resúmenes distintos, lo que hacía imposible atribuir una mejora al prompt en vez de al azar. Features detectables **17/18** (el 18º lo omite **correctamente**: no tiene evidencia).
+
+**Bugs colaterales encontrados y arreglados en `_mencion_positiva` (`main.py`):**
+- *"opciones veganas y **sin** gluten"* daba False para "gluten": el "sin" de una feature POSITIVA se leía como negación. Fix: si el término va precedido inmediatamente por "sin", ese "sin" es parte de la feature.
+- Una negación de **otra oración** contaminaba la ventana de 70 caracteres: en *"…sin gluten. El ambiente es acogedor, con áreas de juegos"*, el "sin" negaba a "juegos". Fix: la ventana se corta en el límite de oración (`.`/`;`/salto de línea).
+
+**Re-curación del ground truth (26-ago), esta vez contra RESEÑAS CRUDAS de toda la base:** búsqueda SQL independiente del sistema sobre `reviews`, criterio ≥2 reseñas distintas mencionando el concepto. `keyword_vegano` pasó de 8 a 18 lugares y `feature_pelotero` de 6 a 12 — la lista vieja salía de leer `resumen_reviews` v1 (que alucinaba) y era además **muy incompleta**: dejaba afuera lugares con evidencia fuerte (Cervecería OSS con 16 menciones veganas, Rio Juegos + Café con 13 de juegos). Se excluyeron *Cuchí* (cerrado) y *Oh My Veggie - Av. Argentina 368* (0 reseñas lo mencionan; estaba sólo por el resumen alucinado). Ambos casos quedaron `open_ended`.
+
+**La decisión, con la medición hecha en igualdad de condiciones** (mismo ground truth re-curado, mismo proveedor, ambas versiones):
+
+| | v1 (producción) | v4 |
+|---|---|---|
+| Casos | **22/22** | 18/22 |
+| Recall@5 | **0.83** | 0.73 |
+| Precision@5 | **0.84** | 0.68 |
+| MRR | **0.97** | 0.82 |
+
+- **Se descartaron dos hipótesis propias por evidencia en contra:** (a) que el problema fuera el prompt (era el muestreo) y (b) que el benchmark castigara injustamente a v4 por encontrar lugares válidos no listados — al ampliar el ground truth con evidencia real, v1 **igual** gana en todas las métricas, y su precisión incluso *sube* (0.80 → 0.84), o sea ya venía devolviendo lugares válidos que el ground truth viejo no le acreditaba.
+- **Mecanismo de la diferencia:** v1 devuelve los lugares con evidencia **más fuerte** (Ohana con 23 menciones veganas, BIO ZEN vegetariano dedicado) con precisión 1.00 en los tres casos de feature; v4 devuelve lugares marginales (una pizzería con una opción vegana, un bar con 3 menciones). Para el usuario que busca "opciones veganas" eso es peor, aunque v4 sea más honesto.
+- **Hipótesis para una v5:** los resúmenes v1 son más largos (~2000 vs ~1500 chars) y enfatizan más las características, produciendo embeddings más ricos. Lo que le falta a v4 no es menos invención sino **más riqueza** — subir el detalle exigido en el párrafo 3, no bajarlo.
+
+**Estado:** v4 queda en las columnas y colección shadow, sin promover. Producción sigue en `resumen_reviews` / `reviews_embeddings`, verificada en 22/22. Costo total de las 4 regeneraciones: ~$1.32.
+
+### 📝 ESTADO PENDIENTE CONSOLIDADO (al cierre del 26-ago-2026)
+
+**Estado del sistema:** el motor de búsqueda está sano — `22/22 | Recall@5=0.86 | Precision@5=0.80 | MRR=0.97 | Intent Accuracy=1.00`, verificado sobre **gpt-4o-mini**, la configuración que efectivamente sirve producción (`AI_PROVIDER=openai-mini` en Fly.io). Producción verificada en vivo devolviendo resultados correctos. Lo que queda son mayormente problemas de **calidad de datos**, que ningún fix de código puede compensar.
+
+#### 🔴 Alta prioridad
+
+1. **Intentar una v5 de resúmenes que gane en retrieval, no sólo en honestidad.** Producción sigue con los resúmenes v1, que tienen **33 afirmaciones inventadas, 127 truncados a mitad de oración y 51 sin el párrafo de características** — pero v4 (que corrige todo eso) mide peor en retrieval y por eso no se promovió (ver la sección de las 4 iteraciones, arriba). Toda la infraestructura ya está construida y funcionando: `regenerar_resumenes.py` con shadow write, versionado por `resumen_prompt_version`, muestreo por característica, chequeo de groundedness, y `RESUMEN_COLUMN` en el backend para evaluar sin promover. Bumpear `PROMPT_VERSION` a v5 y regenerar cuesta ~$0.33 y ~13 min.
+   - **Hipótesis a probar:** el problema de v4 no es que invente menos, es que dice **menos**. Los resúmenes v1 miden ~2000 chars contra ~1500 de v4 y enfatizan más las características, lo que da embeddings más ricos. Probar un prompt que exija **más detalle** en el párrafo 3 (enumerar todas las características que las reseñas confirmen, con el matiz de cada una) manteniendo la prohibición de inventar.
+   - **Segunda vía, independiente:** v1 gana porque rankea mejor por *fuerza* de evidencia. Se podría dar esa señal explícitamente en vez de esperar que el embedding la infiera — ej. guardar por lugar cuántas reseñas respaldan cada característica (un JSONB `features_evidencia`) y usarlo en el ranking. Eso desacoplaría "qué features tiene" de "qué tan bien lo redactó el LLM".
+   - **Criterio de aceptación:** correr el benchmark con `RESUMEN_COLUMN=resumen_reviews_v2` y `COLLECTION_NAME=reviews_embeddings_v2` y **superar** la línea de v1 (`22/22 | Recall 0.83 | Precision 0.84 | MRR 0.97`). Si no la supera, no promover.
+
+2. **Sin revalidación de locales cerrados.** "Cuchí" cerró hace ~1 año y sigue en la base; el bot puede recomendarlo. El scraper sólo detecta "permanently closed" en el scrapeo inicial (`enrichment-validator.py`), nunca revalida lo ya cargado.
+
+#### 🟡 Media prioridad (bugs de código, acotados)
+
+3. **`exactos = locales_verificados[:3]`** (`main.py`, en `procesar_consulta_gen`) toma los 3 primeros aprobados por el Juez **en orden de lista, no por relevancia**. Se mitigó indirectamente mejorando el orden de `grupo_alta`, pero la causa sigue: si el Juez es permisivo, un lugar popular pero tangencial le gana el lugar a uno más específico. Confirmado con experimento controlado que es **preexistente**, no introducido por los fixes de esta sesión. Fix candidato: ordenar `locales_verificados` por alguna señal de calidad/especificidad antes de cortar a 3.
+
+4. **Extracción de keywords en queries de queja.** Para `"la milanesa que comí ayer estaba una mierda, recomendame otra parrilla buena"` el router extrae "milanesa" como keyword pese a que el usuario se queja de eso y pide otra cosa. Quedó tapado por el fix de categorías, nunca resuelto de fondo.
+
+#### 🔵 Baja prioridad / housekeeping
+
+5. **`DEEPSEEK_MODEL` por defecto apunta a un ID viejo:** `deepseek-chat` ya no figura en el catálogo de DeepSeek (ahora `deepseek-v4-flash`/`v4-pro`). Sólo importa si se vuelve a ese proveedor; el default está en `main.py` y es overrideable por env.
+
+6. **LangSmith desactualizado.** No se corrió `run_langsmith_eval.py` desde los cambios del 25/26-ago, así que el historial trackeado no refleja el 22/22 actual ni el cambio de proveedor. Correrlo deja la comparación "antes/después" registrada.
+
+7. **Minar `query_logs` para ampliar el golden dataset.** La tabla y el logging están activos en producción desde el 24-ago pero no se usaron todavía. Esperar a que se acumulen queries reales y revisarlas para sumar casos nuevos (o más realistas). Sin fecha ni umbral definido: "volver en unas semanas".
+
+8. **Tab de LangSmith en el dashboard (`que-morfamos-dashboard`).** Evaluado y pospuesto: por ahora alcanza con la UI propia de LangSmith (`smith.langchain.com`, proyecto `que-morfamos`, dataset `que-morfamos-golden` → Experiments). Retomar sólo si se quiere todo centralizado en el portfolio.
+
+#### ⚠️ Nota operativa sobre costos
+Producción corre sobre OpenAI con saldo acotado (~$4 al 26-ago). `AI_PROVIDER=openai-mini` (gpt-4o-mini para ambos LLMs) rinde ~1200 consultas; `openai` (mini + gpt-4o) rinde ~70. No cambiar a `openai` sin recargar saldo. Ver la comparación de proveedores más arriba para las alternativas evaluadas y por qué se descartaron.
 
 ---
 *Bitácora actualizada por Antigravity Agent (v7.1).*
