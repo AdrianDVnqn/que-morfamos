@@ -19,28 +19,30 @@ PLACEHOLDER = "<TODO: curate>"
 
 
 def recall_at_k(expected: list, actual: list, k: int = 5) -> float:
-    """|expected ∩ actual[:k]| / |expected|. Vacuamente 1.0 si no hay nada esperado."""
+    """|expected ∩ actual[:k]| / |expected|. None si no hay ground truth que medir."""
     if not expected:
-        return 1.0
+        return None
     top_k = set(actual[:k])
     hits = sum(1 for name in expected if name in top_k)
     return hits / len(expected)
 
 
 def precision_at_k(expected: list, actual: list, k: int = 5) -> float:
-    """|expected ∩ actual[:k]| / |actual[:k]|. Vacuamente 1.0 si no se esperaba ni se devolvió nada."""
+    """|expected ∩ actual[:k]| / |actual[:k]|. None si no hay ground truth que medir."""
+    if not expected:
+        return None
     top_k = actual[:k]
     if not top_k:
-        return 1.0 if not expected else 0.0
+        return 0.0
     expected_set = set(expected)
     hits = sum(1 for name in top_k if name in expected_set)
     return hits / len(top_k)
 
 
 def mrr(expected: list, actual: list) -> float:
-    """1/rank (1-indexado) del primer item esperado encontrado en actual. 0.0 si ninguno aparece."""
+    """1/rank (1-indexado) del primer item esperado encontrado en actual. None si no hay ground truth."""
     if not expected:
-        return 1.0
+        return None
     expected_set = set(expected)
     for i, name in enumerate(actual, start=1):
         if name in expected_set:
@@ -74,15 +76,21 @@ def zone_match(expected_zones: list, cards: list) -> tuple:
     return passed, matched, total
 
 
-def evaluate_case(case: dict, actual_mode: str, actual_names: list, k: int = 5) -> dict:
+def evaluate_case(case: dict, actual_mode: str, actual_names: list, k: int = 5, cards: list = None) -> dict:
     """
     Evalúa un único caso del golden dataset contra la respuesta real del backend.
     actual_names: lista de nombres de restaurantes devueltos (ya extraídos de restaurant_cards).
+    cards: los RestaurantCard completos, necesarios para chequear zona.
     """
     expected_restaurants = case.get("expected_restaurants", [])
     skipped = PLACEHOLDER in expected_restaurants
+    expected_empty = case.get("expected_empty", False)
 
     expected_mode = case.get("expected_mode") or INTENT_TO_MODE.get(case.get("expected_intent", ""), "")
+
+    # Un caso mide retrieval solo si tiene ground truth que comparar. Los demás (stats, block,
+    # followup) miden ruteo: mezclarlos en el promedio de recall regala 1.0 y infla el titular.
+    mide_retrieval = bool(expected_restaurants) or expected_empty
 
     result = {
         "id": case["id"],
@@ -93,6 +101,9 @@ def evaluate_case(case: dict, actual_mode: str, actual_names: list, k: int = 5) 
         "actual_mode": actual_mode,
         "intent_ok": intent_match(expected_mode, actual_mode),
         "min_results_ok": len(actual_names) >= case.get("min_results", 1),
+        "mide_retrieval": mide_retrieval,
+        "expected_empty": expected_empty,
+        "open_ended": bool(case.get("open_ended")),
     }
 
     if skipped:
@@ -103,57 +114,93 @@ def evaluate_case(case: dict, actual_mode: str, actual_names: list, k: int = 5) 
     precision = precision_at_k(expected_restaurants, actual_names, k)
     score_mrr = mrr(expected_restaurants, actual_names)
 
-    passed = result["intent_ok"] and (recall >= 0.5 or not expected_restaurants)
+    if expected_empty:
+        # Caso que debe NO devolver resultados. Antes esto era un pass automático (la condición
+        # `not expected_restaurants` cortocircuitaba `passed`), así que el único test de "no
+        # encontré nada" era incapaz de fallar aunque el RAG devolviera 5 lugares reales.
+        retrieval_ok = len(actual_names) == 0
+    elif expected_restaurants and case.get("open_ended"):
+        # Query abierta: hay muchos más lugares válidos que los que el sistema puede devolver
+        # (el backend corta en 5 cards: 3 exactos + 2 relacionados), así que expected_restaurants
+        # es una MUESTRA de respuestas aceptables, no la lista exhaustiva. Exigir recall contra
+        # una muestra arbitraria castiga al sistema por una decisión de curación: con 8 esperados
+        # y 5 slots, el recall máximo es 0.62 aunque acierte los 5. Acá lo que importa es la
+        # precisión: ¿los que devolvió salen del conjunto aceptable?
+        retrieval_ok = precision >= 0.6 and result["min_results_ok"]
+    elif expected_restaurants:
+        retrieval_ok = recall >= 0.5 and precision >= 0.4 and result["min_results_ok"]
+    else:
+        retrieval_ok = True  # caso de ruteo puro: no hay nada que exigirle al retrieval
+
+    # Chequeo de zona (antes zone_match estaba definida pero nunca se llamaba desde ningún lado,
+    # así que expected_zones no se evaluaba: la detección de zona quedaba sin testear).
+    zona_ok, zona_matched, zona_total = zone_match(case.get("expected_zones", []), cards or [])
+
+    passed = result["intent_ok"] and retrieval_ok and zona_ok
 
     result.update({
         "recall": recall,
         "precision": precision,
         "mrr": score_mrr,
+        "retrieval_ok": retrieval_ok,
+        "zona_ok": zona_ok,
+        "zona_matched": zona_matched,
+        "zona_total": zona_total,
         "passed": passed,
     })
     return result
 
 
+def _promedio(valores):
+    """Promedio ignorando None (casos sin ground truth). None si no queda nada que promediar."""
+    reales = [v for v in valores if v is not None]
+    return sum(reales) / len(reales) if reales else None
+
+
 def aggregate(results: list) -> dict:
-    """Resumen global + breakdown por expected_intent, ignorando casos SKIPPED."""
+    """Resumen separado en dos scoreboards + breakdown por expected_intent, ignorando SKIPPED.
+
+    Las métricas de retrieval se promedian SOLO sobre los casos que tienen ground truth real.
+    Antes se promediaban sobre los 22 casos, y los que no tienen nada esperado (stats, block,
+    followup) aportaban un 1.0 vacuo que inflaba el titular ~40%.
+    """
     scored = [r for r in results if not r["skipped"]]
     n_cases = len(scored)
     n_skipped = len(results) - n_cases
 
     if n_cases == 0:
         return {
-            "n_cases": 0, "n_skipped": n_skipped,
-            "avg_recall": 0.0, "avg_precision": 0.0, "avg_mrr": 0.0,
+            "n_cases": 0, "n_skipped": n_skipped, "n_retrieval": 0,
+            "avg_recall": None, "avg_precision": None, "avg_mrr": None,
             "intent_accuracy": 0.0, "min_results_pass_rate": 0.0,
             "n_passed": 0, "by_type": {},
         }
 
-    avg_recall = sum(r["recall"] for r in scored) / n_cases
-    avg_precision = sum(r["precision"] for r in scored) / n_cases
-    avg_mrr = sum(r["mrr"] for r in scored) / n_cases
+    retrieval = [r for r in scored if r.get("mide_retrieval")]
+
     intent_accuracy = sum(1 for r in scored if r["intent_ok"]) / n_cases
     min_results_pass_rate = sum(1 for r in scored if r["min_results_ok"]) / n_cases
     n_passed = sum(1 for r in scored if r["passed"])
 
     by_type = {}
-    types = {r["expected_intent"] for r in scored}
-    for t in types:
+    for t in {r["expected_intent"] for r in scored}:
         group = [r for r in scored if r["expected_intent"] == t]
-        n = len(group)
         by_type[t] = {
-            "n_cases": n,
-            "avg_recall": sum(r["recall"] for r in group) / n,
-            "avg_precision": sum(r["precision"] for r in group) / n,
-            "avg_mrr": sum(r["mrr"] for r in group) / n,
-            "intent_accuracy": sum(1 for r in group if r["intent_ok"]) / n,
+            "n_cases": len(group),
+            "n_retrieval": sum(1 for r in group if r.get("mide_retrieval")),
+            "avg_recall": _promedio([r["recall"] for r in group]),
+            "avg_precision": _promedio([r["precision"] for r in group]),
+            "avg_mrr": _promedio([r["mrr"] for r in group]),
+            "intent_accuracy": sum(1 for r in group if r["intent_ok"]) / len(group),
         }
 
     return {
         "n_cases": n_cases,
         "n_skipped": n_skipped,
-        "avg_recall": avg_recall,
-        "avg_precision": avg_precision,
-        "avg_mrr": avg_mrr,
+        "n_retrieval": len(retrieval),
+        "avg_recall": _promedio([r["recall"] for r in scored]),
+        "avg_precision": _promedio([r["precision"] for r in scored]),
+        "avg_mrr": _promedio([r["mrr"] for r in scored]),
         "intent_accuracy": intent_accuracy,
         "min_results_pass_rate": min_results_pass_rate,
         "n_passed": n_passed,
