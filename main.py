@@ -73,6 +73,44 @@ ZONAS_NO_FILTRABLES = {
     "neuquen", "neuquen capital", "capital", "ciudad", "ciudad de neuquen", "nqn",
 }
 
+# Sinónimos curados para los conceptos que más pesan en el ranking. El router LLM también devuelve
+# sinónimos, pero eso resultó depender del modelo: DeepSeek devolvía listas ricas
+# (["sin gluten","apto celíaco","libre de gluten"]) y gpt-4o-mini devuelve SIEMPRE `[]`. Como el
+# desempate por fuerza de evidencia en `relevancia()` se calcula sobre keywords ∪ sinónimos, con la
+# lista vacía todos los candidatos empatan y el orden vuelve a caer en popularidad — reapareciendo
+# el bug de "sin tacc" que ya habíamos arreglado. Este mapa hace el ranking independiente del LLM.
+# Las claves se comparan normalizadas (sin acentos, minúsculas) y por prefijo, para cubrir plurales
+# y género ("veganas"/"veganos" -> "vegano").
+SINONIMOS_CURADOS = {
+    "sin tacc": ["sin gluten", "libre de gluten", "celiaco", "celiaca", "apto celiaco", "sin harina"],
+    "vegano": ["vegana", "vegetariano", "vegetariana", "plant based", "sin ingredientes de origen animal"],
+    "vegetariano": ["vegano", "vegetariana", "sin carne"],
+    "pelotero": ["juegos infantiles", "juegos para ninos", "area de juegos", "juegos para chicos",
+                 "zona de juegos", "calesita", "tobogan", "hamaca"],
+    "celiaco": ["sin tacc", "sin gluten", "libre de gluten"],
+}
+
+
+def expandir_sinonimos(keywords, synonyms):
+    """Suma los sinónimos curados de SINONIMOS_CURADOS a los que devolvió el LLM.
+
+    Devuelve la lista de sinónimos ampliada, sin duplicados y preservando los del LLM.
+    """
+    resultado = list(synonyms or [])
+    vistos = {_normalizar_busqueda(s) for s in resultado}
+    for kw in keywords or []:
+        kw_norm = _normalizar_busqueda(kw)
+        for concepto, extras in SINONIMOS_CURADOS.items():
+            # Prefijo en cualquier dirección: cubre "veganas"->"vegano" y "vegano"->"veganas".
+            if kw_norm.startswith(concepto[:5]) or concepto.startswith(kw_norm[:5]):
+                # Se suma el concepto canónico además de sus sinónimos: si el usuario escribió
+                # "veganas", esa forma no matchea el "vegano" que aparece en los resúmenes.
+                for e in [concepto] + extras:
+                    if _normalizar_busqueda(e) not in vistos:
+                        vistos.add(_normalizar_busqueda(e))
+                        resultado.append(e)
+    return resultado
+
 
 def _mencion_positiva(texto, termino, ventana=70):
     """True si `termino` aparece en `texto` sin una negación cercana hacia atrás
@@ -354,19 +392,35 @@ async def lifespan(app: FastAPI):
 
         logger.info(f"🤖 Configurando LLMs en modo: {provider_mode.upper()}")
 
+        # Los modelos son configurables por env para poder comparar proveedores contra el golden
+        # dataset sin tocar código (ver DEV_LOG, sesión 25/26-ago-2026).
         openai_mini = ChatOpenAI(
-            model="gpt-4o-mini", temperature=0, api_key=openai_key, max_tokens=1024
+            model=os.getenv("OPENAI_MINI_MODEL", "gpt-4o-mini"),
+            temperature=0, api_key=openai_key, max_tokens=1024,
         )
         openai_smart = ChatOpenAI(
-            model="gpt-4o", temperature=0, api_key=openai_key, max_tokens=1024
+            model=os.getenv("OPENAI_SMART_MODEL", "gpt-4o"),
+            temperature=0, api_key=openai_key, max_tokens=1024,
         )
 
         ds_instance = None
         if deepseek_key:
             ds_instance = ChatOpenAI(
-                model="deepseek-chat",
+                model=os.getenv("DEEPSEEK_MODEL", "deepseek-chat"),
                 openai_api_key=deepseek_key,
                 openai_api_base="https://api.deepseek.com",
+                temperature=0,
+                max_tokens=1024,
+            )
+
+        # Gemini vía su endpoint compatible con OpenAI: mismo patrón que DeepSeek, sin SDK nuevo.
+        gemini_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
+        gemini_instance = None
+        if gemini_key:
+            gemini_instance = ChatOpenAI(
+                model=os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite"),
+                openai_api_key=gemini_key,
+                openai_api_base="https://generativelanguage.googleapis.com/v1beta/openai/",
                 temperature=0,
                 max_tokens=1024,
             )
@@ -385,6 +439,11 @@ async def lifespan(app: FastAPI):
             # más caro: con saldo acotado este modo rinde ~1200 consultas donde "openai" rinde ~70.
             llm_mini = openai_mini
             llm_smart = openai_mini
+        elif provider_mode == "gemini":
+            if not gemini_instance:
+                raise ValueError("Falta GOOGLE_API_KEY (o GEMINI_API_KEY)")
+            llm_mini = gemini_instance
+            llm_smart = gemini_instance
         else:  # hybrid
             llm_mini = openai_mini
             llm_smart = ds_instance if ds_instance else openai_smart
@@ -1455,8 +1514,8 @@ async def analizar_query_semantica(query, llm, last_entity=None):
         if safe in q_lower:
             is_safe_bypass = True
 
-    # v92: "pelotero" ahora suma sinónimos amplios de juegos infantiles (ver regla 4) — invalida cache vieja
-    cache_key = f"analysis_v92_{q_lower.strip()}"
+    # v93: ejemplo de nombre propio en minúscula en la REGLA DE ORO — invalida cache vieja
+    cache_key = f"analysis_v93_{q_lower.strip()}"
     if last_entity:
         cache_key += f"_{last_entity.replace(' ', '_')}"
 
@@ -1483,6 +1542,9 @@ async def analizar_query_semantica(query, llm, last_entity=None):
        - Si el usuario menciona un NOMBRE PROPIO de un local -> Es SPECIFIC.
        - "pasteleria en el rio" -> RECOMMENDATION (Busca el producto, no un local llamado 'Pasteleria').
        - "Que onda Pasteleria Najuian?" -> SPECIFIC.
+       - El nombre del local puede venir en minúscula, con artículo y sin signos: "que onda el
+         growler" -> SPECIFIC (target_name: "Growler"). No lo trates como RECOMMENDATION sólo
+         porque no está capitalizado.
     
     3. KEYWORDS MÚLTIPLES: Si la query combina una categoría/producto CON una característica o
        amenity DISTINTA (ej: "parrilla con pelotero", "pizzeria sin tacc", "bar con juegos para
@@ -2578,7 +2640,9 @@ async def procesar_consulta_gen(
 
     # Extraer datos del análisis para los caminos posteriores
     keywords = analisis.get("keywords", [])
-    synonyms = analisis.get("synonyms", [])
+    # Los sinónimos del LLM varían mucho según el proveedor (gpt-4o-mini devuelve [] siempre),
+    # así que se completan con los curados: el ranking no debe depender del modelo.
+    synonyms = expandir_sinonimos(keywords, analisis.get("synonyms", []))
     zona_detectada = analisis.get("donde")
     # "pizzerías de Neuquén" no pide una zona: pide la ciudad entera, que es todo el catálogo.
     # Tratarlo como zona filtraba a cero y (desde el fix de zona inexistente) devolvía vacío.

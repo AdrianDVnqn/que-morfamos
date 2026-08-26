@@ -332,6 +332,38 @@ Los 3 casos que el harness corregido dejó al descubierto resultaron ser **5 bug
 - **Defecto propio del harness (arreglado):** `main.py` atrapa los errores de LLM y responde HTTP 200 con un texto de fallback, así que una API caída se veía como "todos los casos fallaron a la vez" y el modo estabilidad lo reportaba como ruido. Ahora `run_single_case` marca `api_error` cuando la respuesta empieza con el texto de fallback, y el reporte avisa en rojo que la medición no es confiable en vez de inventar un piso de ruido.
 - **Pendiente de re-verificar:** el 22/22 está confirmado por una sola corrida limpia. Volver a correr `BENCHMARK_REPEATS=3` cuando haya saldo, para confirmar estabilidad.
 
+### 💸 Cambio de proveedor LLM y comparación de alternativas (26-ago-2026)
+Tras quedarse sin saldo DeepSeek, se evaluaron alternativas con pruebas reales de API (no de memoria: varios de estos modelos son posteriores al cutoff del asistente). Estimación de costo usada: **~10k tokens de input + ~3k de output por consulta** (el pipeline hace ~8 llamadas LLM: router, Juez, generación de texto y una por card).
+
+| Candidato | $/1M in–out | $/consulta | Veredicto |
+|---|---|---|---|
+| **gpt-4o-mini** | 0.15 / 0.60 | **$0.0033** | ✅ Elegido |
+| gpt-5-nano | 0.05 / 0.40 | $0.0017 nominal → **~$0.0125 real** | ❌ Ver abajo |
+| gpt-5.6-luna | 0.20 / 1.20 | $0.0056 | ❌ 1.7x más caro; parte keywords mal |
+| gpt-5.6-terra | 2.00 / 12.00 | $0.056 | ❌ 17x más caro |
+| gemini-3.5-flash-lite | 0.30 / 2.50 | $0.0105 | ❌ 3x más caro (free tier inusable) |
+| deepseek-v4-flash | 0.22 / 0.66 | $0.0042 | ❌ Ya no es la opción barata |
+
+**Hallazgos que sólo aparecieron probando la API de verdad:**
+- **gpt-5-nano es un modelo de razonamiento, y eso invalida su precio por token.** Para una tarea trivial de routing gastó **1408 tokens de razonamiento** (facturados como output) en modo default, 448 en `low` y 0 en `minimal`. Sin `reasoning_effort=minimal` sale ~4x más caro que gpt-4o-mini, no la mitad. La estimación inicial basada sólo en precio por token estaba mal.
+- **gpt-5-nano confunde "pelotero" con béisbol**: extrajo `["beisbolista","lanzador","pitcher"]` — justo la query que costó media sesión arreglar.
+- **Toda la familia gpt-5 rechaza `temperature=0`** (sólo acepta el default 1) y exige `max_completion_tokens` en vez de `max_tokens`. LangChain traduce el parámetro solo, pero el no-determinismo forzado choca con un pipeline que depende de JSON estricto — y con el benchmark estable que se acababa de construir.
+- **gpt-5.6-luna parte mal las keywords**: devolvió `["parrilla con pelotero"]` como un único concepto en vez de dos. Eso degenera `keywords_core` a 1 y anula el orden en cascada que hace aparecer a "827 Punto de Encuentro". (Salvedad: se probó con un prompt simplificado; el prompt real de `main.py` tiene la regla explícita y podría corregirlo.)
+- **El "80% lower cost" de gpt-5.6-luna es relativo a Sol/Terra**, no barato en términos absolutos: sigue siendo 1.7x gpt-4o-mini.
+- **Gemini: excelente calidad, free tier inusable.** El router devolvió exactamente `["parrilla","pelotero"]` con sinónimos correctos y cero alucinación, y el texto generado tenía muy buen tono rioplatense. Pero el free tier throttlea fuerte: llamadas triviales ("di OK", 20 tokens) dieron timeout a los 25s dos veces seguidas y luego 15.2s de latencia; una consulta completa del pipeline tardó **más de 180 segundos**. Inviable para un chat. Y `gemini-2.5-flash-lite` (el barato, $0.10/$0.40) **ya no está disponible para cuentas nuevas** — Google redirige a `3.5-flash-lite`, 3x más caro que gpt-4o-mini.
+- **DeepSeek dejó de ser la opción barata** y `deepseek-chat` ya no figura en su catálogo (ahora `deepseek-v4-flash`/`v4-pro`), así que el `model="deepseek-chat"` del código apunta a un ID viejo.
+
+**🐛 Bug grave que sólo apareció al correr el benchmark en el proveedor nuevo:** con gpt-4o-mini el resultado cayó a **19/22** (Intent Accuracy 0.95). Causa raíz única para los tres fallos: **el router de gpt-4o-mini devuelve `synonyms: []` siempre**, mientras DeepSeek devolvía listas ricas (`['sin gluten','apto celíaco','libre de gluten']`). Como el desempate por fuerza de evidencia en `relevancia()` se calcula sobre keywords ∪ sinónimos, con la lista vacía todos los candidatos empatan y el orden vuelve a caer en popularidad — **reapareciendo exactamente el bug de `feature_sintacc` que se había arreglado horas antes**, con los mismos lugares equivocados (Antares, Heladería Costa Piré…). El fix del ranking estaba acoplado a una peculiaridad de DeepSeek sin que nadie lo notara.
+- **Fix: `SINONIMOS_CURADOS` + `expandir_sinonimos()`** — mapa estático para los conceptos que más pesan (sin tacc, vegano, vegetariano, pelotero, celíaco), mismo patrón que el `KEYWORD_TO_CATEGORIES` que ya existía. El ranking deja de depender del capricho del LLM. Matchea por prefijo para cubrir plurales/género y **suma el concepto canónico además de sus sinónimos**, porque la forma que escribe el usuario ("veganas") no matchea el texto del corpus ("vegano").
+- **Fix del router:** `"que onda el growler"` se ruteaba a `rag` en vez de `resumen`. El prompt sólo tenía ejemplos capitalizados y con signo (`"Que onda Atila?"`), así que gpt-4o-mini no leía `"el growler"` en minúscula como nombre propio. Se agregó ese caso explícito a la REGLA DE ORO (cache key a `v93`).
+- **Resultado tras los fixes: `22/22 | Recall@5=0.86 | Precision@5=0.80 | MRR=0.97 | Intent Accuracy=1.00`** sobre gpt-4o-mini — paridad con DeepSeek (0.87/0.80/0.93) y mejor MRR.
+- **Lección:** el golden dataset se midió siempre sobre un proveedor; cambiar de LLM puede romper fixes que parecían generales. Vale re-correr el benchmark ante cualquier cambio de proveedor o de modelo, no sólo ante cambios de código.
+
+**Cambios de código:**
+- Nuevo modo `AI_PROVIDER=openai-mini` (gpt-4o-mini para ambos LLMs): con saldo acotado rinde ~1200 consultas donde `openai` (mini + gpt-4o) rinde ~70.
+- Nuevo modo `AI_PROVIDER=gemini` vía el endpoint compatible con OpenAI de Google (`generativelanguage.googleapis.com/v1beta/openai/`), mismo patrón que DeepSeek — sin SDK nuevo.
+- Los IDs de modelo son configurables por env (`OPENAI_MINI_MODEL`, `OPENAI_SMART_MODEL`, `GEMINI_MODEL`, `DEEPSEEK_MODEL`) para poder comparar proveedores contra el golden dataset sin tocar código.
+
 ### 📝 Pendientes para retomar (no son bugs, son tareas abiertas)
 - **Minar `query_logs` para ampliar el golden dataset:** la tabla y el logging ya están activos en producción desde la sesión del 24-ago (ver arriba), pero todavía no se usó para nada — hay que esperar a que se acumulen suficientes queries reales y después revisarlas para sumar casos nuevos (o más realistas) al golden dataset. No hay una fecha ni un umbral definido; es simplemente "volver a esto en unas semanas".
 - **Tab de LangSmith en el dashboard (`que-morfamos-dashboard`):** se evaluó agregar una solapa propia para visualizar las corridas del golden dataset (el dashboard ya tiene el patrón — Next.js + Radix Tabs + d3 — y sería sencillo pegarle a la REST API de LangSmith desde ahí). Se decidió posponerlo: por ahora alcanza con la UI propia de LangSmith (`smith.langchain.com`, proyecto `que-morfamos`, dataset `que-morfamos-golden` → pestaña Experiments), que ya da comparación entre corridas sin construir nada. Retomar esto si en algún momento se quiere todo centralizado en el dashboard del portfolio en vez de saltar a otra pestaña.
