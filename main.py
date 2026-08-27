@@ -197,14 +197,73 @@ def _normalizar_postgres_url(url):
 
 
 class RedisCacheManager:
+    """Caché en Upstash Redis.
+
+    Diseño defensivo: el caché NUNCA debe voltear un request. Pero "no voltear" no puede
+    significar "fallar en silencio": la version anterior atrapaba todas las excepciones con
+    `except: pass` y encima logueaba "Redis conectado" apenas construía el cliente — que no
+    abre ninguna conexión. Resultado: con credenciales mal configuradas la app corría SIN caché
+    indefinidamente, sin un solo error en los logs, y cada request pagaba el costo completo
+    (medido: 3 llamadas idénticas a /restaurant en 8.7s cada una). Ahora los errores se loguean
+    (con rate-limit para no inundar) y el estado real es visible en /health.
+    """
+
     def __init__(self, url, token):
         self.client = None
-        if url and token:
+        self.configurado = bool(url and token)
+        self.ultimo_error = None
+        self.hits = 0
+        self.misses = 0
+        self.errores = 0
+        self._ultimo_log_error = 0.0
+        if self.configurado:
             try:
                 self.client = Redis(url=url, token=token)
-                logger.info("✅ Redis conectado.")
+                logger.info("🔧 Cliente Redis construido (la conexión real se verifica en el ping)")
             except Exception as e:
-                logger.error(f"⚠️ Error Redis: {e}")
+                self.ultimo_error = f"{type(e).__name__}: {e}"
+                logger.error(f"⚠️ No se pudo construir el cliente Redis: {e}")
+        else:
+            logger.warning(
+                "⚠️ Redis SIN CONFIGURAR (falta UPSTASH_REDIS_REST_URL o UPSTASH_REDIS_REST_TOKEN). "
+                "La app funciona igual, pero cada consulta se recalcula desde cero."
+            )
+
+    def _log_error(self, operacion, e):
+        """Loguea el error del caché, pero como mucho una vez cada 60s para no inundar."""
+        self.errores += 1
+        self.ultimo_error = f"{type(e).__name__}: {e}"
+        ahora = time.time()
+        if ahora - self._ultimo_log_error > 60:
+            self._ultimo_log_error = ahora
+            logger.error(f"⚠️ Caché ({operacion}) fallando: {self.ultimo_error}")
+
+    async def ping(self):
+        """Verifica la conexión de verdad: escribe y lee una clave. Devuelve (ok, detalle)."""
+        if not self.configurado:
+            return False, "sin configurar (faltan UPSTASH_REDIS_REST_URL / _TOKEN)"
+        if not self.client:
+            return False, f"cliente no construido: {self.ultimo_error}"
+        try:
+            await self.client.set("healthcheck:ping", "1", ex=60)
+            valor = await self.client.get("healthcheck:ping")
+            if valor is None:
+                return False, "el set/get no devolvió el valor escrito"
+            return True, "ok"
+        except Exception as e:
+            self.ultimo_error = f"{type(e).__name__}: {e}"
+            return False, self.ultimo_error
+
+    def estado(self):
+        total = self.hits + self.misses
+        return {
+            "configurado": self.configurado,
+            "hits": self.hits,
+            "misses": self.misses,
+            "errores": self.errores,
+            "hit_rate": round(self.hits / total, 3) if total else None,
+            "ultimo_error": self.ultimo_error,
+        }
 
     def _sanitize_key(self, key):
         if not key:
@@ -218,9 +277,12 @@ class RedisCacheManager:
         try:
             data = await self.client.get(full_key)
             if data:
+                self.hits += 1
                 return data if isinstance(data, dict) else json.loads(data)
+            self.misses += 1
             return None
-        except:
+        except Exception as e:
+            self._log_error(f"get {prefix}", e)
             return None
 
     async def set_json(self, prefix, key, value_dict, expire=604800):
@@ -230,23 +292,24 @@ class RedisCacheManager:
         try:
             json_str = json.dumps(value_dict, ensure_ascii=False)
             await self.client.set(full_key, json_str, ex=expire)
-        except:
-            pass
+        except Exception as e:
+            self._log_error(f"set {prefix}", e)
 
     async def set_value(self, key, value, expire=None):
         if not self.client:
             return
         try:
             await self.client.set(key, value, ex=expire)
-        except:
-            pass
+        except Exception as e:
+            self._log_error("set_value", e)
 
     async def get_value(self, key):
         if not self.client:
             return None
         try:
             return await self.client.get(key)
-        except:
+        except Exception as e:
+            self._log_error("get_value", e)
             return None
 
 
@@ -494,6 +557,14 @@ async def lifespan(app: FastAPI):
         logger.info(
             f"✅ IA lista. Mini: {llm_mini.model_name} | Smart: {llm_smart.model_name}"
         )
+
+        # Verificación real de Redis al arrancar: queda en los logs de Fly. Antes se logueaba
+        # "Redis conectado" apenas se construía el cliente, lo que no prueba nada.
+        cache_ok, cache_detalle = await cache.ping()
+        if cache_ok:
+            logger.info("✅ Caché Redis operativo (set/get verificado)")
+        else:
+            logger.error(f"❌ Caché Redis NO operativo: {cache_detalle}")
 
     except Exception as e:
         logger.error(f"❌ Error iniciando LLMs: {e}")
@@ -3352,6 +3423,11 @@ async def health_check():
         except Exception as e:
             logger.warning("Última actualización no disponible: %s", e)
 
+    # Estado real del caché: se verifica con un set/get de ida y vuelta, no asumiendo que
+    # construir el cliente equivale a estar conectado. Sin esto, un Redis mal configurado pasaba
+    # totalmente inadvertido y la app corría sin caché indefinidamente.
+    cache_ok, cache_detalle = await cache.ping()
+
     return {
         "status": "healthy",
         "version": SERVER_VERSION,
@@ -3359,6 +3435,7 @@ async def health_check():
         "last_scraping": last_scraping,
         "lugares": len(df_lugares) if df_lugares is not None else 0,
         "reviews": "LAZY_MODE",
+        "cache": {"ok": cache_ok, "detalle": cache_detalle, **cache.estado()},
     }
 
 
