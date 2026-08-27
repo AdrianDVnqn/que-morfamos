@@ -400,6 +400,24 @@ Objetivo: eliminar de la base los resúmenes con características inventadas (y,
 
 **Estado:** v4 queda en las columnas y colección shadow, sin promover. Producción sigue en `resumen_reviews` / `reviews_embeddings`, verificada en 22/22. Costo total de las 4 regeneraciones: ~$1.32.
 
+### 🐛 Sinónimos de una sola dirección: "parrilla con pelotero" andaba, "parrillas con juegos" no
+- **Reportado por el usuario** probando en producción: `"recomendame parrillas con juegos para niños"` devolvía 5 lugares de los cuales **uno solo era una parrilla** (los otros: McDonald's, N&S Food Hall, una heladería y un buffet). La respuesta *parecía* correcta porque todos tenían juegos para chicos — pero ignoraba por completo la mitad "parrilla" del pedido.
+- **Causa raíz:** `expandir_sinonimos` comparaba la keyword sólo contra la **clave** de cada concepto en `SINONIMOS_CURADOS`, nunca contra sus sinónimos. El mapeo quedaba en una sola dirección: `"pelotero"` expandía a `["juegos infantiles", …]`, pero una query que dijera `"juegos"` **no** expandía a `"pelotero"`. Además `relevancia()` contaba conceptos cubiertos usando la keyword literal. Resultado, para la query `['parrilla','juegos']`:
+
+  | lugar | parrilla | juegos | conceptos |
+  |---|---|---|---|
+  | 827 Punto de encuentro | True | **False** (dice "pelotero") | 1 |
+  | Parrillas Gatica | True | **False** | 1 |
+  | McDonald's | False | True | 1 |
+
+  Todos empatados en 1 concepto → desempata la popularidad → gana McDonald's con 10.033 reseñas. Por eso la misma búsqueda escrita como "parrilla con **pelotero**" sí funcionaba.
+- **Fix:** nuevo helper `variantes_de_concepto(keyword)` que devuelve la keyword más toda la familia de su concepto, y `expandir_sinonimos` ahora empareja la keyword contra la clave **y** contra los sinónimos (`_emparenta`, prefijo en cualquier dirección). `relevancia()` cuenta un concepto como cubierto si el resumen menciona **cualquier** variante. Las parrillas con pelotero pasaron de 1 a 2 conceptos.
+- **Verificado:** `"recomendame parrillas con juegos para niños"` ahora incluye "827 Punto de encuentro" (parrilla real con pelotero), que antes no aparecía. Benchmark completo `22/22 | Recall 0.83 | Precision 0.83 | MRR 0.97` — sin regresión respecto de la línea base (0.84 de precisión, dentro del ruido).
+- **Nota:** la respuesta sigue incluyendo lugares que no son parrillas en los slots de "relacionados". Eso es el pendiente #3 (`exactos = locales_verificados[:3]` corta por orden de lista, no por relevancia), no este bug.
+
+### 🗺️ CARTO dejó de servir su tier anónimo (frontend)
+El mapa de `que-morfamos-frontend` usa `https://{s}.basemaps.cartocdn.com/dark_all/…` sin API key (`src/App.js`, `MAP_STYLE`). CARTO ahora exige key y superpone una marca de agua. Las tiles **siguen cargando** (HTTP 200), así que no es una caída: es estético. Opciones evaluadas: (a) API key gratuita de CARTO — mantiene el look exacto, pero la key queda pública en el bundle y hay que acotarla por dominio; (b) OSM + filtro CSS oscuro — sin registro ni keys, look parecido pero las etiquetas quedan con colores invertidos; (c) Stadia Maps — estilo oscuro nativo, también con key. **Pendiente de decisión del usuario.**
+
 ### 📝 ESTADO PENDIENTE CONSOLIDADO (al cierre del 26-ago-2026)
 
 **Estado del sistema:** el motor de búsqueda está sano — `22/22 | Recall@5=0.86 | Precision@5=0.80 | MRR=0.97 | Intent Accuracy=1.00`, verificado sobre **gpt-4o-mini**, la configuración que efectivamente sirve producción (`AI_PROVIDER=openai-mini` en Fly.io). Producción verificada en vivo devolviendo resultados correctos. Lo que queda son mayormente problemas de **calidad de datos**, que ningún fix de código puede compensar.

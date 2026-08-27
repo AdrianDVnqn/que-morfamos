@@ -91,6 +91,25 @@ SINONIMOS_CURADOS = {
 }
 
 
+def _emparenta(a, b):
+    """Prefijo en cualquier dirección: cubre 'veganas'<->'vegano', 'juegos'<->'juegos infantiles'."""
+    a, b = _normalizar_busqueda(a), _normalizar_busqueda(b)
+    return bool(a) and bool(b) and (a.startswith(b[:5]) or b.startswith(a[:5]))
+
+
+def variantes_de_concepto(keyword):
+    """La keyword más las variantes curadas de su concepto (si pertenece a alguno).
+
+    Se usa para contar cobertura de conceptos en el ranking: un lugar cuyo resumen dice "pelotero"
+    tiene que contar para una query que dice "juegos", y viceversa.
+    """
+    variantes = [keyword]
+    for concepto, extras in SINONIMOS_CURADOS.items():
+        if _emparenta(keyword, concepto) or any(_emparenta(keyword, e) for e in extras):
+            variantes.extend([concepto] + extras)
+    return variantes
+
+
 def expandir_sinonimos(keywords, synonyms):
     """Suma los sinónimos curados de SINONIMOS_CURADOS a los que devolvió el LLM.
 
@@ -99,10 +118,14 @@ def expandir_sinonimos(keywords, synonyms):
     resultado = list(synonyms or [])
     vistos = {_normalizar_busqueda(s) for s in resultado}
     for kw in keywords or []:
-        kw_norm = _normalizar_busqueda(kw)
         for concepto, extras in SINONIMOS_CURADOS.items():
-            # Prefijo en cualquier dirección: cubre "veganas"->"vegano" y "vegano"->"veganas".
-            if kw_norm.startswith(concepto[:5]) or concepto.startswith(kw_norm[:5]):
+            # La keyword se compara contra la clave del concepto Y contra sus sinónimos. Antes sólo
+            # se comparaba contra la clave, así que el mapeo era de una sola dirección: "pelotero"
+            # expandía a "juegos infantiles", pero una query que dijera "juegos" NO expandía a
+            # "pelotero" — y los lugares cuyo resumen dice "pelotero" (827 Punto de Encuentro,
+            # Parrillas Gatica) quedaban sin acreditar. Por eso "parrilla con pelotero" andaba y
+            # "parrillas con juegos para niños" devolvía McDonald's y una heladería.
+            if _emparenta(kw, concepto) or any(_emparenta(kw, e) for e in extras):
                 # Se suma el concepto canónico además de sus sinónimos: si el usuario escribió
                 # "veganas", esa forma no matchea el "vegano" que aparece en los resúmenes.
                 for e in [concepto] + extras:
@@ -2517,7 +2540,15 @@ def procesar_recomendacion_pesado(
         if nombre not in df_lugares_ref.index:
             return (0, 0, 0)
         resumen = safe_str(df_lugares_ref.loc[nombre].get("resumen_reviews", ""))
-        conceptos = sum(1 for k in keywords_core if _mencion_positiva(resumen, k))
+        # Un concepto cuenta como cubierto si el resumen menciona la keyword O CUALQUIERA de sus
+        # variantes curadas. Contar sólo la keyword literal hacía que un lugar cuyo resumen dice
+        # "pelotero" no contara para una query que dice "juegos": ahí "parrillas con juegos para
+        # niños" devolvía McDonald's y una heladería, porque las parrillas con pelotero quedaban
+        # empatadas en 1 concepto y ganaba la popularidad.
+        conceptos = sum(
+            1 for k in keywords_core
+            if any(_mencion_positiva(resumen, v) for v in variantes_de_concepto(k))
+        )
         evidencia = sum(1 for t in filtro_terms if _mencion_positiva(resumen, t))
         return (conceptos, evidencia, calc_score(nombre))
 
