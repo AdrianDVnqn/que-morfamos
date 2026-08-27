@@ -601,19 +601,45 @@ async def lifespan(app: FastAPI):
 # ==========================================
 # LAZY-LOAD: Reviews bajo demanda desde PostgreSQL
 # ==========================================
-def _fetch_reviews_sync(nombres: list, limit_per_local: int = 15):
-    """Sync worker for fetching reviews from DB. Runs in thread."""
+def _escapar_sql(v):
+    return str(v).replace("'", "''")
+
+
+def _fetch_reviews_sync(nombres: list, limit_per_local: int = 15, terminos: list = None):
+    """Sync worker for fetching reviews from DB. Runs in thread.
+
+    `terminos`: si se pasan, las reseñas que los mencionan se traen PRIMERO; el resto sigue
+    ordenado por fecha. Asi la frase destacada de la tarjeta muestra a alguien hablando de lo que
+    el usuario busco ("el pelotero es hermoso") en vez de un comentario cualquiera. Si ninguna
+    reseña menciona el termino, el orden queda como antes: las mas recientes.
+    """
     global db_engine
     if db_engine is None or not nombres:
         return pd.DataFrame()
-    
+
     # Use parameterized query for safety
-    placeholders = ", ".join([f"'{n.replace(chr(39), chr(39)+chr(39))}'" for n in nombres])
+    placeholders = ", ".join([f"'{_escapar_sql(n)}'" for n in nombres])
+
+    # Prioridad por relevancia: 1 si el texto menciona alguno de los terminos, 0 si no.
+    # Se ordena por esa prioridad y despues por fecha, en la misma consulta (sin round trip extra).
+    relevancia = "0"
+    utiles = [t for t in (terminos or []) if t and len(str(t).strip()) > 3][:6]
+    if utiles:
+        # Los % van duplicados: psycopg interpreta '%' como marcador de parametro en SQL crudo
+        # y falla con "only '%s', '%b', '%t' are allowed as placeholders".
+        condiciones = " OR ".join(
+            [f"texto ILIKE '%%{_escapar_sql(t.strip())}%%'" for t in utiles]
+        )
+        relevancia = f"CASE WHEN {condiciones} THEN 1 ELSE 0 END"
+
     query = f"""
         SELECT restaurante, autor, rating_user, texto, fecha
         FROM (
             SELECT restaurante, autor, rating_user, texto, fecha_aproximada as fecha,
-                   ROW_NUMBER() OVER(PARTITION BY restaurante ORDER BY fecha_aproximada DESC) as rn
+                   ROW_NUMBER() OVER(
+                       PARTITION BY restaurante
+                       ORDER BY {relevancia} DESC, fecha_aproximada DESC
+                   ) as rn
             FROM reviews
             WHERE restaurante IN ({placeholders})
         ) t
@@ -629,16 +655,18 @@ def _fetch_reviews_sync(nombres: list, limit_per_local: int = 15):
         return pd.DataFrame()
 
 
-async def obtener_reviews_por_local(nombres: list, limit_per_local: int = 15):
+async def obtener_reviews_por_local(nombres: list, limit_per_local: int = 15, terminos: list = None):
     """
     LAZY-LOAD: Trae reviews de PostgreSQL solo para los restaurantes necesarios.
     Se ejecuta en un thread para no bloquear el event loop.
     Retorna un DataFrame indexado por 'restaurante' (compatible con el viejo df).
+
+    `terminos` prioriza las reseñas que los mencionan (ver _fetch_reviews_sync).
     """
     if not nombres:
         return pd.DataFrame()
-    
-    result = await asyncio.to_thread(_fetch_reviews_sync, nombres, limit_per_local)
+
+    result = await asyncio.to_thread(_fetch_reviews_sync, nombres, limit_per_local, terminos)
     
     if not result.empty and "restaurante" in result.columns:
         result.set_index("restaurante", inplace=True, drop=False)
@@ -1486,7 +1514,12 @@ async def obtener_restaurant_cards(
     final_search_terms = [k for k in search_terms if len(k) > 3]
 
     # 1.5 Fetch real reviews para usarlos como cita destacada en las cards
-    real_reviews_df = await obtener_reviews_por_local(nombres_restaurantes, limit_per_local=3)
+    # Se priorizan las reseñas que mencionan lo que el usuario busco: la frase destacada de la
+    # tarjeta muestra evidencia real del pedido ("el pelotero es hermoso") en vez de un comentario
+    # cualquiera. Sin coincidencias, caen las mas recientes, que es el comportamiento de siempre.
+    real_reviews_df = await obtener_reviews_por_local(
+        nombres_restaurantes, limit_per_local=3, terminos=final_search_terms
+    )
 
     card_items = []
 
