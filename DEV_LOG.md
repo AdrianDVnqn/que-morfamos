@@ -437,6 +437,48 @@ El mapa de `que-morfamos-frontend` usa `https://{s}.basemaps.cartocdn.com/dark_a
 - **Resultado:** `22/22 | Recall 0.83 | Precision 0.83 | MRR 0.97` — idéntico a la línea base, con el bug arreglado. Verificado end-to-end: "recomendame parrillas con juegos para niños" devuelve Rancho Grande y 827 Punto de Encuentro arriba; "recomendame otra parrilla buena" recuperó Rancho Grande en primer puesto.
 - **Nota metodológica:** en el camino afirmé que ordenar por relevancia era mejor porque ponía BIO ZEN (vegetariano dedicado, 117 reseñas) antes que Lucciano's (heladería, 4686). Eso era **preferencia propia, no medición** — el golden dataset tiene a los dos como válidos, así que el benchmark no los distingue. Se revirtió esa parte y se conservó sólo lo medido.
 
+### ⚡ Análisis de rendimiento y primer fix: la búsqueda vectorial hacía Seq Scan (27-ago-2026)
+Medición de los dos flujos que el usuario reportó como lentos, contra producción y en local con los `[TIMING]` internos.
+
+**Flujo 1 — consulta (`/chat/stream`), lo que ve el usuario en producción:**
+
+| Hito | Tiempo |
+|---|---|
+| Primer texto visible | **11.6 – 14.9s** |
+| Cards | 17.7 – 22.1s |
+
+Desglose local (13.7s total): embedding OpenAI 1.3s + **consulta pgvector 2.6s** + router LLM 2.0s (paralelo) + Juez ~1.5s + generación hasta el primer token.
+
+**Flujo 2 — click en card (`/restaurant`), ~9s en producción:**
+
+| Etapa | Tiempo |
+|---|---|
+| Metadata | 0.02s |
+| Reviews (DB) | 1.0s |
+| **Análisis LLM** | **2.2 – 4.4s** |
+
+#### 🔧 Arreglado: la columna de embeddings no tenía dimensión fija
+`EXPLAIN ANALYZE` mostró un **`Seq Scan`** sobre las 909 filas de la colección: 568ms de CPU en la base, en **cada** consulta del chat. Causa: LangChain crea `langchain_pg_embedding.embedding` como `vector` **sin dimensión**, y con ese tipo Postgres no puede optimizar el cálculo de distancia. Además pgvector rechaza crear un índice HNSW sobre una columna así (`column does not have dimensions`).
+
+Fix (script idempotente `crear_indice_vectorial.py`): `ALTER COLUMN embedding TYPE vector(1536)` + `CREATE INDEX CONCURRENTLY ... USING hnsw`. Verificado que las 1700 filas tenían la misma dimensión y sin nulos antes de tocar nada.
+
+- **DB: 568ms → 23.6ms (24x).** A nivel app la búsqueda bajó de 2.64s a ~1.1s (lo que queda es ida y vuelta de red, ver abajo).
+- **Nota honesta:** la mejora viene del `ALTER`, no del índice. El planificador sigue eligiendo `Seq Scan` porque la consulta filtra por `collection_id` y pgvector no combina bien HNSW con filtros. El índice queda creado por si la tabla crece; si hiciera falta, el camino es un índice **parcial** por colección.
+
+#### 🔴 Pendiente #1: el caché de Redis está muerto en producción
+Tres llamadas **idénticas** a `/restaurant` dieron 8.75s / 8.67s / 8.84s. Si Redis funcionara, la segunda sería instantánea (el endpoint retorna temprano con `cached_full`). `UPSTASH_REDIS_REST_URL` y `UPSTASH_REDIS_REST_TOKEN` están **vacías** en el `.env` local; todo indica que nunca se configuró la instancia.
+
+No afecta sólo a las cards: el código **ya cachea** la búsqueda vectorial (`vsearch`) y el análisis del router (`analysis_v93`). Con Redis caído, **cada consulta rehace todo desde cero**, aunque alguien busque exactamente lo mismo. Es el fix de mayor impacto pendiente y no requiere tocar código: crear una instancia gratuita de Upstash y cargar las dos variables en Fly.io.
+
+#### 🟠 Pendiente #2: la app y la base están en costas opuestas
+`fly.toml` fija `primary_region = "ewr"` (Newark, este) y la base es `aws-0-us-west-2` (Oregon, oeste). Cada round trip a la base cruza el continente, y el request hace varios. Cambiar la región de Fly a una cercana a la base (`sjc`/`sea`) es una línea en `fly.toml`, gratis. Ganancia estimada: modesta (~0.5s), porque lo que domina son las llamadas al LLM.
+
+#### 🟠 Pendiente #3: cold start de ~46s
+`min_machines_running = 0` + `auto_stop_machines = "stop"`: la primera visita después de un rato paga el arranque completo (medido: 46s). Ponerlo en 1 lo elimina, pero implica tener la máquina siempre encendida — tiene costo.
+
+#### 🟠 Pendiente #4: el click en card bloquea esperando al LLM
+`/restaurant` espera 2-4s a que el LLM genere un resumen específico del tópico antes de responder. La metadata y las reseñas ya están listas en ~1s. Devolver eso primero y cargar el análisis aparte haría que la card se sienta inmediata.
+
 ### 📝 ESTADO PENDIENTE CONSOLIDADO (al cierre del 26-ago-2026)
 
 **Estado del sistema:** el motor de búsqueda está sano — `22/22 | Recall@5=0.86 | Precision@5=0.80 | MRR=0.97 | Intent Accuracy=1.00`, verificado sobre **gpt-4o-mini**, la configuración que efectivamente sirve producción (`AI_PROVIDER=openai-mini` en Fly.io). Producción verificada en vivo devolviendo resultados correctos. Lo que queda son mayormente problemas de **calidad de datos**, que ningún fix de código puede compensar.
