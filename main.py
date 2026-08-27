@@ -208,7 +208,22 @@ class RedisCacheManager:
     (con rate-limit para no inundar) y el estado real es visible en /health.
     """
 
+    @staticmethod
+    def _normalizar_url(url):
+        """Tolera las dos formas en que se suele cargar mal la URL de Upstash en un panel de
+        secrets: sin el prefijo https:// y con comillas alrededor del valor. Es exactamente lo
+        que paso en produccion — el secret venia sin protocolo y el SDK fallaba con
+        'UnsupportedProtocol', dejando la app sin cache sin que nadie se enterara."""
+        if not url:
+            return url
+        url = url.strip().strip('"').strip("'")
+        if url and not url.startswith(("http://", "https://")):
+            url = "https://" + url
+        return url
+
     def __init__(self, url, token):
+        url = self._normalizar_url(url)
+        token = token.strip().strip('"').strip("'") if token else token
         self.client = None
         self.configurado = bool(url and token)
         self.ultimo_error = None
