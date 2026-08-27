@@ -3282,6 +3282,7 @@ async def procesar_consulta_gen(
             # Cards deferred: start AFTER first token to avoid OpenAI API contention
             # (11 concurrent calls caused 32s throttle delay)
             card_task = None
+            cards_emitidas = False
             async for token in astream_buffer(llm_mini, prompt_rag):
                 if card_task is None:
                     # First token flowed → NOW start card generation in parallel
@@ -3300,8 +3301,29 @@ async def procesar_consulta_gen(
                     )
                 yield {"type": "token", "content": token}
 
+                # Las cards se generan en paralelo y suelen estar listas ANTES de que termine de
+                # escribirse el texto. Antes se emitian recien despues del bucle, asi que quedaban
+                # retenidas de gusto: medido en produccion, llegaban 0.0s despues del ultimo token
+                # aunque estuvieran listas hacia rato. Emitirlas apenas estan listas las adelanta
+                # varios segundos sin tocar nada del frontend (ya maneja el meta cuando llegue).
+                if card_task is not None and card_task.done() and not cards_emitidas:
+                    cards_emitidas = True
+                    cards = card_task.result()
+                    print(f"[TIMING] Cards listas y emitidas a los {time.time() - t_start:.2f}s "
+                          f"(sin esperar a que termine el texto)", flush=True)
+                    yield {
+                        "type": "meta",
+                        "mode": "rag",
+                        "cards": cards,
+                        "locs": obtener_coordenadas([c.nombre for c in cards], df),
+                        "zona": zona_detectada,
+                    }
+
             # AWAIT CARDS AND YIELD
             print(f"[TIMING] Text stream finished. Waiting for cards...", flush=True)
+            if cards_emitidas:
+                # Ya se emitieron durante el streaming; no hay que mandarlas de nuevo.
+                return
             cards = await card_task if card_task else []
             t3 = time.time()
             print(
