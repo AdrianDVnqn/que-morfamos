@@ -3051,10 +3051,49 @@ async def procesar_consulta_gen(
             # Identificar rechazados explícitamente para no mostrarlos en 'relacionados'
             locales_rechazados = set(candidatos_a_verificar) - set(locales_verificados)
 
-            # Separar EXACTOS (aprobados por juez) y RELACIONADOS (alta relevancia no aprobados)
-            exactos = locales_verificados[:3]  # Máximo 3 exactos (antes 6)
+            # `grupo_alta_relevancia` ya viene ordenado por la clave en cascada de `relevancia()`
+            # (conceptos cubiertos, fuerza de evidencia, popularidad). Se reusa esa posición como
+            # rango en vez de recalcular: así el orden que se muestra es el mismo que se razonó
+            # aguas arriba. Los aprobados que no estén en grupo_alta (vinieron de grupo_baja) van
+            # al final.
+            orden_relevancia = {n: i for i, n in enumerate(grupo_alta_relevancia)}
 
-            # Relacionados: tomamos de alta relevancia, excluyendo los que ya son exactos Y los que fueron RECHAZADOS por el juez
+            def get_score(n):
+                if n not in df_lugares.index: return 0
+                r = df_lugares.loc[n]
+                if isinstance(r, pd.DataFrame): r = r.iloc[0]
+                return safe_float(r.get("rating_gral")) + (math.log10(safe_int(r.get("total_reviews_google")) + 1) * 2.7)
+
+            # La cobertura de conceptos sólo discrimina si hay MÁS DE UN concepto que cubrir. En una
+            # query de un solo concepto ("parrilla") todos los candidatos empatan en conceptos=1 y
+            # el desempate cae en `evidencia` (cuántos sinónimos menciona el resumen), que premia
+            # resúmenes verbosos y no lugares buenos: un local oscuro que escribe "parrilla, asado,
+            # parrillada" le ganaba a Parrilla Rancho Grande (4.3⭐, 1532 reseñas). Para "recomendame
+            # una parrilla buena" la popularidad SÍ es la señal correcta. Medido: ordenar por
+            # relevancia en queries de un concepto bajaba el MRR de 1.00 a 0.33.
+            keywords_core_call = [
+                k for k in (keywords or [])
+                if len(k) > 3 and k.lower().strip() not in KEYWORDS_GENERICAS
+            ]
+            multi_concepto = len(keywords_core_call) > 1
+
+            def rango_relevancia(n):
+                return orden_relevancia.get(n, 10**6)
+
+            # El orden en que se MUESTRAN. Para queries de un solo concepto se mantiene la
+            # popularidad (era el comportamiento previo y está medido como el mejor); sólo las
+            # multi-concepto se muestran por cobertura de conceptos.
+            rango = rango_relevancia if multi_concepto else (lambda n: -get_score(n))
+
+            # SELECCIÓN. Sólo se reordena por relevancia en queries multi-concepto: es lo que
+            # arregla "parrillas con juegos para niños", donde las parrillas con pelotero quedaban
+            # fuera de los 3 exactos. En queries de un solo concepto se conserva el orden en que el
+            # Juez devolvió los aprobados (comportamiento previo): tocarlo ahí no aporta —todos
+            # empatan en cobertura— y está medido que empeora, porque cambia qué 3 entran
+            # (`no_falso_bloqueo_queja` bajaba de MRR 1.00 a 0.33).
+            exactos = (sorted(locales_verificados, key=rango_relevancia) if multi_concepto
+                       else locales_verificados)[:3]
+
             relacionados = [
                 loc
                 for loc in grupo_alta_relevancia
@@ -3067,15 +3106,13 @@ async def procesar_consulta_gen(
             print(f"[DEBUG] 🚫 Rechazados filtrados: {locales_rechazados}", flush=True)
             print(f"[DEBUG] 🔗 Relacionados: {relacionados}", flush=True)
 
-            # 6. RANKING FINAL (Final sort by rating and review count)
-            def get_score(n):
-                if n not in df_lugares.index: return 0
-                r = df_lugares.loc[n]
-                if isinstance(r, pd.DataFrame): r = r.iloc[0]
-                return safe_float(r.get("rating_gral")) + (math.log10(safe_int(r.get("total_reviews_google")) + 1) * 2.7)
-
-            exactos.sort(key=get_score, reverse=True)
-            relacionados.sort(key=get_score, reverse=True)
+            # 6. ORDEN FINAL — mismo criterio que la selección (ver `rango` arriba).
+            # Antes acá había un `sort(key=get_score)` incondicional que re-ordenaba por popularidad
+            # justo antes de mostrar, tirando a la basura el ranking en cascada calculado aguas
+            # arriba: en una query multi-concepto, un McDonald's de 10.033 reseñas terminaba arriba
+            # de una parrilla con pelotero de 183.
+            exactos.sort(key=rango)
+            relacionados.sort(key=rango)
 
             if not exactos and not relacionados:
                 yield {

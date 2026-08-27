@@ -418,6 +418,25 @@ Objetivo: eliminar de la base los resúmenes con características inventadas (y,
 ### 🗺️ CARTO dejó de servir su tier anónimo (frontend)
 El mapa de `que-morfamos-frontend` usa `https://{s}.basemaps.cartocdn.com/dark_all/…` sin API key (`src/App.js`, `MAP_STYLE`). CARTO ahora exige key y superpone una marca de agua. Las tiles **siguen cargando** (HTTP 200), así que no es una caída: es estético. Opciones evaluadas: (a) API key gratuita de CARTO — mantiene el look exacto, pero la key queda pública en el bundle y hay que acotarla por dominio; (b) OSM + filtro CSS oscuro — sin registro ni keys, look parecido pero las etiquetas quedan con colores invertidos; (c) Stadia Maps — estilo oscuro nativo, también con key. **Pendiente de decisión del usuario.**
 
+### 🐛 Selección y orden de resultados: la relevancia se tiraba a la basura en la última línea
+- **Continuación del bug anterior**, pedido por el usuario: aun con los sinónimos bidireccionales arreglados, la respuesta seguía metiendo no-parrillas en los slots de "alternativas". Al abrir el código aparecieron **dos** puntos de pérdida, no uno:
+  1. `exactos = locales_verificados[:3]` cortaba por el orden en que el **Juez** devolvió los nombres, no por relevancia.
+  2. **El más grave, que no estaba documentado:** justo antes de mostrar había un `exactos.sort(key=get_score)` / `relacionados.sort(key=get_score)` con `get_score = rating + log(reseñas)`. Es decir, **re-ordenaba todo por popularidad en la última línea**, tirando a la basura el ranking en cascada calculado aguas arriba. Un McDonald's de 10.033 reseñas terminaba arriba de una parrilla con pelotero de 183.
+- **Cuatro combinaciones probadas y medidas** (selección × orden), porque cada intento rompía algo distinto y sólo se veía al medir:
+
+  | Selección | Orden mostrado | Recall | Precision | MRR |
+  |---|---|---|---|---|
+  | Juez | popularidad | 0.83 | 0.83 | **0.97** ← línea base |
+  | relevancia | relevancia | 0.83 | 0.81 | 0.91 |
+  | popularidad | popularidad | 0.78 | 0.80 | 0.86 |
+  | relevancia | condicional | 0.81 | 0.81 | 0.91 |
+  | **condicional** | **condicional** | **0.83** | **0.83** | **0.97** ✅ |
+
+- **Por qué la relevancia empeora en queries de UN concepto:** con "parrilla" todos los candidatos empatan en `conceptos=1`, así que desempata `evidencia` (cuántos sinónimos menciona el resumen) — que premia resúmenes verbosos, no lugares buenos. Un local oscuro que escribe "parrilla, asado, parrillada" le ganaba a Parrilla Rancho Grande (4.3⭐, 1532 reseñas). Medido: `no_falso_bloqueo_queja` caía de MRR 1.00 a 0.33.
+- **Fix final, en un principio simple:** *la cobertura de conceptos sólo se usa cuando hay más de un concepto que cubrir*. Tanto la selección como el orden son condicionales a `multi_concepto`; las queries de un solo concepto pasan por exactamente el mismo código que antes, así que **no pueden regresionar por construcción**.
+- **Resultado:** `22/22 | Recall 0.83 | Precision 0.83 | MRR 0.97` — idéntico a la línea base, con el bug arreglado. Verificado end-to-end: "recomendame parrillas con juegos para niños" devuelve Rancho Grande y 827 Punto de Encuentro arriba; "recomendame otra parrilla buena" recuperó Rancho Grande en primer puesto.
+- **Nota metodológica:** en el camino afirmé que ordenar por relevancia era mejor porque ponía BIO ZEN (vegetariano dedicado, 117 reseñas) antes que Lucciano's (heladería, 4686). Eso era **preferencia propia, no medición** — el golden dataset tiene a los dos como válidos, así que el benchmark no los distingue. Se revirtió esa parte y se conservó sólo lo medido.
+
 ### 📝 ESTADO PENDIENTE CONSOLIDADO (al cierre del 26-ago-2026)
 
 **Estado del sistema:** el motor de búsqueda está sano — `22/22 | Recall@5=0.86 | Precision@5=0.80 | MRR=0.97 | Intent Accuracy=1.00`, verificado sobre **gpt-4o-mini**, la configuración que efectivamente sirve producción (`AI_PROVIDER=openai-mini` en Fly.io). Producción verificada en vivo devolviendo resultados correctos. Lo que queda son mayormente problemas de **calidad de datos**, que ningún fix de código puede compensar.
