@@ -3577,7 +3577,7 @@ async def get_restaurant_detail(
     # === CHECK FULL-RESPONSE CACHE ===
     tone = sanitize_tone(tone)
     full_cache_key = f"detail_full_{nombre}_{topic}_{tone}"
-    cached_full = await cache.get_json("detail_full", full_cache_key)
+    cached_full = await cache.get_json("detail_full_v2", full_cache_key)
     if cached_full:
         print(f"[DETAIL] {nombre} | CACHE HIT | {time.time() - t_start:.2f}s", flush=True)
         return RestaurantDetail(**cached_full)
@@ -3600,9 +3600,19 @@ async def get_restaurant_detail(
     nombre_real = safe_str(row.get("restaurante", nombre_exacto))
     print(f"[DETAIL] {nombre_real} | Metadata lookup: {time.time() - t_start:.2f}s", flush=True)
 
-    # Lazy-load reviews para este restaurante
+    # Lazy-load reviews para este restaurante.
+    # Los terminos del tema van a la consulta, no solo al ranking posterior. Sin esto se traian
+    # las 15 mas recientes y recien despues se rankeaban por tema: si el lugar tiene 548 resenas
+    # y las que hablan del tema no estan entre las ultimas 15, al LLM no le llegaba ninguna.
+    # Medido en "Ohana Tienda y Cafe" con topic="opciones veganas": 0 de 15 resenas mencionaban
+    # el tema por fecha, 15 de 15 pasando los terminos. El detalle terminaba afirmando que no se
+    # mencionan opciones veganas, sobre un lugar que tiene 43 resenas que las mencionan.
     t1 = time.time()
-    reviews_df = await obtener_reviews_por_local([nombre_exacto])
+    terminos_tema = []
+    if topic and topic not in ["undefined", "null"]:
+        for kw in get_keywords_from_topic(topic):
+            terminos_tema.extend(variantes_de_concepto(kw))
+    reviews_df = await obtener_reviews_por_local([nombre_exacto], terminos=terminos_tema or None)
     reviews_list = []
     if not reviews_df.empty:
         sorted_reviews = rankear_reviews_por_topico(reviews_df, topic)
@@ -3619,7 +3629,7 @@ async def get_restaurant_detail(
     print(f"[DETAIL] {nombre_real} | Reviews fetch+rank: {time.time() - t1:.2f}s ({len(reviews_list)} reviews)", flush=True)
 
     cache_key = f"{nombre_real}_{topic}_{tone}" if topic and topic not in ["undefined", "null"] else f"{nombre_real}__{tone}"
-    analisis = await cache.get_json("detail_topic", cache_key)
+    analisis = await cache.get_json("detail_topic_v2", cache_key)
     if analisis:
         print(f"[DETAIL] {nombre_real} | Analysis CACHE HIT", flush=True)
     else:
@@ -3632,9 +3642,22 @@ async def get_restaurant_detail(
             }
         else:
             t2 = time.time()
-            sample = " | ".join([r.texto[:150] for r in reviews_list[:5]])
+            # 150 caracteres cortaban la mencion a la mitad de la resena: en la muestra de
+            # Ohana habia menciones al tema recien en el caracter 185, 249... El costo de subirlo
+            # es despreciable (5 x 400 = ~500 tokens).
+            sample = " | ".join([r.texto[:400] for r in reviews_list[:5]])
+            # La version anterior era solo "El usuario busca X. Resalta que dicen las resenas
+            # sobre eso". Si las resenas no decian nada del tema, el modelo reportaba la ausencia
+            # — y 'negativos' es el unico casillero donde entra una mala noticia sobre la
+            # busqueda. Asi salio "A mejorar: no se mencionan opciones veganas en las resenas",
+            # que no es un defecto del lugar sino la falta de respuesta a la pregunta del usuario.
+            # Misma regla que ya rige el prompt de resumenes del scraper: ni inventar ni negar.
             contexto_tema = (
-                f"IMPORTANTE: El usuario busca '{topic}'. Resalta qué dicen las reseñas sobre eso."
+                f"El usuario busca '{topic}'. Si las reseñas hablan de eso, dale prioridad. "
+                "REGLA: no inventes ni niegues. Si las reseñas no dicen nada sobre lo que el "
+                "usuario busca, describí el lugar por lo que SÍ cuentan y no menciones la "
+                "ausencia. 'negativos' es para quejas concretas de clientes, nunca para señalar "
+                "que un tema no aparece en las reseñas: si no hay quejas, devolvé lista vacía."
             )
             prefix = tone_system_instruction(tone)
             prompt_txt = f"""{prefix}\nAnaliza "{nombre_real}". {contexto_tema}
@@ -3645,7 +3668,7 @@ async def get_restaurant_detail(
                 res = await llm_mini.ainvoke(prompt_txt)
                 clean = res.content.strip().replace("```json", "").replace("```", "")
                 analisis = json.loads(clean)
-                asyncio.create_task(cache.set_json("detail_topic", cache_key, analisis))
+                asyncio.create_task(cache.set_json("detail_topic_v2", cache_key, analisis))
             except:
                 analisis = {
                     "resumen": "Info no disponible momentáneamente.",
@@ -3671,7 +3694,7 @@ async def get_restaurant_detail(
 
     # Cache full response (TTL managed by Redis/Upstash)
     try:
-        asyncio.create_task(cache.set_json("detail_full", full_cache_key, result.model_dump()))
+        asyncio.create_task(cache.set_json("detail_full_v2", full_cache_key, result.model_dump()))
     except:
         pass  # Don't fail the request if caching fails
 
