@@ -479,9 +479,123 @@ No afecta sólo a las cards: el código **ya cachea** la búsqueda vectorial (`v
 #### 🟠 Pendiente #4: el click en card bloquea esperando al LLM
 `/restaurant` espera 2-4s a que el LLM genere un resumen específico del tópico antes de responder. La metadata y las reseñas ya están listas en ~1s. Devolver eso primero y cargar el análisis aparte haría que la card se sienta inmediata.
 
-### 📝 ESTADO PENDIENTE CONSOLIDADO (al cierre del 26-ago-2026)
+## 📅 Sesión: 28 de Agosto de 2026 (Contaminación por query, orden de reseñas, frase destacada y fichas muertas de Google)
 
-**Estado del sistema:** el motor de búsqueda está sano — `22/22 | Recall@5=0.86 | Precision@5=0.80 | MRR=0.97 | Intent Accuracy=1.00`, verificado sobre **gpt-4o-mini**, la configuración que efectivamente sirve producción (`AI_PROVIDER=openai-mini` en Fly.io). Producción verificada en vivo devolviendo resultados correctos. Lo que queda son mayormente problemas de **calidad de datos**, que ningún fix de código puede compensar.
+### 🎯 Objetivo
+Arrancó como un reporte puntual del usuario —"busco opciones veganas, aparece Ohana y el detalle dice que no menciona opciones veganas"— y terminó destapando cuatro bugs independientes en el mismo camino, más el detector de locales cerrados que estaba pendiente desde el 26-ago.
+
+### 🐛 Bug #1: el detalle afirmaba una ausencia sin haber visto una sola reseña del tema
+- **Síntoma:** para `topic="opciones veganas"`, el detalle de Ohana Tienda y Cafe decía *"no se menciona específicamente opciones veganas en las experiencias compartidas"* y listaba eso como **"A mejorar"**.
+- **Lo que NO era:** ni un problema de recuperación ni una alucinación. Ohana es un resultado legítimo — su propio `resumen_reviews` dice *"incluyendo opciones veganas, vegetarianas y sin TACC"* — y los otros 4 resultados de esa búsqueda también lo eran (se verificó uno por uno, incluido Lucciano's, que tiene "variedad de helados veganos" en su resumen). El modelo describió con exactitud lo que le mostraron.
+- **Causa real, medida:** el endpoint llamaba `obtener_reviews_por_local()` **sin `terminos`**, así que traía las 15 reseñas más recientes y recién después las rankeaba por tema. Ohana tiene 548 reseñas y 43 mencionan vegano/vegetariano/sin TACC, pero:
+
+      hoy (15 más recientes)          -> 0 de 15 mencionaban el tema
+      pasando términos a la consulta  -> 15 de 15
+
+  `_fetch_reviews_sync` ya soportaba ordenar por relevancia desde la sesión del pelotero; este endpoint simplemente no lo usaba.
+- **Fix (tres defectos que se acumulaban):**
+    1. Los términos del tema van a la consulta, expandidos con `variantes_de_concepto()` para que "veganas" alcance también "vegano" y "vegetariano".
+    2. La muestra que ve el LLM pasa de 150 a 400 caracteres por reseña. En Ohana había menciones al tema recién en el caracter 185 y 249: el recorte las cortaba.
+    3. El prompt decía *"El usuario busca X. Resaltá qué dicen las reseñas sobre eso"*. Si no decían nada, el modelo reportaba la ausencia — y `negativos` es el único casillero donde entra una mala noticia sobre la búsqueda. Ahora rige la misma regla que el prompt de resúmenes del scraper: **ni inventar ni negar**, y `negativos` es sólo para quejas concretas.
+- **Resultado verificado sobre el mismo caso:** el "A mejorar" pasó de *"No se mencionan opciones veganas"* a *"Las opciones veganas eran desabridas"* y *"olor extraño a cloacas"* — quejas reales, rastreables palabra por palabra a reseñas concretas.
+
+### 🐛 Bug #2: el ordenamiento por fecha de reseñas era un no-op
+- **Causa:** `fecha_a_orden()` se escribió para las fechas relativas en español que scrapeaba Google ("hace 2 meses"), pero la base guarda ISO desde hace rato. A una fecha ISO le caían todos los `if` y devolvía el `5000` del final, **igual para todas**:
+
+      2026-08-22 -> 5000
+      2026-08-09 -> 5000
+      2026-07-27 -> 5000
+
+- **Alcance:** afectaba a las cuatro llamadas de `rankear_reviews_por_topico`, incluida la frase destacada de las tarjetas.
+- **Fix:** las ISO se convierten a horas transcurridas, la misma escala que ya usaba la rama de fechas relativas.
+- **Pero con eso solo no alcanzaba** para que la fecha decidiera algo:
+    - La relevancia por tema pasa a ser **binaria**. Antes sumaba 100 por keyword matcheada y después +50 si el rating era alto o −20 si era bajo, así que entre dos reseñas del tema ganaba la de mejor puntaje y la fecha casi nunca desempataba. El bonus por rating además empujaba las quejas hacia abajo, que en una app de reseñas es justo lo que no se quiere. Ahora la relevancia elige **qué** reseñas y la fecha decide **en qué orden**.
+    - `get_keywords_from_topic()` ahora descarta las palabras-contenedor de `KEYWORDS_GENERICAS`, que ya existía pero esta función no usaba. "opciones veganas" dejaba `["opcion","vegana"]`, y "opcion" matchea cualquier reseña que diga "opciones de almuerzo" u "opciones sin gluten".
+
+### 🐛 Bug #3: la frase destacada de las tarjetas — cuatro defectos encadenados
+1. **Selección de términos NO DETERMINISTA.** `search_terms` es un `set` y `_fetch_reviews_sync` se queda con los primeros 6: cuáles 6 sobrevivían cambiaba entre corridas. Tres ejecuciones del mismo corte dieron tres subconjuntos distintos, y a veces entraba "opciones" dejando afuera "vegano".
+2. **No se verificaba que la cita hablara del tema:** se agarraba la primera fila con más de 20 caracteres. En una búsqueda vegana, Ohana citaba *"La carta estaba desactualizada, no tenían varios ingredientes"*. Ahora se exige mención, se descartan las negadas con `_mencion_positiva` (*"lo único malo es que NO tienen parrillas"* contenía el término y era lo contrario de una evidencia) y entre candidatas gana la que menciona más términos distintos.
+3. **El recorte a 200 caracteres tapaba la evidencia.** Una reseña podía calificar por decir "las medialunas veganas también" en el caracter 139 y mostrarse cortada justo antes. Ahora la ventana se abre alrededor de la mención.
+4. **Sin reseña del tema se fabricaba una cita:** se ponía `resumen_reviews` —texto generado por un modelo— entre comillas y firmado *"— Google Reviews"*, y el frontend lo renderiza en itálica con la atribución. Un texto que no escribió nadie aparecía como el testimonio de un cliente. Ahora simplemente no se muestra cita.
+
+### ⚖️ Decisión de producto: la cita de la tarjeta prefiere reseñas positivas
+- **Planteo del usuario:** "si uno busca mejores pizzas y lee reseñas negativas, te hace dudar de todo el sistema. TODO lugar va a tener reseñas negativas."
+- **Razonamiento:** una cita elegida sin mirar la valencia no da una visión balanceada — da una muestra de tamaño 1 con signo aleatorio. Y como todo lugar tiene reseñas malas, tampoco distingue un lugar bueno de uno malo. Un local de 4.1★ con 3476 reseñas ilustrado con su peor comentario sólo hace dudar del sistema entero.
+- **Implementación:** entre las candidatas que mencionan el tema positivamente ganan las de 4-5★ y se descartan las de 1-2★. Si no queda ninguna, no se muestra cita: no se fabrica un positivo que no existe.
+- **Por qué no contradice haber sacado el bonus por rating del ordenamiento (bug #2):** son propósitos distintos. Ahí el objetivo es **no esconder quejas en una lista**; acá es **elegir un ejemplar representativo** de una recomendación. Lo negativo sigue visible en "A mejorar" y en la lista completa de reseñas, a un clic.
+- **Verificado:** Franz y Peppone pasó de *"Salón abandonado, muebles viejos, paredes sucias"* a *"Riquísimas las pizzas! Hace 20 años soy cliente"*.
+
+### 🐛 Bug #4: `variantes_de_concepto()` devolvía duplicados
+`SINONIMOS_CURADOS` es bidireccional a propósito, así que ambas entradas matchean y la lista salía repetida: para "vegano" devolvía 11 términos de los que sólo 7 eran distintos, con "vegano" **tres veces**. Rompía dos cosas: `evidencia` suma 1 por término, así que una sola palabra valía triple; y `_fetch_reviews_sync` corta en 6, y los repetidos gastaban esos lugares. El orden no cambia en los casos conocidos — era una distorsión del puntaje, no del resultado.
+
+### 🔍 Cómo se explica el orden de resultados (pregunta del usuario, vale documentarla)
+Ante *"¿por qué ÁRBOL aparece 5to siendo 4.6★ con 1153 reseñas, y Oh My Veggie 2do con 4.2★ y 572?"*, el desglose de la clave en cascada `(conceptos, evidencia, popularidad)`:
+
+| lugar | conceptos | evidencia | popularidad | rating/reseñas |
+|---|---|---|---|---|
+| BIO ZEN | 1 | **4** | 6.97 | 4.9★/117 |
+| Oh My Veggie | 1 | **4** | 6.96 | 4.2★/572 |
+| Ohana | 1 | 3 | 7.51 | 4.6★/816 |
+| Lucciano's | 1 | 2 | 8.47 | 4.8★/4686 |
+| ÁRBOL | 1 | **2** | 7.66 | 4.6★/1153 |
+
+Los cinco cubren el concepto, así que desempata la **evidencia**: Oh My Veggie menciona 4 de 7 términos del concepto; ÁRBOL sólo 2, porque es un brewpub que **además** tiene opciones veganas. La popularidad entra tercera. Si no fuera así, toda búsqueda devolvería los 5 lugares más famosos de Neuquén sin importar qué se preguntó.
+
+### 🗑️ "Cuchí" eliminado de la base (pendiente #2 del 26-ago, resuelto para este caso)
+- **Alcance medido antes de borrar:** 1 fila en `lugares`, 315 en `reviews`, 26 en `review_history`, 26 en `scraping_logs` (las tres últimas por `ON DELETE CASCADE`, que ya estaba configurado) y **2** en `langchain_pg_embedding`.
+- **Casi un accidente serio:** el primer conteo de embeddings buscaba el texto "cuch" dentro del documento y daba **32** — pero 30 de esos eran reseñas de otros 8 lugares que dicen "cucharas" o "cuchillo". Borrarlos habría destruido los embeddings de Bairoletto, Batacazo y Cervecería OSS. Filtrando por `cmetadata->>'nombre'` eran exactamente 2.
+- **Backup previo** en `backups/cuchi_2026-08-28.json` (173 KB, 370 filas), así que es reversible.
+- **Los 43 `query_logs` que lo mencionan se dejaron intactos a propósito:** no son datos del lugar sino el registro histórico de lo que el sistema devolvió; borrarlos falsearía el historial y son material para la minería de queries pendiente.
+- **Dato de contexto:** Google marcaba el lugar como *"Cerrado temporalmente"*, no permanentemente. El usuario confirmó que en Roca 89 ahora funciona otro local (Blest), o sea que la etiqueta de Google estaba desactualizada. **La etiqueta de Google falla en las dos direcciones**, y eso condiciona el diseño del detector de cerrados.
+
+### 🔎 El scraper fallaba en silencio: `SIN_OPINIONES` tapaba fichas muertas de Google
+- **Síntoma:** 11 lugares volvían `SIN_OPINIONES` semana tras semana, que se lee como "no tiene reseñas". No era eso: Damiana tiene **2316 reseñas en Google y nosotros 813**; Pizzería Alta Barda, 603 contra 39.
+- **Diagnóstico:** la cantidad de fallos predecía exactamente el problema — 10 de los 11 tenían **7 fallos** (uno por semana, 7 semanas seguidas) y uno tenía 1. Abriendo las URLs a mano, las 10 con 7 fallos caen en el mapa genérico de Google y la que tenía 1 resuelve bien; un lugar de control (Ohana) también resuelve. Fallo determinista, no bot-detection ni rate limiting.
+- **Causa:** cuando el place ID de una URL guardada deja de existir (el negocio cerró, o Google fusionó/reemplazó la ficha), Maps **no devuelve 404**: redirige a la portada del mapa. La URL queda con el nombre **vacío** entre las dos barras (`/maps/place//@-38.95,-68.06,11z/...`), sin `h1` y sin pestañas. Al no haber pestañas, `forzar_entrada_pestana_opiniones()` falla y el caso se archivaba como "no tiene pestaña de Opiniones".
+- **Fix (repo `que-morfamos-scraper`):** `ficha_del_lugar_resolvio()` en `scraping_utils.py` detecta el redirect; `monitor_reviews.py` la usa **antes** de buscar la pestaña y devuelve `URL_MUERTA`, que viaja a `scraping_logs` con su propio nombre.
+- **Y la otra mitad, que es la que lo hacía silencioso:** una ficha muerta no es un "error" (`procesar_lugar` vuelve por el camino normal), así que no entraba en ningún contador y el resumen del run no la mencionaba. Ahora el resumen imprime `Fichas muertas: N` con la lista, y `notificador.py` levanta ese número por regex y **lo manda a Discord**. Cadena verificada con un `run.log` simulado, con 10 y con 0.
+- **Error propio en el camino, vale registrarlo:** el primer parche fue a `opiniones-scraper.py`, y el workflow semanal corre `monitor_reviews.py`. Peor: la función parcheada (`procesar_restaurante`, ~230 líneas) es **código muerto**, no la llama nadie.
+- **Este es el mejor detector de cerrados disponible**, muy superior al silencio de reseñas: una ficha que Google dejó de resolver es una señal directa, no una inferencia. Pero **no significa "cerró" automáticamente** — Google también fusiona y reemplaza fichas — así que lo correcto es revalidar por nombre y dirección antes de dar de baja.
+
+### 📊 Por qué el silencio de reseñas NO sirve como detector de cerrados (medido)
+El usuario propuso "3 meses sin reseñas nuevas ya es señal". Los números dicen que no alcanza:
+
+| señal | resultado |
+|---|---|
+| Sin reseñas hace +3 meses | **325 de 942 lugares (35% de la base)** |
+| ...de esos, lugares chicos (<50 reseñas) | 215 — para ellos 3 meses de silencio es normal |
+| Reseñas que mencionan cierre (Cuchí) | **1 de 315**, y de hace 17 meses |
+| Lugares con menciones de cierre en 12 meses | 14, casi todos con 1 sola y varios abiertos |
+| Cruzando ambas señales | 6 lugares — una cola de revisión manual, no una acción automática |
+
+Y hay algo peor: **el silencio no significa "cerró", significa "dejamos de recibir datos"**, que tiene dos causas mezcladas. The Coffee Store, Mostaza y Armando Medialunas tienen su última reseña **exactamente el mismo día** (2026-01-08): tres lugares de 30-40 reseñas/mes no cierran juntos. `scraping_logs` ya sabe distinguirlo — silencio + `EXITO` es candidato a cierre; silencio + `SIN_OPINIONES`/`URL_MUERTA` es scraper roto.
+
+### ⚡ El detalle se sirve en dos tiempos (pendiente #4 del 26-ago, resuelto)
+- **Medición del endpoint:** metadata 0.31s, reseñas 1.13s, **análisis del LLM 4.49s**. El 72% de la espera es una sola parte y el resto está listo a 1.4s, pero se devolvía junto.
+- **Fix:** `solo_base=1` devuelve todo menos el análisis. El frontend pide las dos cosas **en paralelo** (no en cadena: encadenarlas sumaría los tiempos en vez de solaparlos) y pinta la tarjeta apenas llega la base, dejando el esqueleto sólo en el bloque del resumen.
+- **La respuesta base se cachea con clave propia que NO incluye el tono**, porque el tono sólo afecta al texto del LLM: un mismo lugar reusa su base entre los tres tonos.
+- **Medido en el navegador con una tarjeta sin cachear:** 80ms esqueleto completo → **1441ms nombre, rating, dirección y 4 reseñas visibles** → 4000ms resumen completo. Contenido real a 1.4s en vez de 4.0s.
+
+### 🔗 `url` expuesta en el detalle
+Se agregó `url` al modelo **y a la consulta que carga `df_lugares`** — la columna existía en la tabla pero la query no la traía, así que el campo llegaba vacío al frontend. Se usa para linkear a la ficha de Google: horarios, teléfono y cómo llegar no los tenemos ni los queremos tener, y linkear devuelve tráfico a la fuente de los datos.
+
+### ✅ Benchmark re-corrido tras los cambios de ranking
+Esta sesión tocó código que alimenta el ranking (`variantes_de_concepto()` dejó de devolver duplicados, y esa lista es la que cuenta `evidencia` en `relevancia()`), así que se corrió el golden dataset completo antes de deployar en vez de razonar que "no debería afectar":
+
+    22/22 PASARON (0 sin curar) | Recall@5=0.83 | Precision@5=0.84 | MRR=0.97 | Intent Accuracy=1.00
+
+Contra la línea del 26-ago (`Recall 0.86 | Precision 0.80`): **sin regresión**. Pasan los 22 casos, MRR e Intent Accuracy quedan idénticos, y recall/precisión se movieron dentro de la variación entre corridas que ya estaba documentada — de hecho `0.83 / 0.84` coincide exacto con una corrida de v1 registrada más arriba. No se afirma que el retrieval "mejoró": los arreglos de esta sesión fueron sobre lo que el usuario **lee** (el detalle, el orden de reseñas, la frase destacada), no sobre qué lugares se recuperan.
+
+**Nota operativa:** en Windows hace falta `PYTHONIOENCODING=utf-8` para correrlo redirigiendo la salida a un archivo. Sin eso revienta con `UnicodeEncodeError` porque la consola queda en cp1252 y el script imprime emojis.
+
+### 🎨 Frontend (repo `que-morfamos-web`, resumen)
+Sesión larga de producto. Lo relevante para el backend: nada rompe compatibilidad, y el frontend **degrada bien** si el backend no entiende `solo_base` (funciona como antes, sin la mejora). Lo demás: bienvenida rehecha como una escena de chat de grupo que se escribe sola (nombres y pedidos rotativos, con pedidos incompatibles que no pueden convivir), paleta de azul navy a ciruela oscuro para que acompañe al cartel de neón, hover del mapa al estilo Airbnb (destaca el pin, no mueve la cámara), rating en los marcadores, minimapa y link a Maps en el detalle, y fondo rehecho (el slideshow tenía un hueco negro de 10s por ciclo porque el CSS definía 5 turnos para 4 imágenes).
+
+---
+
+### 📝 ESTADO PENDIENTE CONSOLIDADO (al cierre del 28-ago-2026)
+
+**Estado del sistema:** el motor de búsqueda está sano — `22/22 | Recall@5=0.83 | Precision@5=0.84 | MRR=0.97 | Intent Accuracy=1.00`, **medido el 28-ago sobre el código actual** con `AI_PROVIDER=openai-mini`, que es la configuración que efectivamente sirve producción. Lo que queda son mayormente problemas de **calidad de datos**, que ningún fix de código puede compensar.
 
 #### 🔴 Alta prioridad
 
@@ -490,23 +604,32 @@ No afecta sólo a las cards: el código **ya cachea** la búsqueda vectorial (`v
    - **Segunda vía, independiente:** v1 gana porque rankea mejor por *fuerza* de evidencia. Se podría dar esa señal explícitamente en vez de esperar que el embedding la infiera — ej. guardar por lugar cuántas reseñas respaldan cada característica (un JSONB `features_evidencia`) y usarlo en el ranking. Eso desacoplaría "qué features tiene" de "qué tan bien lo redactó el LLM".
    - **Criterio de aceptación:** correr el benchmark con `RESUMEN_COLUMN=resumen_reviews_v2` y `COLLECTION_NAME=reviews_embeddings_v2` y **superar** la línea de v1 (`22/22 | Recall 0.83 | Precision 0.84 | MRR 0.97`). Si no la supera, no promover.
 
-2. **Sin revalidación de locales cerrados.** "Cuchí" cerró hace ~1 año y sigue en la base; el bot puede recomendarlo. El scraper sólo detecta "permanently closed" en el scrapeo inicial (`enrichment-validator.py`), nunca revalida lo ya cargado.
+2. **Locales cerrados: hay detector, falta el tratamiento.** *(actualizado 28-ago)* "Cuchí" ya se eliminó (con backup) y el scraper ahora detecta fichas muertas de Google y avisa por Discord — ver la sección del 28-ago. Lo que falta es qué hacer con ellas:
+   - **Nunca borrar en duro.** Google se equivoca en las dos direcciones (marcaba a Cuchí como "temporalmente" cerrado cuando en realidad el local ya no existe) y además fusiona/reemplaza fichas. Un falso positivo que borra 315 reseñas no se deshace.
+   - **Diseño acordado con el usuario:** dos columnas en `lugares` (`cerrado_at TIMESTAMPTZ`, `cerrado_tipo TEXT`) y el backend filtrando `WHERE cerrado_at IS NULL` al cargar `df_lugares` — una línea, y el lugar desaparece del bot sin destruir nada. Con dos salvaguardas: exigir la detección en **dos corridas semanales seguidas** antes de marcar (una falla de carga no puede matar un lugar vivo) y avisar por Discord para confirmación humana. Los embeddings sí se pueden borrar al confirmar, porque se regeneran.
+   - **Pendiente inmediato:** los 10 lugares que ya tienen la URL muerta necesitan revalidación manual (buscar por nombre y dirección) para distinguir "cerró" de "Google le cambió la ficha".
 
 #### 🟡 Media prioridad (bugs de código, acotados)
 
 3. **`exactos = locales_verificados[:3]`** (`main.py`, en `procesar_consulta_gen`) toma los 3 primeros aprobados por el Juez **en orden de lista, no por relevancia**. Se mitigó indirectamente mejorando el orden de `grupo_alta`, pero la causa sigue: si el Juez es permisivo, un lugar popular pero tangencial le gana el lugar a uno más específico. Confirmado con experimento controlado que es **preexistente**, no introducido por los fixes de esta sesión. Fix candidato: ordenar `locales_verificados` por alguna señal de calidad/especificidad antes de cortar a 3.
 
-4. **Extracción de keywords en queries de queja.** Para `"la milanesa que comí ayer estaba una mierda, recomendame otra parrilla buena"` el router extrae "milanesa" como keyword pese a que el usuario se queja de eso y pide otra cosa. Quedó tapado por el fix de categorías, nunca resuelto de fondo.
+4. **El orden de "sin tacc" no aplica la clave de relevancia.** *(nuevo, 28-ago — síntoma medido, causa SIN confirmar)* Buscando "sin tacc" sale Antares (4.2★/5027) primera y Lucciana Pastelería Sin Gluten (4.7★/60) tercera. Calculando la clave a mano debería ser al revés: Lucciana tiene evidencia 3 y Antares 1. El docstring de `relevancia()` usa **ese mismo caso** como ejemplo de lo que arregla. Sospecha: `usa_match_count` queda en `False` cuando `es_query_generica` es `True`, y ahí `grupo_alta` se ordena por `calc_score` (popularidad pura). No se llegó a confirmar.
+
+5. **El ranking no distingue el TIPO de local ni la ocasión.** *(nuevo, 28-ago)* Medido sobre la base: **78 lugares** son delivery/takeout (no son lugares para ir) y **285** son panadería, heladería, café o postres — casi el **39% de la base** no es un lugar para ir a comer un plato. `categoria` tiene 99.5% de cobertura, así que la señal existe. **No corresponde filtrarlos**: una panadería es la respuesta correcta para "dónde desayunar" y una heladería para "postres veganos". El problema es cuando la categoría **no coincide con lo que la consulta pide** (Lucciana es perfecta para "torta sin TACC" y equivocada para "almorzar sin TACC"). Fix candidato: un eslabón más en la cascada — `concepto > evidencia > coincidencia de ocasión > popularidad` — infiriendo de la consulta qué tipo de salida es. Delivery-only es el único caso tratable casi como regla global, con la salvedad de que "Takeout Restaurant" en Google a veces sólo significa que el lugar destaca el takeaway.
+
+6. **Extracción de keywords en queries de queja.** Para `"la milanesa que comí ayer estaba una mierda, recomendame otra parrilla buena"` el router extrae "milanesa" como keyword pese a que el usuario se queja de eso y pide otra cosa. Quedó tapado por el fix de categorías, nunca resuelto de fondo.
 
 #### 🔵 Baja prioridad / housekeeping
 
-5. **`DEEPSEEK_MODEL` por defecto apunta a un ID viejo:** `deepseek-chat` ya no figura en el catálogo de DeepSeek (ahora `deepseek-v4-flash`/`v4-pro`). Sólo importa si se vuelve a ese proveedor; el default está en `main.py` y es overrideable por env.
+7. **`DEEPSEEK_MODEL` por defecto apunta a un ID viejo:** `deepseek-chat` ya no figura en el catálogo de DeepSeek (ahora `deepseek-v4-flash`/`v4-pro`). Sólo importa si se vuelve a ese proveedor; el default está en `main.py` y es overrideable por env.
 
-6. **LangSmith desactualizado.** No se corrió `run_langsmith_eval.py` desde los cambios del 25/26-ago, así que el historial trackeado no refleja el 22/22 actual ni el cambio de proveedor. Correrlo deja la comparación "antes/después" registrada.
+8. **LangSmith desactualizado.** No se corrió `run_langsmith_eval.py` desde los cambios del 25/26-ago, así que el historial trackeado no refleja el 22/22 actual ni el cambio de proveedor. Correrlo deja la comparación "antes/después" registrada.
 
-7. **Minar `query_logs` para ampliar el golden dataset.** La tabla y el logging están activos en producción desde el 24-ago pero no se usaron todavía. Esperar a que se acumulen queries reales y revisarlas para sumar casos nuevos (o más realistas). Sin fecha ni umbral definido: "volver en unas semanas".
+9. **Minar `query_logs` para ampliar el golden dataset.** La tabla y el logging están activos en producción desde el 24-ago pero no se usaron todavía. Esperar a que se acumulen queries reales y revisarlas para sumar casos nuevos (o más realistas). Sin fecha ni umbral definido: "volver en unas semanas".
 
-8. **Tab de LangSmith en el dashboard (`que-morfamos-dashboard`).** Evaluado y pospuesto: por ahora alcanza con la UI propia de LangSmith (`smith.langchain.com`, proyecto `que-morfamos`, dataset `que-morfamos-golden` → Experiments). Retomar sólo si se quiere todo centralizado en el portfolio.
+10. **Tab de LangSmith en el dashboard (`que-morfamos-dashboard`).** Evaluado y pospuesto: por ahora alcanza con la UI propia de LangSmith (`smith.langchain.com`, proyecto `que-morfamos`, dataset `que-morfamos-golden` → Experiments). Retomar sólo si se quiere todo centralizado en el portfolio.
+
+11. **Housekeeping del repo.** *(nuevo, 28-ago)* `__pycache__/main.cpython-314.pyc` está **trackeado** en git y ensucia cada diff. Y `backups/` (con el respaldo de Cuchí, que contiene reseñas de usuarios) debería ir al `.gitignore`. En `que-morfamos-scraper`, `procesar_restaurante()` en `opiniones-scraper.py` (~230 líneas) es código muerto.
 
 #### ⚠️ Nota operativa sobre costos
 Producción corre sobre OpenAI con saldo acotado (~$4 al 26-ago). `AI_PROVIDER=openai-mini` (gpt-4o-mini para ambos LLMs) rinde ~1200 consultas; `openai` (mini + gpt-4o) rinde ~70. No cambiar a `openai` sin recargar saldo. Ver la comparación de proveedores más arriba para las alternativas evaluadas y por qué se descartaron.
