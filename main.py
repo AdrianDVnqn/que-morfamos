@@ -3697,8 +3697,16 @@ async def health_check(full: bool = False):
 
 @app.get("/restaurant/{nombre}", response_model=RestaurantDetail)
 async def get_restaurant_detail(
-    nombre: str, topic: Optional[str] = None, tone: Optional[str] = None
+    nombre: str, topic: Optional[str] = None, tone: Optional[str] = None,
+    solo_base: int = 0,
 ):
+    """Detalle de un lugar. Con `solo_base=1` devuelve todo MENOS el análisis del LLM.
+
+    Medido en este mismo endpoint: metadata 0.31s, reseñas 1.13s, análisis del LLM 4.49s. O sea
+    que el 72% de la espera es una sola parte, y el resto está listo a 1.4s. El frontend pide las
+    dos cosas en paralelo: pinta la tarjeta con reseñas apenas llega la base y deja el esqueleto
+    sólo en el bloque del resumen, en vez de tener al usuario 6 segundos frente a una tarjeta
+    vacía."""
     global df_lugares, llm_mini
     t_start = time.time()
     if not nombre:
@@ -3706,7 +3714,10 @@ async def get_restaurant_detail(
 
     # === CHECK FULL-RESPONSE CACHE ===
     tone = sanitize_tone(tone)
-    full_cache_key = f"detail_full_{nombre}_{topic}_{tone}"
+    # La base no depende del tono (el tono solo afecta al texto que escribe el LLM), asi que su
+    # clave lo omite y un mismo lugar la reusa entre los tres tonos.
+    full_cache_key = (f"detail_base_{nombre}_{topic}" if solo_base
+                      else f"detail_full_{nombre}_{topic}_{tone}")
     cached_full = await cache.get_json("detail_full_v3", full_cache_key)
     if cached_full:
         print(f"[DETAIL] {nombre} | CACHE HIT | {time.time() - t_start:.2f}s", flush=True)
@@ -3757,6 +3768,30 @@ async def get_restaurant_detail(
                     )
                 )
     print(f"[DETAIL] {nombre_real} | Reviews fetch+rank: {time.time() - t1:.2f}s ({len(reviews_list)} reviews)", flush=True)
+
+    if solo_base:
+        base = RestaurantDetail(
+            nombre=nombre_real,
+            rating=safe_float(row.get("rating_gral")),
+            total_reviews=safe_int(row.get("total_reviews_google")),
+            direccion=safe_str(row.get("direccion")),
+            barrio=safe_str(row.get("barrio")),
+            zona=safe_str(row.get("zona")),
+            lat=safe_float(row.get("latitud")),
+            lng=safe_float(row.get("longitud")),
+            # Se devuelven vacios a proposito: el frontend distingue "todavia no llego" de "no
+            # hay" por el pedido que sigue en vuelo, no por estos campos.
+            resumen_general="",
+            aspectos_positivos=[],
+            aspectos_negativos=[],
+            reviews=reviews_list,
+        )
+        try:
+            asyncio.create_task(cache.set_json("detail_full_v3", full_cache_key, base.model_dump()))
+        except Exception:
+            pass
+        print(f"[DETAIL] {nombre_real} | BASE (sin LLM): {time.time() - t_start:.2f}s", flush=True)
+        return base
 
     cache_key = f"{nombre_real}_{topic}_{tone}" if topic and topic not in ["undefined", "null"] else f"{nombre_real}__{tone}"
     analisis = await cache.get_json("detail_topic_v3", cache_key)
