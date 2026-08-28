@@ -3477,6 +3477,44 @@ def read_root():
     return {"status": "online", "message": "API OK v6.8"}
 
 
+def _uso_memoria():
+    """Uso de memoria del proceso y limite del contenedor, sin dependencias externas.
+
+    Se lee de /proc y de los cgroups (Linux, que es donde corre Fly). En otros sistemas devuelve
+    lo que pueda. Sirve para dimensionar la VM: si el RSS real es holgadamente menor al limite,
+    se puede bajar la RAM asignada y con eso el costo de tener la maquina encendida 24/7.
+    """
+    datos = {}
+    try:
+        with open("/proc/self/status") as f:
+            for linea in f:
+                if linea.startswith("VmRSS:"):
+                    datos["rss_mb"] = round(int(linea.split()[1]) / 1024, 1)
+                    break
+    except Exception:
+        pass
+
+    # Limite del contenedor: cgroup v2 primero, v1 como fallback.
+    for ruta in ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"):
+        try:
+            with open(ruta) as f:
+                crudo = f.read().strip()
+            if crudo and crudo != "max":
+                limite = int(crudo)
+                # cgroup v1 reporta un numero gigante cuando no hay limite real
+                if limite < 64 * 1024**3:
+                    datos["limite_mb"] = round(limite / 1024**2, 1)
+            break
+        except Exception:
+            continue
+
+    if "rss_mb" in datos and "limite_mb" in datos:
+        datos["uso_pct"] = round(datos["rss_mb"] / datos["limite_mb"] * 100, 1)
+    if not datos:
+        datos["detalle"] = "no disponible en este sistema (se lee de /proc, Linux)"
+    return datos
+
+
 @app.get("/health")
 async def health_check():
     last_scraping = None
@@ -3506,6 +3544,7 @@ async def health_check():
         "lugares": len(df_lugares) if df_lugares is not None else 0,
         "reviews": "LAZY_MODE",
         "cache": {"ok": cache_ok, "detalle": cache_detalle, **cache.estado()},
+        "memoria": _uso_memoria(),
     }
 
 
