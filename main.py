@@ -135,6 +135,40 @@ def expandir_sinonimos(keywords, synonyms):
     return resultado
 
 
+def _cita_con_evidencia(texto, terminos, largo=200):
+    """Recorta la reseña a `largo` caracteres dejando VISIBLE la mención que la hizo calificar.
+
+    Antes se cortaba con texto[:200] a secas. Una reseña podia entrar como cita destacada por
+    decir "las medialunas veganas tambien" en el caracter 139 y mostrarse recortada justo antes,
+    asi que el usuario leia una frase que no tenia nada que ver con lo que habia buscado y no
+    habia forma de saber por que estaba ahi.
+    """
+    texto = safe_str(texto).strip()
+    if len(texto) <= largo:
+        return texto
+
+    bajo = texto.lower()
+    # .lower() y no _normalizar_busqueda(): esa funcion saca los acentos, asi que buscar su
+    # resultado dentro de un texto que SI los tiene falla justo en las palabras con tilde. Ademas
+    # es la misma comparacion que usa _mencion_positiva para elegir la resena, y las dos tienen
+    # que coincidir o la ventana se abre en el lugar equivocado.
+    posiciones = [bajo.find(safe_str(t).lower().strip()) for t in (terminos or [])]
+    posiciones = [p for p in posiciones if p >= 0]
+    pos = min(posiciones) if posiciones else 0
+
+    # Si la mención ya entra en el recorte de siempre, se deja el arranque natural de la reseña.
+    if pos < largo * 0.7:
+        return texto[:largo].rstrip() + "..."
+
+    # Si no, se abre una ventana alrededor. Se busca hacia atrás el final de la oración anterior
+    # para no arrancar en mitad de una palabra.
+    inicio = max(0, pos - largo // 3)
+    corte = texto.rfind(". ", inicio, pos)
+    inicio = corte + 2 if corte != -1 else texto.find(" ", inicio) + 1
+    fragmento = texto[inicio:inicio + largo].rstrip()
+    return ("..." if inicio > 0 else "") + fragmento + "..."
+
+
 def _mencion_positiva(texto, termino, ventana=70):
     """True si `termino` aparece en `texto` sin una negación cercana hacia atrás
     (ej. "no cuenta con pelotero" no cuenta como mención positiva de "pelotero").
@@ -1534,14 +1568,36 @@ async def obtener_restaurant_cards(
     if not search_terms and query_context:
         search_terms.add(query_context.lower())
 
-    final_search_terms = [k for k in search_terms if len(k) > 3]
+    # Los términos van ORDENADOS y sin palabras-contenedor, no en el orden de iteración del set.
+    # `_fetch_reviews_sync` se queda con los primeros 6, así que el orden decide cuáles se usan
+    # de verdad. Con un set, ese recorte era distinto en cada corrida (verificado: tres corridas
+    # seguidas dieron tres subconjuntos distintos), y a veces entraba "opciones" —que matchea
+    # cualquier reseña— dejando afuera "vegano". De ahí salían citas destacadas fuera de tema y
+    # que además cambiaban entre requests.
+    # Prioridad: primero lo que el usuario escribió, después los sinónimos que agregamos nosotros.
+    def _ordenar_terminos(*grupos):
+        vistos, ordenados = set(), []
+        for grupo in grupos:
+            for t in (grupo or []):
+                t = safe_str(t).lower().strip()
+                if len(t) <= 3 or t in vistos or t in KEYWORDS_GENERICAS:
+                    continue
+                vistos.add(t)
+                ordenados.append(t)
+        return ordenados
+
+    final_search_terms = _ordenar_terminos(keywords_list, synonyms_list)
+    if not final_search_terms and query_context:
+        final_search_terms = _ordenar_terminos([query_context])
 
     # 1.5 Fetch real reviews para usarlos como cita destacada en las cards
     # Se priorizan las reseñas que mencionan lo que el usuario busco: la frase destacada de la
     # tarjeta muestra evidencia real del pedido ("el pelotero es hermoso") en vez de un comentario
     # cualquiera. Sin coincidencias, caen las mas recientes, que es el comportamiento de siempre.
     real_reviews_df = await obtener_reviews_por_local(
-        nombres_restaurantes, limit_per_local=3, terminos=final_search_terms
+        # 6 y no 3: la cita tiene que hablar del tema y no estar negada, asi que con tres
+        # candidatas se quedaban muchos lugares sin ninguna que sirviera.
+        nombres_restaurantes, limit_per_local=6, terminos=final_search_terms
     )
 
     card_items = []
@@ -1564,19 +1620,46 @@ async def obtener_restaurant_cards(
         
         if not real_reviews_df.empty and nombre_real in real_reviews_df.index:
             rest_reviews = real_reviews_df.loc[[nombre_real]]
-            if not rest_reviews.empty:
-                for _, rv in rest_reviews.iterrows():
-                    if len(str(rv.get("texto", ""))) > 20:
-                        real_review_text = str(rv["texto"])
-                        real_review_autor = formatear_autor(str(rv.get("autor", "Google Reviews")))
-                        break
-                        
+            # Se elige la cita que MEJOR respalda la recomendación, no la primera que aparezca.
+            # Antes se agarraba la primera fila con más de 20 caracteres, sin chequear nada: si
+            # el lugar no tenía ninguna reseña del tema, terminaba de "evidencia" un comentario
+            # cualquiera — en una búsqueda vegana, Ohana citaba "La carta estaba desactualizada,
+            # no tenían varios ingredientes".
+            mejor = None
+            for _, rv in rest_reviews.iterrows():
+                texto_rv = str(rv.get("texto", ""))
+                if len(texto_rv) <= 20:
+                    continue
+                if not final_search_terms:
+                    mejor = (0, texto_rv, rv)
+                    break
+                # _mencion_positiva descarta las menciones negadas: "lo único malo es que NO
+                # tienen parrillas" contiene el término pero es lo contrario de una evidencia.
+                positivos = [t for t in final_search_terms if _mencion_positiva(texto_rv, t)]
+                if not positivos:
+                    continue
+                # A más términos distintos mencionados, mejor cita: en "parrilla con pelotero",
+                # una reseña que habla de los dos dice mucho más que una que sólo dice "parrilla",
+                # palabra que aparece en casi cualquier reseña de una parrilla.
+                if mejor is None or len(positivos) > mejor[0]:
+                    mejor = (len(positivos), texto_rv, rv)
+
+            if mejor:
+                real_review_text = mejor[1]
+                real_review_autor = formatear_autor(str(mejor[2].get("autor", "Google Reviews")))
+
         if real_review_text:
-            frase = f'"{real_review_text[:200]}..."'
+            frase = f'"{_cita_con_evidencia(real_review_text, final_search_terms)}"'
             autor = real_review_autor
         else:
-            frase = resumen[:200] + "..." if resumen else sample_text
-            autor = "Google Reviews"
+            # Sin reseña real del tema no se muestra cita. El fallback anterior ponía
+            # resumen_reviews —texto generado por un modelo— entre comillas y firmado
+            # "— Google Reviews", y el frontend lo renderiza en itálica con la atribución: un
+            # texto que no escribió nadie aparecía como el testimonio de un cliente. La tarjeta
+            # ya tiene `descripcion` para contar de qué va el lugar; el bloque de cita se omite
+            # solo cuando frase_destacada viene vacía.
+            frase = ""
+            autor = ""
 
         # 3. Preparación para CACHE GET
         topic_key = "-".join(sorted(list(search_terms))) if search_terms else "general"
