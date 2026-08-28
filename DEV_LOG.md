@@ -657,6 +657,3 @@ Sesión larga de producto. Lo relevante para el backend: nada rompe compatibilid
 
 #### ⚠️ Nota operativa sobre costos
 Producción corre sobre OpenAI con saldo acotado (~$4 al 26-ago). `AI_PROVIDER=openai-mini` (gpt-4o-mini para ambos LLMs) rinde ~1200 consultas; `openai` (mini + gpt-4o) rinde ~70. No cambiar a `openai` sin recargar saldo. Ver la comparación de proveedores más arriba para las alternativas evaluadas y por qué se descartaron.
-
----
-*Bitácora actualizada por Antigravity Agent (v7.1).*
