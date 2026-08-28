@@ -107,7 +107,17 @@ def variantes_de_concepto(keyword):
     for concepto, extras in SINONIMOS_CURADOS.items():
         if _emparenta(keyword, concepto) or any(_emparenta(keyword, e) for e in extras):
             variantes.extend([concepto] + extras)
-    return variantes
+    # Sin duplicados. SINONIMOS_CURADOS es bidireccional a proposito ("vegano" lista
+    # "vegetariano" y "vegetariano" lista "vegano"), asi que ambas entradas matchean y la lista
+    # salia con repetidos: para "vegano" daba 11 terminos de los que solo 7 eran distintos, con
+    # "vegano" tres veces. Eso rompia las dos cosas que la usan:
+    #   - `evidencia` en el ranking suma 1 por termino, asi que una sola palabra valia triple: un
+    #     lugar que dice "vegano" sumaba 3 y uno que dice "plant based" sumaba 1, con la misma
+    #     cantidad de evidencia real.
+    #   - _fetch_reviews_sync se queda con los primeros 6 terminos, y los repetidos gastaban esos
+    #     lugares sin aportar nada.
+    # dict.fromkeys preserva el orden, que importa porque el corte en 6 es por posicion.
+    return list(dict.fromkeys(variantes))
 
 
 def expandir_sinonimos(keywords, synonyms):
