@@ -1172,9 +1172,27 @@ def formatear_autor(nombre):
 
 
 def fecha_a_orden(fecha_str):
-    fecha_str = safe_str(fecha_str).lower()
+    """Devuelve cuantas horas hace de la resena. Mas chico = mas reciente.
+
+    Esta funcion se escribio para las fechas relativas en espanol que scrapeaba Google ("hace 2
+    meses"), pero la base guarda fechas ISO desde hace rato. A una ISO le caian todos los `if` y
+    devolvia el 5000 del final, IGUAL para todas: el orden por fecha empataba siempre y no
+    ordenaba nada. Afectaba a las cuatro llamadas de rankear_reviews_por_topico, incluida la
+    frase destacada de las tarjetas.
+    """
+    fecha_str = safe_str(fecha_str).strip().lower()
     if not fecha_str:
         return 9999
+
+    iso = re.match(r"^(\d{4})-(\d{2})-(\d{2})", fecha_str)
+    if iso:
+        try:
+            d = datetime(int(iso.group(1)), int(iso.group(2)), int(iso.group(3)))
+            # max(0, ...) por si una resena viene fechada en el futuro por un desfasaje de zona.
+            return max(0, int((datetime.now() - d).total_seconds() // 3600))
+        except ValueError:
+            return 9999
+
     numeros = re.findall(r"\d+", fecha_str)
     num = int(numeros[0]) if numeros else 1
     if "hora" in fecha_str:
@@ -1380,7 +1398,16 @@ def get_keywords_from_topic(topic):
             stemmed_words.append(w[:-1])
         else:
             stemmed_words.append(w)
-    return stemmed_words
+    # Se descartan las palabras-contenedor (ver KEYWORDS_GENERICAS). "opciones veganas" dejaba
+    # las keywords ["opcion", "vegana"], y "opcion" matchea cualquier resena que diga "opciones
+    # de almuerzo" u "opciones sin gluten": resenas que no hablan del tema entraban al grupo
+    # relevante y se colaban arriba de las que si. Se compara la forma cruda y la stemizada
+    # porque el stemmer convierte "opciones" en "opcion" y ambas estan en el set.
+    utiles = [w for w, crudo in zip(stemmed_words, clean_words)
+              if w not in KEYWORDS_GENERICAS and crudo not in KEYWORDS_GENERICAS]
+    # Si la consulta era toda palabras genericas ("lugares para comer") no queda nada, y quien
+    # llama cae en su fallback por fecha, que es lo correcto: no hay tema del que hablar.
+    return utiles
 
 
 def rankear_reviews_por_topico(df_reviews, topic=None):
@@ -1405,20 +1432,16 @@ def rankear_reviews_por_topico(df_reviews, topic=None):
         return df_local.sort_values("orden_fecha")
 
     def calcular_relevancia(row):
+        """Relevancia BINARIA: la resena habla del tema o no habla del tema.
+
+        Antes sumaba 100 por cada keyword que matcheara y despues +50 si el rating era alto o -20
+        si era bajo. Con eso la fecha casi nunca llegaba a decidir: entre dos resenas que hablan
+        del tema, ganaba la de mejor puntaje, no la mas reciente. Y el bonus por rating ademas
+        empujaba las quejas hacia abajo, que en una app de resenas es justo lo que no se quiere.
+        Ahora relevancia elige QUE resenas, y la fecha decide EN QUE ORDEN.
+        """
         texto = safe_str(row.get("texto")).lower()
-        rating = row.get("rating_user", 0)
-        score = 0
-        match_found = False
-        for k in keywords:
-            if k in texto:
-                score += 100
-                match_found = True
-        if match_found:
-            if rating >= 4:
-                score += 50
-            elif rating <= 2:
-                score -= 20
-        return score
+        return 100 if any(k in texto for k in keywords) else 0
 
     df_local["score_topic"] = df_local.apply(calcular_relevancia, axis=1)
     if df_local["score_topic"].max() == 0:
@@ -3577,7 +3600,7 @@ async def get_restaurant_detail(
     # === CHECK FULL-RESPONSE CACHE ===
     tone = sanitize_tone(tone)
     full_cache_key = f"detail_full_{nombre}_{topic}_{tone}"
-    cached_full = await cache.get_json("detail_full_v2", full_cache_key)
+    cached_full = await cache.get_json("detail_full_v3", full_cache_key)
     if cached_full:
         print(f"[DETAIL] {nombre} | CACHE HIT | {time.time() - t_start:.2f}s", flush=True)
         return RestaurantDetail(**cached_full)
@@ -3629,7 +3652,7 @@ async def get_restaurant_detail(
     print(f"[DETAIL] {nombre_real} | Reviews fetch+rank: {time.time() - t1:.2f}s ({len(reviews_list)} reviews)", flush=True)
 
     cache_key = f"{nombre_real}_{topic}_{tone}" if topic and topic not in ["undefined", "null"] else f"{nombre_real}__{tone}"
-    analisis = await cache.get_json("detail_topic_v2", cache_key)
+    analisis = await cache.get_json("detail_topic_v3", cache_key)
     if analisis:
         print(f"[DETAIL] {nombre_real} | Analysis CACHE HIT", flush=True)
     else:
@@ -3668,7 +3691,7 @@ async def get_restaurant_detail(
                 res = await llm_mini.ainvoke(prompt_txt)
                 clean = res.content.strip().replace("```json", "").replace("```", "")
                 analisis = json.loads(clean)
-                asyncio.create_task(cache.set_json("detail_topic_v2", cache_key, analisis))
+                asyncio.create_task(cache.set_json("detail_topic_v3", cache_key, analisis))
             except:
                 analisis = {
                     "resumen": "Info no disponible momentáneamente.",
@@ -3694,7 +3717,7 @@ async def get_restaurant_detail(
 
     # Cache full response (TTL managed by Redis/Upstash)
     try:
-        asyncio.create_task(cache.set_json("detail_full_v2", full_cache_key, result.model_dump()))
+        asyncio.create_task(cache.set_json("detail_full_v3", full_cache_key, result.model_dump()))
     except:
         pass  # Don't fail the request if caching fails
 
