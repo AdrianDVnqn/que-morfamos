@@ -1625,28 +1625,42 @@ async def obtener_restaurant_cards(
             # el lugar no tenía ninguna reseña del tema, terminaba de "evidencia" un comentario
             # cualquiera — en una búsqueda vegana, Ohana citaba "La carta estaba desactualizada,
             # no tenían varios ingredientes".
-            mejor = None
+            # La cita es el ejemplar que ILUSTRA la recomendación, no una muestra al azar de las
+            # reseñas del lugar. Elegirla sin mirar la valencia no da una visión balanceada: da
+            # una muestra de tamaño 1 con signo aleatorio, y como todo lugar tiene reseñas malas,
+            # tampoco distingue un lugar bueno de uno malo. Un local de 4.1 con 3476 reseñas
+            # ilustrado con su peor comentario solo hace dudar del sistema entero.
+            # Lo negativo no se esconde: el detalle tiene "A mejorar" y la lista completa de
+            # reseñas, a un clic.
+            mejor = None  # (es_muy_buena, cuantos_terminos, texto, fila)
             for _, rv in rest_reviews.iterrows():
                 texto_rv = str(rv.get("texto", ""))
                 if len(texto_rv) <= 20:
                     continue
+                estrellas = safe_int(rv.get("rating_user"))
+                # 0 = sin dato, no se descarta. 1-2 estrellas es una queja: no sirve de titular.
+                if estrellas and estrellas <= 2:
+                    continue
                 if not final_search_terms:
-                    mejor = (0, texto_rv, rv)
+                    mejor = (0, 0, texto_rv, rv)
                     break
                 # _mencion_positiva descarta las menciones negadas: "lo único malo es que NO
                 # tienen parrillas" contiene el término pero es lo contrario de una evidencia.
                 positivos = [t for t in final_search_terms if _mencion_positiva(texto_rv, t)]
                 if not positivos:
                     continue
-                # A más términos distintos mencionados, mejor cita: en "parrilla con pelotero",
-                # una reseña que habla de los dos dice mucho más que una que sólo dice "parrilla",
-                # palabra que aparece en casi cualquier reseña de una parrilla.
-                if mejor is None or len(positivos) > mejor[0]:
-                    mejor = (len(positivos), texto_rv, rv)
+                # Primero las de 4-5 estrellas; después, a más términos distintos mencionados,
+                # mejor cita: en "parrilla con pelotero", una reseña que habla de los dos dice
+                # mucho más que una que sólo dice "parrilla", palabra que está en casi todas.
+                candidato = (1 if estrellas >= 4 else 0, len(positivos), texto_rv, rv)
+                # Estrictamente mayor: ante un empate gana la primera, y la consulta ya las trae
+                # ordenadas por relevancia y fecha.
+                if mejor is None or candidato[:2] > mejor[:2]:
+                    mejor = candidato
 
             if mejor:
-                real_review_text = mejor[1]
-                real_review_autor = formatear_autor(str(mejor[2].get("autor", "Google Reviews")))
+                real_review_text = mejor[2]
+                real_review_autor = formatear_autor(str(mejor[3].get("autor", "Google Reviews")))
 
         if real_review_text:
             frase = f'"{_cita_con_evidencia(real_review_text, final_search_terms)}"'
