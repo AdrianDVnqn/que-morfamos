@@ -502,7 +502,7 @@ async def lifespan(app: FastAPI):
             logger.info(f"📄 Columna de resúmenes: {col_resumen}")
             query_lugares = f"""
                 SELECT nombre as restaurante, rating_gral, total_reviews_google, direccion,
-                       latitud, longitud, barrio, zona, categoria,
+                       latitud, longitud, barrio, zona, categoria, url,
                        {col_resumen} as resumen_reviews
                 FROM lugares
             """
@@ -808,6 +808,9 @@ class RestaurantDetail(BaseModel):
     categoria: str = ""
     lat: float = 0
     lng: float = 0
+    # Ficha del lugar en Google Maps. Se expone para que el frontend pueda mandar al usuario a
+    # ver horarios, telefono y como llegar — cosas que nosotros no tenemos y no queremos tener.
+    url: str = ""
     resumen_general: str
     aspectos_positivos: List[str] = []
     aspectos_negativos: List[str] = []
@@ -3716,9 +3719,9 @@ async def get_restaurant_detail(
     tone = sanitize_tone(tone)
     # La base no depende del tono (el tono solo afecta al texto que escribe el LLM), asi que su
     # clave lo omite y un mismo lugar la reusa entre los tres tonos.
-    full_cache_key = (f"detail_base_{nombre}_{topic}" if solo_base
+    full_cache_key = (f"detail_base_v2_{nombre}_{topic}" if solo_base
                       else f"detail_full_{nombre}_{topic}_{tone}")
-    cached_full = await cache.get_json("detail_full_v3", full_cache_key)
+    cached_full = await cache.get_json("detail_full_v4", full_cache_key)
     if cached_full:
         print(f"[DETAIL] {nombre} | CACHE HIT | {time.time() - t_start:.2f}s", flush=True)
         return RestaurantDetail(**cached_full)
@@ -3779,6 +3782,7 @@ async def get_restaurant_detail(
             zona=safe_str(row.get("zona")),
             lat=safe_float(row.get("latitud")),
             lng=safe_float(row.get("longitud")),
+            url=safe_str(row.get("url")),
             # Se devuelven vacios a proposito: el frontend distingue "todavia no llego" de "no
             # hay" por el pedido que sigue en vuelo, no por estos campos.
             resumen_general="",
@@ -3787,14 +3791,14 @@ async def get_restaurant_detail(
             reviews=reviews_list,
         )
         try:
-            asyncio.create_task(cache.set_json("detail_full_v3", full_cache_key, base.model_dump()))
+            asyncio.create_task(cache.set_json("detail_full_v4", full_cache_key, base.model_dump()))
         except Exception:
             pass
         print(f"[DETAIL] {nombre_real} | BASE (sin LLM): {time.time() - t_start:.2f}s", flush=True)
         return base
 
     cache_key = f"{nombre_real}_{topic}_{tone}" if topic and topic not in ["undefined", "null"] else f"{nombre_real}__{tone}"
-    analisis = await cache.get_json("detail_topic_v3", cache_key)
+    analisis = await cache.get_json("detail_topic_v4", cache_key)
     if analisis:
         print(f"[DETAIL] {nombre_real} | Analysis CACHE HIT", flush=True)
     else:
@@ -3833,7 +3837,7 @@ async def get_restaurant_detail(
                 res = await llm_mini.ainvoke(prompt_txt)
                 clean = res.content.strip().replace("```json", "").replace("```", "")
                 analisis = json.loads(clean)
-                asyncio.create_task(cache.set_json("detail_topic_v3", cache_key, analisis))
+                asyncio.create_task(cache.set_json("detail_topic_v4", cache_key, analisis))
             except:
                 analisis = {
                     "resumen": "Info no disponible momentáneamente.",
@@ -3851,6 +3855,7 @@ async def get_restaurant_detail(
         zona=safe_str(row.get("zona")),
         lat=safe_float(row.get("latitud")),
         lng=safe_float(row.get("longitud")),
+        url=safe_str(row.get("url")),
         resumen_general=safe_str(analisis.get("resumen")),
         aspectos_positivos=analisis.get("positivos", []),
         aspectos_negativos=analisis.get("negativos", []),
@@ -3859,7 +3864,7 @@ async def get_restaurant_detail(
 
     # Cache full response (TTL managed by Redis/Upstash)
     try:
-        asyncio.create_task(cache.set_json("detail_full_v3", full_cache_key, result.model_dump()))
+        asyncio.create_task(cache.set_json("detail_full_v4", full_cache_key, result.model_dump()))
     except:
         pass  # Don't fail the request if caching fails
 
