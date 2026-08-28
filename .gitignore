@@ -19,3 +19,10 @@ Thumbs.db
 
 # Notas locales, no se suben al repo
 LANGSMITH_GUIDE.md
+
+# Backups de datos (contienen reseñas de usuarios, no van al repo publico)
+backups/
+
+# Scratch local y config del agente
+temp.txt
+.claude/
