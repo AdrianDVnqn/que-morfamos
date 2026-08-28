@@ -3516,7 +3516,24 @@ def _uso_memoria():
 
 
 @app.get("/health")
-async def health_check():
+async def health_check(full: bool = False):
+    """Chequeo de salud.
+
+    Por defecto es BARATO: Fly lo llama cada 30s (ver fly.toml) y ademas se usa como ping para
+    mantener la maquina despierta, asi que no puede hacer trabajo real en cada llamada. Consultar
+    la base y pingear Redis en cada health check eran ~2.880 consultas por dia sin ningun uso.
+
+    Con ?full=1 hace los chequeos completos (fecha de scraping, ping real a Redis, memoria). Eso
+    es lo que hay que usar para diagnosticar.
+    """
+    if not full:
+        return {
+            "status": "healthy",
+            "version": SERVER_VERSION,
+            "backend_updated_at": SERVER_UPDATED_AT,
+            "lugares": len(df_lugares) if df_lugares is not None else 0,
+        }
+
     last_scraping = None
     if db_engine is not None:
         try:

@@ -1,0 +1,41 @@
+name: Mantener el backend despierto
+
+# El backend corre en Fly con min_machines_running=0: la maquina se apaga sola cuando no hay
+# trafico, y el primer visitante despues de eso paga el arranque completo (medido: 35-46s). Para
+# un portfolio eso es fatal — quien abre el link por primera vez se va antes de ver nada.
+#
+# En vez de dejarla encendida 24/7 (~US$5/mes), se la mantiene despierta solo en horario de uso
+# (10:00-22:00 Argentina), lo que sale la mitad. Fuera de ese horario se apaga y el costo baja.
+#
+# NOTA sobre la precision del cron de GitHub Actions: los horarios NO se respetan con exactitud,
+# las ejecuciones pueden demorarse 10-20 minutos cuando la plataforma esta cargada. Por eso el
+# ping corre cada 5 minutos y ademas cada ejecucion hace varios pings espaciados: asi un retraso
+# no deja dormir la maquina. Si hiciera falta mas fiabilidad, conviene un cron externo dedicado
+# (cron-job.org o UptimeRobot, ambos gratis) que si respeta el intervalo.
+
+on:
+  schedule:
+    # Cada 5 minutos entre las 13:00 y 01:00 UTC = 10:00 a 22:00 en Argentina (UTC-3).
+    - cron: "*/5 13-23 * * *"
+    - cron: "*/5 0-1 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: mantener-despierto
+  cancel-in-progress: true
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - name: Pingear el backend
+        run: |
+          URL="https://que-morfamos-api-black-paper-1056.fly.dev/health"
+          # Varios pings espaciados dentro de la misma ejecucion, para cubrir el caso de que la
+          # siguiente ejecucion del cron llegue tarde.
+          for i in 1 2 3 4 5; do
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 60 "$URL" || echo "000")
+            echo "ping $i -> HTTP $CODE"
+            if [ "$i" -lt 5 ]; then sleep 60; fi
+          done
