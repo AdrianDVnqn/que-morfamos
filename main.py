@@ -61,6 +61,57 @@ NEGATION_RE = re.compile(r"\b(no|ni|sin|carece|falta|ausencia)\b")
 FEATURES_CON_SIN = {"gluten", "tacc", "lactosa", "azucar", "alcohol", "conservantes", "sal"}
 
 
+# Ocasiones que exigen ESTAR en el lugar: no alcanza con que la comida sea buena, hay que poder
+# sentarse. Es una lista de marcadores de la consulta, deliberadamente conservadora — ante la
+# duda no se filtra nada, porque un falso filtro esconde lugares válidos y eso es peor que
+# mostrar uno de más.
+OCASIONES_PRESENCIALES = (
+    "cita", "citas", "romantic", "aniversario", "festejar", "cumpleanos", "cumpleaños",
+    "cenar", "cena", "almorzar", "salir a comer", "con amigos", "after office",
+    "sentarse", "ambiente", "para ir", "para quedarse", "tomar algo", "una salida",
+)
+
+# Categorías de Google que describen un local de SOLO MOSTRADOR. Deliberadamente NO incluye
+# panadería, cafetería, heladería ni pastelería: en Neuquén son lugares donde uno se sienta, y
+# además son la respuesta correcta para "dónde desayunar" o "postres veganos". Filtrarlas sería
+# el error opuesto y más caro.
+CATEGORIAS_SOLO_MOSTRADOR = (
+    "takeout", "delivery", "grocery store", "butcher shop", "poultry store",
+    "pasta shop", "chicken shop", "food stand", "market", "caterer",
+)
+
+
+def filtrar_no_presenciales(query, candidatos, df_lugares_ref):
+    """Saca los locales de sólo mostrador cuando la consulta pide un lugar donde ESTAR.
+
+    No es un filtro global: una panadería es la respuesta correcta para "dónde desayunar" y una
+    heladería para "postres veganos". El filtro corre únicamente si la consulta trae un marcador
+    de ocasión presencial (ver OCASIONES_PRESENCIALES).
+
+    Nunca deja la lista vacía: si filtrar se llevara todo, se devuelven los candidatos
+    originales. Mostrar algo imperfecto es mejor que responder "no encontré nada" por una regla
+    de categoría, sobre todo porque `categoria` es un dato de Google que a veces miente
+    ("Takeout Restaurant" a veces sólo significa que el lugar destaca el takeaway).
+    """
+    q = _normalizar_busqueda(query)
+    if not any(_contiene_palabra(q, m) or m in q for m in OCASIONES_PRESENCIALES):
+        return candidatos
+    if df_lugares_ref is None or df_lugares_ref.empty or "categoria" not in df_lugares_ref.columns:
+        return candidatos
+
+    def es_presencial(nombre):
+        if nombre not in df_lugares_ref.index:
+            return True
+        cat = _normalizar_busqueda(safe_str(df_lugares_ref.loc[nombre].get("categoria", "")))
+        return not any(c in cat for c in CATEGORIAS_SOLO_MOSTRADOR)
+
+    filtrados = [n for n in candidatos if es_presencial(n)]
+    if filtrados and len(filtrados) < len(candidatos):
+        print(f"[DEBUG] 🪑 Ocasión presencial: {len(candidatos) - len(filtrados)} locales de sólo "
+              f"mostrador descartados", flush=True)
+    return filtrados or candidatos
+
+
 def _contiene_palabra(texto, fragmento):
     """True si `fragmento` aparece en `texto` como palabra completa, no como pedazo de otra.
 
@@ -3457,6 +3508,11 @@ async def procesar_consulta_gen(
             # --- OPERACIONES PESADAS (OFFLOAD TO THREAD) ---
             # Filtro de zona, Hybrid Injection, Hard Filter y Ranking se hacen en un thread aparte.
             t_pesado_start = time.time()
+            # Una "fábrica de pastas" no sirve para una cita, por rica que sea la pasta: la
+            # consulta pide un LUGAR DONDE ESTAR, y ese local es sólo mostrador. Reportado con
+            # "lugares para citas" devolviendo SALUZZO Fábrica de Pastas (`Pasta shop`).
+            candidatos_crudos = filtrar_no_presenciales(query, candidatos_crudos, df_lugares)
+
             candidatos_a_verificar, grupo_alta_relevancia, candidatos_confiables = await asyncio.to_thread(
                 procesar_recomendacion_pesado,
                 candidatos_crudos,
