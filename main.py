@@ -2780,14 +2780,15 @@ def procesar_recomendacion_pesado(
 
     if es_query_generica:
         grupo_alta = candidatos_crudos
-        # Modo Generico NO descarta candidatos: todos vienen del filtro por categoria oficial, y
-        # por eso ninguno va a grupo_baja. Pero no descartar no es razon para no ORDENAR. Antes
-        # esto caia a `calc_score` (popularidad pura) y toda la cascada de conceptos quedaba sin
-        # usar justo en las consultas mas comunes: "opciones veganas", "mejores pizzas", "sin
-        # tacc". Es la causa del sintoma documentado como pendiente #8 (Antares 4.2/5027 primera
-        # y Lucciana Pasteleria Sin Gluten 4.7/60 tercera, cuando Lucciana tiene evidencia 3 y
-        # Antares 1).
-        usa_match_count = bool(filtro_terms)
+        # PROBADO Y REVERTIDO (01-sep): se intento `usa_match_count = bool(filtro_terms)` aca,
+        # para que Modo Generico ordenara por la cascada de conceptos en vez de por popularidad.
+        # El benchmark bajo de Recall 0.83 / Precision 0.84 a 0.78 / 0.79 (tres corridas previas
+        # dieron 0.83 de forma consistente, asi que no es ruido). Motivo probable: en Modo
+        # Generico la unica keyword suele ser la categoria misma ("pizza", "vegano"), asi que
+        # todos los candidatos empatan en `conceptos` y el desempate cae en `evidencia`, que
+        # premia resumenes verbosos — el mismo efecto ya medido para queries de un solo concepto
+        # (MRR 1.00 -> 0.33). Ordenar por popularidad aca es correcto hasta que se distingan los
+        # conceptos de requisito excluyente de los de tipo de comida (ver pendiente #11).
     elif filtro_terms and "resumen_reviews" in df_lugares_ref.columns:
         usa_match_count = True
         for local in candidatos_crudos:
