@@ -12,6 +12,7 @@ if sys.platform == "win32":
 import json
 import re
 import unicodedata
+import hashlib
 import asyncio
 import logging
 import math
@@ -741,7 +742,7 @@ from langchain_core.messages import BaseMessage
 # ==========================================
 # HELPER: STREAM BUFFER
 # ==========================================
-async def astream_buffer(llm, prompt, cache_key=None, cache_instance=None):
+async def astream_buffer(llm, prompt, cache_key=None, cache_instance=None, cache_ns="resumen_texto"):
     """
     Yields tokens from LLM stream and buffers the full response.
     Returns the full text at the end via a special event or just side-effect?
@@ -761,7 +762,10 @@ async def astream_buffer(llm, prompt, cache_key=None, cache_instance=None):
         yield token
 
     if cache_key and cache_instance:
-        asyncio.create_task(cache_instance.set_json("resumen_texto", cache_key, buffer))
+        # El namespace es parametro porque hay dos consumidores con claves de distinta forma:
+        # el resumen de un local y la respuesta de recomendacion. Escribir los dos en
+        # "resumen_texto" hacia que el segundo nunca acertara, porque lee de su propio namespace.
+        asyncio.create_task(cache_instance.set_json(cache_ns, cache_key, buffer))
 
 
 class DoubleSlashMiddleware(BaseHTTPMiddleware):
@@ -2551,6 +2555,17 @@ async def verificar_candidatos_con_llm(candidatos, df_lugares_ref, query, llm):
     }}
     """
 
+    # El Juez era la ultima llamada al LLM del camino critico que se pagaba en TODAS las
+    # consultas, incluso repitiendo una identica: medido, ~2.1s y su costo en cada request.
+    # Se cachea con el mismo criterio que la respuesta: la clave es el hash del prompt, que ya
+    # lleva adentro la query y la evidencia de los candidatos concretos. Si cambia cualquiera de
+    # las dos, cambia la clave sola.
+    clave_juez = hashlib.sha256(prompt.encode("utf-8")).hexdigest()[:32]
+    aprobados_cache = await cache.get_json("juez_v1", clave_juez)
+    if aprobados_cache is not None:
+        print(f"[TIMING] Juez LLM HIT (Redis cache): {len(aprobados_cache)} aprobados", flush=True)
+        return aprobados_cache
+
     try:
         res = await llm.ainvoke(prompt)
         clean = res.content.strip().replace("```json", "").replace("```", "")
@@ -2564,10 +2579,12 @@ async def verificar_candidatos_con_llm(candidatos, df_lugares_ref, query, llm):
             for local, razon in rechazados.items():
                 print(f"   - {local}: {razon}", flush=True)
 
+        asyncio.create_task(cache.set_json("juez_v1", clave_juez, aprobados))
         return aprobados
     except Exception as e:
         logger.error(f"Error Juez LLM: {e}")
-        # Fallback: Si falla el JSON, devolvemos todo (mejor pecar de exceso que de defecto)
+        # Fallback: Si falla el JSON, devolvemos todo. NO se cachea: seria fijar el resultado de
+        # un fallo transitorio (timeout, JSON mal formado) para todas las consultas siguientes.
         return candidatos
 
 
@@ -2763,6 +2780,14 @@ def procesar_recomendacion_pesado(
 
     if es_query_generica:
         grupo_alta = candidatos_crudos
+        # Modo Generico NO descarta candidatos: todos vienen del filtro por categoria oficial, y
+        # por eso ninguno va a grupo_baja. Pero no descartar no es razon para no ORDENAR. Antes
+        # esto caia a `calc_score` (popularidad pura) y toda la cascada de conceptos quedaba sin
+        # usar justo en las consultas mas comunes: "opciones veganas", "mejores pizzas", "sin
+        # tacc". Es la causa del sintoma documentado como pendiente #8 (Antares 4.2/5027 primera
+        # y Lucciana Pasteleria Sin Gluten 4.7/60 tercera, cuando Lucciana tiene evidencia 3 y
+        # Antares 1).
+        usa_match_count = bool(filtro_terms)
     elif filtro_terms and "resumen_reviews" in df_lugares_ref.columns:
         usa_match_count = True
         for local in candidatos_crudos:
@@ -3444,12 +3469,42 @@ async def procesar_consulta_gen(
                 flush=True,
             )
 
+            # CACHE DE LA RESPUESTA GENERADA
+            # Era la unica llamada al LLM del camino de recomendacion que se pagaba SIEMPRE. El
+            # router y la busqueda vectorial ya se cacheaban, asi que repetir la misma consulta
+            # bajaba de ~8.3s a ~4.9s pero seguia costando plata: medido contra produccion, dos
+            # corridas identicas devolvian las mismas cards y textos DISTINTOS (1991 vs 1966
+            # caracteres), o sea que se regeneraba entera cada vez.
+            # La clave es el hash del prompt y no la query: el prompt ya lleva adentro el tono,
+            # la consulta y los locales concretos, asi que si cambia cualquiera de esas cosas
+            # cambia la clave sola. Armar la clave a mano se olvidaria de alguna.
+            clave_respuesta = hashlib.sha256(prompt_rag.encode("utf-8")).hexdigest()[:32]
+            texto_cacheado = await cache.get_json("respuesta_rag_v1", clave_respuesta)
+
+            async def _tokens_respuesta():
+                if texto_cacheado:
+                    print("[TIMING] Respuesta RAG HIT (Redis cache)", flush=True)
+                    # Se trocea en vez de mandarla de una: el frontend la escribe como si se
+                    # estuviera tipeando, y un unico bloque gigante rompe esa animacion.
+                    for i in range(0, len(texto_cacheado), 24):
+                        yield texto_cacheado[i:i + 24]
+                        await asyncio.sleep(0)
+                    return
+                async for t in astream_buffer(
+                    llm_mini,
+                    prompt_rag,
+                    cache_key=clave_respuesta,
+                    cache_instance=cache,
+                    cache_ns="respuesta_rag_v1",
+                ):
+                    yield t
+
             # STREAMING THE RAG RESPONSE
             # Cards deferred: start AFTER first token to avoid OpenAI API contention
             # (11 concurrent calls caused 32s throttle delay)
             card_task = None
             cards_emitidas = False
-            async for token in astream_buffer(llm_mini, prompt_rag):
+            async for token in _tokens_respuesta():
                 if card_task is None:
                     # First token flowed → NOW start card generation in parallel
                     print(f"[TIMING] First token at {time.time() - t_start:.2f}s. Starting card gen...", flush=True)
