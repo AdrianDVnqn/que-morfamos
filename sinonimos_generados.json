@@ -1,0 +1,250 @@
+{
+  "aire libre": [
+    "patio cervecero",
+    "patio",
+    "espacioso",
+    "area",
+    "descontracturado",
+    "relajado",
+    "verano",
+    "mascotas",
+    "frente",
+    "rio"
+  ],
+  "barato": [
+    "baratos",
+    "super"
+  ],
+  "cerveza artesanal": [
+    "cerveceria artesanal",
+    "patio cervecero",
+    "cerveza artesanal tirada",
+    "artesanal tirada",
+    "cervecera",
+    "birras",
+    "ipa",
+    "cervecero",
+    "bar cervecero",
+    "cervezas",
+    "cervezas artesanales"
+  ],
+  "desayuno": [
+    "desayunos",
+    "ideal para desayunos",
+    "desayuno rapido",
+    "perfecto para desayunos",
+    "desayunos economicos",
+    "desayunos completos",
+    "desayunos brunch",
+    "desayunos meriendas"
+  ],
+  "empanadas": [
+    "pizzas empanadas",
+    "empanadas fritas",
+    "empanadas artesanales",
+    "empanadas caseras",
+    "pranzo empanadas",
+    "opciones como empanadas",
+    "junto con empanadas",
+    "empanadas tartas",
+    "empanadas gourmet",
+    "empanadas arabes",
+    "incluye empanadas",
+    "especialmente las empanadas",
+    "empanadas para llevar",
+    "empanadas con relleno"
+  ],
+  "hamburguesa": [
+    "hamburguesas gourmet",
+    "hamburgueseria",
+    "burgers",
+    "hamburguesas clasicas",
+    "hamburguesas gigantes",
+    "hamburguesas abundantes",
+    "hamburguesas papas fritas",
+    "hamburguesas rabas",
+    "hamburguesas con pan",
+    "hamburguesas artesanales",
+    "smash",
+    "opciones como hamburguesas",
+    "hamburguesas pizzas"
+  ],
+  "helado": [
+    "helado",
+    "helados",
+    "heladeria",
+    "heladeria artesanal",
+    "helados artesanales",
+    "cremosos",
+    "cremas heladas",
+    "tortas heladas",
+    "cucuruchos",
+    "potes"
+  ],
+  "merienda": [
+    "desayunos meriendas",
+    "merienda informal",
+    "tartas dulces",
+    "pasteleria casera",
+    "medialunas dulces",
+    "torta matera",
+    "merienda tranquila",
+    "desayuno una merienda",
+    "amigos una merienda",
+    "algunas facturas",
+    "meriendas",
+    "pastelitos",
+    "facturas artesanales",
+    "masas finas",
+    "panificados frescos",
+    "masas secas",
+    "medialunas rellenas"
+  ],
+  "milanesa": [
+    "milanesas",
+    "milanesas napolitanas",
+    "milanesas lomitos",
+    "empanadas milanesas",
+    "minutas",
+    "napolitanas"
+  ],
+  "musica en vivo": [
+    "vivo",
+    "bandas",
+    "rock",
+    "noches"
+  ],
+  "para grupos grandes": [
+    "grupos grandes",
+    "grupos",
+    "reservas",
+    "celebraciones",
+    "cumpleanos",
+    "eventos",
+    "compartir con amigos",
+    "amplio"
+  ],
+  "parrilla": [
+    "parrillada",
+    "parrilladas",
+    "parrillas",
+    "parrilla argentina",
+    "asado",
+    "cortes",
+    "carnes",
+    "matambre"
+  ],
+  "pastas": [
+    "pastas caseras",
+    "pastas frescas",
+    "italiana",
+    "lasana",
+    "ravioles",
+    "noquis",
+    "sorrentinos",
+    "canelones"
+  ],
+  "pasteleria": [
+    "pasteleria artesanal",
+    "pasteleria dulce",
+    "pasteleria casera",
+    "pasteleria tradicional",
+    "reposteria artesanal",
+    "tortas personalizadas",
+    "galletitas",
+    "cake",
+    "tortas tartas",
+    "medialunas dulces",
+    "facturas artesanales",
+    "carrot cake",
+    "cookies",
+    "masas secas",
+    "budines",
+    "brownies",
+    "croissants"
+  ],
+  "pelotero": [
+    "pelotero para ninos",
+    "entretenimiento infantil"
+  ],
+  "pet friendly": [
+    "pet",
+    "friendly",
+    "lugar pet friendly",
+    "lugar pet",
+    "mascotas",
+    "patio"
+  ],
+  "pizza": [
+    "pizzas",
+    "incluye pizzas",
+    "pizzas empanadas",
+    "prepizzas",
+    "pizzas con masa",
+    "pizzas ideal",
+    "pizzas consideradas",
+    "prepizza",
+    "pizzerias",
+    "especialidad incluye pizzas",
+    "pizzeria",
+    "pizzas hamburguesas",
+    "pizzas tradicionales",
+    "pizzas napolitanas",
+    "pizzas exquisitas",
+    "pizzas destacadas",
+    "pizzas caseras",
+    "pizzas artesanales"
+  ],
+  "porciones abundantes": [
+    "porciones abundantes",
+    "abundantes",
+    "hamburguesas gigantes"
+  ],
+  "romantico": [
+    "lugar romantico",
+    "especialmente romantico",
+    "romanticos",
+    "entorno romantico",
+    "sitio romantico",
+    "lugar especialmente romantico",
+    "espacio romantico",
+    "ambiente romantico"
+  ],
+  "sin tacc": [
+    "opciones sin tacc",
+    "productos sin tacc",
+    "menu sin tacc",
+    "completamente apto",
+    "celiacos con opciones",
+    "recomendado para celiacos"
+  ],
+  "sushi": [
+    "sushi fresco",
+    "japonesa",
+    "mejor sushi",
+    "comida japonesa",
+    "piezas",
+    "rolls",
+    "salmon",
+    "fresco",
+    "salsas",
+    "autentica",
+    "restaurante especializado"
+  ],
+  "vegano": [
+    "menu vegano",
+    "platos veganos",
+    "menus veganos"
+  ],
+  "vegetariano": [
+    "opciones para vegetarianos",
+    "platos vegetarianos",
+    "veggie",
+    "vegetariana",
+    "opciones limitadas"
+  ],
+  "vinos": [
+    "vinoteca",
+    "seleccion"
+  ]
+}

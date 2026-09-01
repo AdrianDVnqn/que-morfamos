@@ -89,6 +89,13 @@ SINONIMOS_CURADOS = {
     "pelotero": ["juegos infantiles", "juegos para ninos", "area de juegos", "juegos para chicos",
                  "zona de juegos", "calesita", "tobogan", "hamaca"],
     "celiaco": ["sin tacc", "sin gluten", "libre de gluten"],
+    # Estos tres se curan a mano porque el generador no puede inferirlos: aparecen en muy pocos
+    # resúmenes (terraza 17, pet friendly 21, wifi 12) y con esa muestra el lift devuelve
+    # correlaciones en vez de equivalencias. Las variantes están verificadas por medición sobre
+    # menciones positivas: terraza pasa de 16 lugares a 89, y pet friendly de 18 a 31.
+    "terraza": ["patio", "al aire libre", "deck", "mesas afuera", "aire libre"],
+    "pet friendly": ["mascota", "mascotas", "perro", "perros", "apto mascotas"],
+    "wifi": ["wi-fi", "conexion a internet", "internet"],
 }
 
 
@@ -113,6 +120,36 @@ CONCEPTOS_EXCLUYENTES = {
 }
 
 
+def _cargar_sinonimos_generados(ruta="sinonimos_generados.json"):
+    """Vocabulario derivado del corpus por `generar_vocabulario_conceptos.py`.
+
+    Existe porque curar sinonimos a mano tiene techo: eran 5 conceptos, y todo lo demas caia al
+    match literal. Medido sobre menciones positivas, `cerveza artesanal` pasaba de 56 lugares a
+    439 con sus variantes y `musica en vivo` de 0 a 43 — o sea que ese concepto era invisible.
+
+    Es best-effort a proposito: si el archivo no esta o esta roto, el backend arranca igual con
+    los curados. Un problema de vocabulario degrada la calidad del ranking; nunca puede voltear
+    el servicio.
+    """
+    try:
+        with open(ruta, encoding="utf-8") as f:
+            datos = json.load(f)
+        return {k: list(v) for k, v in datos.items() if isinstance(v, list)}
+    except FileNotFoundError:
+        logger.info("Sin vocabulario generado (%s); se usan solo los sinonimos curados.", ruta)
+        return {}
+    except Exception as e:
+        logger.warning("No se pudo leer %s: %s. Se usan solo los curados.", ruta, e)
+        return {}
+
+
+SINONIMOS_GENERADOS = _cargar_sinonimos_generados()
+
+# Los curados PISAN a los generados, no al reves: son decisiones tomadas con evidencia y contra
+# casos concretos, y una corrida del generador no tiene por que revisarlas.
+SINONIMOS = {**SINONIMOS_GENERADOS, **SINONIMOS_CURADOS}
+
+
 def _emparenta(a, b):
     """Prefijo en cualquier dirección: cubre 'veganas'<->'vegano', 'juegos'<->'juegos infantiles'."""
     a, b = _normalizar_busqueda(a), _normalizar_busqueda(b)
@@ -126,7 +163,7 @@ def variantes_de_concepto(keyword):
     tiene que contar para una query que dice "juegos", y viceversa.
     """
     variantes = [keyword]
-    for concepto, extras in SINONIMOS_CURADOS.items():
+    for concepto, extras in SINONIMOS.items():
         if _emparenta(keyword, concepto) or any(_emparenta(keyword, e) for e in extras):
             variantes.extend([concepto] + extras)
     # Sin duplicados. SINONIMOS_CURADOS es bidireccional a proposito ("vegano" lista
@@ -216,6 +253,16 @@ def atomizar_keywords(keywords):
 
 def expandir_sinonimos(keywords, synonyms):
     """Suma los sinónimos curados de SINONIMOS_CURADOS a los que devolvió el LLM.
+
+    OJO — usa SOLO los curados, no el vocabulario generado, y la asimetría con
+    `variantes_de_concepto()` es deliberada. Los dos usos tiran para lados opuestos:
+      - Contar cobertura de conceptos quiere vocabulario AMPLIO: cuantas más formas de nombrar
+        el concepto se reconozcan, mejor se detecta que un lugar lo cumple.
+      - Generar términos de búsqueda quiere vocabulario PRECISO: estos términos alimentan la
+        Hybrid Injection y la consulta de reseñas, así que un sinónimo flojo mete candidatos que
+        no corresponden.
+    Medido: usar el vocabulario generado en los dos lados subía la evidencia de 0.50 a 0.55 pero
+    bajaba Recall de 0.83 a 0.79 y Precision de 0.84 a 0.79.
 
     Devuelve la lista de sinónimos ampliada, sin duplicados y preservando los del LLM.
     """
