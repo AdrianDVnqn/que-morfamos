@@ -33,6 +33,31 @@ REPEATS = int(os.getenv("BENCHMARK_REPEATS", "1"))
 FALLBACK_ERROR_TEXT = "Tuve un problema técnico"
 
 
+
+_CACHE_EVIDENCIA = {}
+
+
+def _evidencia_del_backend():
+    """Mapa {nombre: resumen_reviews} y el matcher negacion-aware, tomados del modulo bajo test.
+
+    Se cachea porque se llama una vez por caso y df_lugares no cambia durante la corrida.
+    """
+    if not _CACHE_EVIDENCIA:
+        try:
+            modulo = importlib.import_module(MODULE_NAME)
+            df = getattr(modulo, "df_lugares", None)
+            mapa = {}
+            if df is not None and not df.empty and "resumen_reviews" in df.columns:
+                mapa = {str(i): str(v or "") for i, v in df["resumen_reviews"].items()}
+            _CACHE_EVIDENCIA["resumenes"] = mapa
+            _CACHE_EVIDENCIA["mencion"] = getattr(modulo, "_mencion_positiva", None)
+        except Exception as e:
+            print(f"⚠️  No se pudo cargar la evidencia para las aserciones: {e}")
+            _CACHE_EVIDENCIA["resumenes"] = {}
+            _CACHE_EVIDENCIA["mencion"] = None
+    return _CACHE_EVIDENCIA["resumenes"], _CACHE_EVIDENCIA["mencion"]
+
+
 def run_single_case(client, case):
     payload = {
         "query": case["query"],
@@ -58,7 +83,12 @@ def run_single_case(client, case):
     reply = data.get("response", "")
     actual_mode = data.get("mode", "")
 
-    result = evaluate_case(case, actual_mode, card_names, k=5, cards=cards)
+    # Los resumenes y el matcher con conciencia de negacion salen del backend, para que la
+    # asercion por evidencia use exactamente el mismo criterio que el ranking (un resumen que
+    # dice "NO tienen opciones veganas" no cuenta como evidencia a favor).
+    resumenes, mencion = _evidencia_del_backend()
+    result = evaluate_case(case, actual_mode, card_names, k=5, cards=cards,
+                           resumenes=resumenes, mencion=mencion)
     # El backend atrapa los errores de LLM y responde 200 con un texto de fallback, así que un
     # corte de la API (ej. saldo agotado en DeepSeek) se vería como si TODOS los casos fallaran
     # a la vez. Sin esta marca, el modo estabilidad reporta eso como "±19 casos inestables"

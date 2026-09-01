@@ -102,7 +102,41 @@ def category_match(expected_categories: list, cards: list, k: int = 5, min_ratio
     return (matched / len(top_k)) >= min_ratio, matched, len(top_k)
 
 
-def evaluate_case(case: dict, actual_mode: str, actual_names: list, k: int = 5, cards: list = None) -> dict:
+def evidence_match(expected_evidence, actual_names, resumenes, k=5, mencion=None):
+    """Chequea que cada lugar devuelto TENGA la evidencia que la consulta pedia.
+
+    `expected_evidence` es una lista de conceptos, y cada concepto una lista de terminos
+    aceptables: un lugar cumple si su resumen menciona al menos UNO de cada concepto.
+
+    Existe porque una lista de nombres exactos es el instrumento equivocado para consultas de
+    concepto, y eso se comprobo el 01-sep: derivar el ground truth con frases contiguas
+    ("musica en vivo") deja afuera lugares que SI corresponden —los 5 que el sistema devolvia
+    para esa consulta mencionaban musica y vivo en su resumen, o sea que el equivocado era el
+    dataset—, y derivarlo con co-ocurrencia laxa mete lugares que no corresponden (una heladeria
+    entraba en "cerveceria con patio" porque su resumen nombraba cerveza y patio en frases
+    distintas). Preguntar por la evidencia en vez de por los nombres saca la curacion subjetiva
+    del medio: la pregunta pasa a ser "¿lo que devolvio cumple lo que se pidio?", que es
+    verificable contra los datos.
+
+    `mencion` permite inyectar el matcher con conciencia de negacion del backend
+    (`_mencion_positiva`), para no contar como evidencia un "NO tienen opciones veganas".
+    """
+    if not expected_evidence:
+        return True, 0, 0
+    check = mencion or (lambda texto, termino: termino.lower() in (texto or "").lower())
+    considerados = actual_names[:k]
+    if not considerados:
+        return False, 0, 0
+    cumplen = 0
+    for nombre in considerados:
+        resumen = (resumenes or {}).get(nombre, "")
+        if all(any(check(resumen, t) for t in grupo) for grupo in expected_evidence):
+            cumplen += 1
+    return cumplen, cumplen, len(considerados)
+
+
+def evaluate_case(case: dict, actual_mode: str, actual_names: list, k: int = 5, cards: list = None,
+                  resumenes: dict = None, mencion=None) -> dict:
     """
     Evalúa un único caso del golden dataset contra la respuesta real del backend.
     actual_names: lista de nombres de restaurantes devueltos (ya extraídos de restaurant_cards).
@@ -140,12 +174,22 @@ def evaluate_case(case: dict, actual_mode: str, actual_names: list, k: int = 5, 
     precision = precision_at_k(expected_restaurants, actual_names, k)
     score_mrr = mrr(expected_restaurants, actual_names)
     cat_ok, cat_matched, cat_total = category_match(case.get("expected_category", []), cards or [], k)
+    ev_cumplen, _, ev_total = evidence_match(
+        case.get("expected_evidence", []), actual_names, resumenes, k, mencion
+    )
+    ev_ratio = (ev_cumplen / ev_total) if ev_total else None
 
     if expected_empty:
         # Caso que debe NO devolver resultados. Antes esto era un pass automático (la condición
         # `not expected_restaurants` cortocircuitaba `passed`), así que el único test de "no
         # encontré nada" era incapaz de fallar aunque el RAG devolviera 5 lugares reales.
         retrieval_ok = len(actual_names) == 0
+    elif case.get("expected_evidence"):
+        # Query de concepto: se juzga por la EVIDENCIA de lo devuelto, no contra una lista
+        # subjetiva de nombres. El umbral es 0.6 —3 de 5— y no 1.0 a proposito: el backend
+        # devuelve 3 exactos + 2 relacionados, y los relacionados por definicion pueden no
+        # cumplir todo.
+        retrieval_ok = (ev_ratio or 0) >= 0.6 and result["min_results_ok"]
     elif case.get("expected_category"):
         # Query de categoría: se juzga por la categoría de lo devuelto, no contra una lista
         # subjetiva de nombres (ver category_match).
@@ -180,6 +224,9 @@ def evaluate_case(case: dict, actual_mode: str, actual_names: list, k: int = 5, 
         "cat_ok": cat_ok,
         "cat_matched": cat_matched,
         "cat_total": cat_total,
+        "ev_cumplen": ev_cumplen,
+        "ev_total": ev_total,
+        "ev_ratio": ev_ratio,
         "passed": passed,
     })
     return result
