@@ -406,5 +406,231 @@
     "min_results": 0,
     "judge_eligible": false,
     "notes": "combo zona+categoría inexistente, no debería devolver cards. FLAG expected_empty AGREGADO (25-ago-2026): antes este caso era un PASS automático — la condición `not expected_restaurants` en evaluate_case cortocircuitaba el pass/fail, así que el único test de 'no encontré nada' era incapaz de fallar aunque el RAG devolviera 5 restaurantes reales (y de hecho los devolvía: McDonald's, Bambú Canting, etc.). Con el flag, devolver cualquier resultado ahora FALLA correctamente."
+  },
+  {
+    "id": "multi_pizza_sintacc",
+    "query": "pizza sin tacc",
+    "conversation_context": {},
+    "tone": "neutro",
+    "expected_intent": "RECOMMENDATION",
+    "expected_mode": "rag",
+    "expected_restaurants": [
+      "Tutanjamon pizzas listas para hornear",
+      "ÁRBOL Cervecería Artesanal",
+      "Kactus Casa Resto",
+      "Cervecería OSS",
+      "Espiritu Pucara",
+      "Valencia",
+      "PATTINO TERRAZAS"
+    ],
+    "expected_zones": [],
+    "min_results": 2,
+    "judge_eligible": true,
+    "open_ended": true,
+    "notes": "MULTICONCEPTO. Ground truth derivado de la base el 01-sep-2026: lugares cuyo `resumen_reviews` menciona AMBOS conceptos. `open_ended` porque el conjunto valido es mayor que los 5 slots, asi que se evalua por precision y no por recall contra una muestra arbitraria. 19 lugares en la base cumplen las dos condiciones. Antes del fix de atomizacion el router devolvia ['pizza sin tacc'] como una sola keyword, que no matchea NINGUN resumen: todos los candidatos empataban en 0 conceptos y el orden caia a popularidad."
+  },
+  {
+    "id": "multi_sushi_vegano",
+    "query": "sushi vegano",
+    "conversation_context": {},
+    "tone": "neutro",
+    "expected_intent": "RECOMMENDATION",
+    "expected_mode": "rag",
+    "expected_restaurants": [
+      "SushiClub Neuquén",
+      "SAWARA",
+      "Sushi Kami 神",
+      "HØFU SUSHI",
+      "Sushisur Neuquén",
+      "Nao Sushi & Ceviches",
+      "sushi 2x1 Neuquén"
+    ],
+    "expected_zones": [],
+    "min_results": 2,
+    "judge_eligible": true,
+    "open_ended": true,
+    "notes": "MULTICONCEPTO. Ground truth derivado de la base el 01-sep-2026: lugares cuyo `resumen_reviews` menciona AMBOS conceptos. `open_ended` porque el conjunto valido es mayor que los 5 slots, asi que se evalua por precision y no por recall contra una muestra arbitraria. 11 lugares cumplen ambas. Mismo caso que multi_pizza_sintacc: el router lo devolvia pegado."
+  },
+  {
+    "id": "multi_cerveceria_patio",
+    "query": "cerveceria artesanal con patio",
+    "conversation_context": {},
+    "tone": "neutro",
+    "expected_intent": "RECOMMENDATION",
+    "expected_mode": "rag",
+    "expected_restaurants": [
+      "Bunker Bar Patio Cervecero",
+      "ÁRBOL Cervecería Artesanal",
+      "Vd bar",
+      "Espiritu Pucara",
+      "Crafter",
+      "KALEVALA BAR",
+      "RefugioFoodpark"
+    ],
+    "expected_zones": [],
+    "min_results": 2,
+    "judge_eligible": true,
+    "open_ended": true,
+    "notes": "MULTICONCEPTO con un concepto NO curado ('patio'/'terraza' no esta en SINONIMOS_CURADOS). Ground truth derivado de la base el 01-sep-2026: lugares cuyo `resumen_reviews` menciona AMBOS conceptos. `open_ended` porque el conjunto valido es mayor que los 5 slots, asi que se evalua por precision y no por recall contra una muestra arbitraria."
+  },
+  {
+    "id": "multi_pet_friendly",
+    "query": "bar pet friendly",
+    "conversation_context": {},
+    "tone": "neutro",
+    "expected_intent": "RECOMMENDATION",
+    "expected_mode": "rag",
+    "expected_restaurants": [
+      "Zeta Birra",
+      "ÁRBOL Cervecería Artesanal",
+      "Mikelo Olascoaga",
+      "MOZA",
+      "La Bordelesa Vinoteca & Wine Bar Resto",
+      "Ohana Tienda y Cafe"
+    ],
+    "expected_zones": [],
+    "min_results": 2,
+    "judge_eligible": true,
+    "open_ended": true,
+    "notes": "Concepto NO curado. Ground truth derivado de la base el 01-sep-2026: lugares cuyo `resumen_reviews` menciona AMBOS conceptos. `open_ended` porque el conjunto valido es mayor que los 5 slots, asi que se evalua por precision y no por recall contra una muestra arbitraria. Medido: 'pet friendly' literal aparece en 20 resumenes y con variantes (mascota/perro) en 34, o sea que hoy se pierde el 40% de la evidencia."
+  },
+  {
+    "id": "concepto_musica_vivo",
+    "query": "lugares con musica en vivo",
+    "conversation_context": {},
+    "tone": "neutro",
+    "expected_intent": "RECOMMENDATION",
+    "expected_mode": "rag",
+    "expected_restaurants": [
+      "Ensamble Bar",
+      "Espacio Linares",
+      "Katmandú Bar",
+      "10 ALMAS",
+      "Bestia morfi",
+      "k-milu Cerveza Artesanal"
+    ],
+    "expected_zones": [],
+    "min_results": 2,
+    "judge_eligible": true,
+    "open_ended": true,
+    "notes": "CONCEPTO NO CURADO y caso limite de vocabulario: el termino literal 'musica en vivo' NO aparece en NINGUN resumen (0 de 929); la evidencia esta en 'shows en vivo' y 'en vivo'. Es el caso que mide si el vocabulario de conceptos sale de la lista curada de 5. Ground truth derivado de la base el 01-sep-2026: lugares cuyo `resumen_reviews` menciona AMBOS conceptos. `open_ended` porque el conjunto valido es mayor que los 5 slots, asi que se evalua por precision y no por recall contra una muestra arbitraria."
+  },
+  {
+    "id": "concepto_wifi_trabajar",
+    "query": "cafe con wifi para trabajar",
+    "conversation_context": {},
+    "tone": "neutro",
+    "expected_intent": "RECOMMENDATION",
+    "expected_mode": "rag",
+    "expected_restaurants": [
+      "Diagonal Piré Patagonia",
+      "PRIMO - Horno & Cafe",
+      "Bar Other World",
+      "Starbucks Coffee"
+    ],
+    "expected_zones": [],
+    "min_results": 2,
+    "judge_eligible": true,
+    "open_ended": true,
+    "notes": "Concepto NO curado, y ademas la consulta trae una intencion ('para trabajar') que no es un concepto buscable. Solo 4 lugares mencionan wifi en su resumen. Ground truth derivado de la base el 01-sep-2026: lugares cuyo `resumen_reviews` menciona AMBOS conceptos. `open_ended` porque el conjunto valido es mayor que los 5 slots, asi que se evalua por precision y no por recall contra una muestra arbitraria."
+  },
+  {
+    "id": "concepto_desayuno",
+    "query": "donde desayunar con medialunas ricas",
+    "conversation_context": {},
+    "tone": "neutro",
+    "expected_intent": "RECOMMENDATION",
+    "expected_mode": "rag",
+    "expected_restaurants": [
+      "Armando Medialunas",
+      "La Forja - Panadería artesanal de masa madre",
+      "Heidi - Flor del Prado",
+      "Adelaida Pastelería & Panadería",
+      "PANIPUNTO MASA MADRE - Buenos Aires 326",
+      "MOZA"
+    ],
+    "expected_zones": [],
+    "min_results": 2,
+    "judge_eligible": true,
+    "open_ended": true,
+    "notes": "Concepto NO curado. Ademas prueba el pendiente del TIPO de local: una panaderia es la respuesta CORRECTA aca, a diferencia de una consulta de almuerzo. Ground truth derivado de la base el 01-sep-2026: lugares cuyo `resumen_reviews` menciona AMBOS conceptos. `open_ended` porque el conjunto valido es mayor que los 5 slots, asi que se evalua por precision y no por recall contra una muestra arbitraria."
+  },
+  {
+    "id": "concepto_heladeria_vegana",
+    "query": "heladeria con opciones veganas",
+    "conversation_context": {},
+    "tone": "neutro",
+    "expected_intent": "RECOMMENDATION",
+    "expected_mode": "rag",
+    "expected_restaurants": [
+      "Lucciano's Paseo de la Costa · Neuquén",
+      "Lucciano´s Neuquén",
+      "Merlí Helados Artesanales - Belgrano 1100",
+      "Mikelo Oeste",
+      "Mikelo Leloir"
+    ],
+    "expected_zones": [],
+    "min_results": 2,
+    "judge_eligible": true,
+    "open_ended": true,
+    "notes": "MULTICONCEPTO donde uno esta curado ('vegano') y el otro no ('heladeria'). Ground truth derivado de la base el 01-sep-2026: lugares cuyo `resumen_reviews` menciona AMBOS conceptos. `open_ended` porque el conjunto valido es mayor que los 5 slots, asi que se evalua por precision y no por recall contra una muestra arbitraria."
+  },
+  {
+    "id": "borde_estilo_pizza",
+    "query": "pizzeria estilo napolitano",
+    "conversation_context": {},
+    "tone": "neutro",
+    "expected_intent": "RECOMMENDATION",
+    "expected_mode": "rag",
+    "expected_restaurants": [
+      "Amore Pizza Napoletana",
+      "Pizzería Pizzani",
+      "Valencia",
+      "CHILI PIZZA",
+      "Perroni Pizza - Elordi",
+      "Pizzeria el Tano",
+      "El Paso"
+    ],
+    "expected_zones": [],
+    "min_results": 2,
+    "judge_eligible": true,
+    "open_ended": true,
+    "notes": "CURADO el 01-sep-2026 (antes estaba como <TODO: curate>). Mide el pendiente #4: hoy el router descarta el modificador de estilo y esta consulta devuelve lo mismo que 'mejores pizzas'. El caso es contundente porque 'Amore Pizza Napoletana' lo dice en el NOMBRE (4.6, 1114 resenas) y aun asi no sale. El resto del ground truth son pizzerias cuyo resumen menciona masa madre / horno de barro / napoletana. OJO al interpretar fallos: 'napolitana' significa tres cosas distintas en este corpus -103 de 248 resenas que la mencionan hablan de MILANESA a la napolitana, y la pizza napolitana argentina es una cobertura (muzzarella, tomate en rodajas y ajo), no el estilo de masa italiano-. Un fix por keyword ciega traeria bodegones y parrillas."
+  },
+  {
+    "id": "borde_concepto_inexistente",
+    "query": "restaurantes con pileta climatizada",
+    "conversation_context": {},
+    "tone": "neutro",
+    "expected_intent": "RECOMMENDATION",
+    "expected_mode": "rag",
+    "expected_restaurants": [],
+    "expected_zones": [],
+    "min_results": 0,
+    "judge_eligible": true,
+    "open_ended": false,
+    "notes": "BORDE: concepto que no existe en Neuquen. Deberia devolver poco y no inventar. Complementa a sin_resultados_edge, que usa un absurdo ('comida marciana'); este es plausible pero igualmente inexistente, que es el caso mas dificil."
+  },
+  {
+    "id": "ocasion_romantica",
+    "query": "lugares romanticos para una cita",
+    "conversation_context": {},
+    "tone": "neutro",
+    "expected_intent": "RECOMMENDATION",
+    "expected_mode": "rag",
+    "expected_restaurants": [
+      "La Bordelesa Vinoteca & Wine Bar Resto",
+      "CAE Babylon",
+      "Vd bar",
+      "Cervecería OSS",
+      "Faraon Comida Arabe En Patagonia",
+      "Mikelo Leloir",
+      "EL TALLER"
+    ],
+    "expected_zones": [],
+    "min_results": 2,
+    "judge_eligible": true,
+    "open_ended": true,
+    "notes": "OCASION, no producto: mide el pendiente #13 (el ranking no distingue el TIPO de local ni la ocasion). Ground truth por SQL sobre `resumen_reviews` con terminos de cita (romantic|para una cita|cena en pareja|velada|luz tenue|ambiente intimo), excluyendo categorias que no son para ir a cenar (panaderia, heladeria, cafe, takeout, delivery) y exigiendo >=120 resenas para que el rating sea creible. Solo 23 lugares de 929 mencionan algo asi, o sea que es un concepto escaso y buen caso de borde: el riesgo es que devuelva los 5 mas populares de la ciudad ignorando la ocasion."
   }
 ]
