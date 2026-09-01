@@ -152,6 +152,68 @@ def es_concepto_excluyente(keywords):
     )
 
 
+# Conectores por los que se parte una keyword que vino como frase. "de" queda AFUERA a
+# proposito: partiria "cafe de especialidad" o "casa de comidas", que son un concepto solo.
+_CONECTORES_KW = re.compile(r"\s+(?:con|y|para|que\s+tengan?|donde)\s+")
+
+
+def _conceptos_conocidos():
+    """Todos los terminos que sabemos que son UN concepto, del mas largo al mas corto.
+
+    Se ordena por largo descendente para que "sin gluten" se extraiga antes que "gluten" y no
+    quede un resto suelto sin sentido.
+    """
+    universo = set(CONCEPTOS_EXCLUYENTES) | set(SINONIMOS_CURADOS)
+    for extras in SINONIMOS_CURADOS.values():
+        universo.update(extras)
+    return sorted(universo, key=len, reverse=True)
+
+
+def atomizar_keywords(keywords):
+    """Parte en conceptos atomicos las keywords que el router devolvio como una frase entera.
+
+    El prompt del router YA pide que devuelva un termino por concepto, con ejemplos explicitos
+    ("pizzeria sin tacc" -> ["pizzeria", "sin tacc"]), y aun asi devuelve la consulta pegada:
+    medido, 5 de 6 consultas multiconcepto volvian como un solo blob ("pizza sin tacc", "bar pet
+    friendly con terraza", "sushi vegano"). Eso rompe todo lo que viene despues, porque el blob
+    no matchea NADA: los cuatro casos medidos daban 0 lugares con el texto completo, mientras que
+    descompuestos daban 19 lugares que son pizza Y sin tacc, y 11 que son sushi Y vegano. Con
+    todos los candidatos empatados en 0 conceptos, el orden caia integro a popularidad.
+    Insistirle al prompt no alcanza —la regla ya esta y la ignora—, asi que esto lo garantiza
+    de forma deterministica y testeable.
+    """
+    salida = []
+    for kw in keywords or []:
+        texto = _normalizar_busqueda(kw)
+        if not texto:
+            continue
+        if " " not in texto:
+            salida.append(texto)
+            continue
+
+        # 1. Se rescatan los conceptos conocidos, que no hay que partir aunque contengan un
+        #    conector ("sin tacc", "pet friendly"). Se marcan con su posicion para poder
+        #    devolver todo en el orden en que aparecia.
+        piezas = []
+        for c in _conceptos_conocidos():
+            for m in re.finditer(r"\b" + re.escape(c) + r"s?\b", texto):
+                piezas.append((m.start(), c))
+                texto = texto[: m.start()] + " " * len(c) + texto[m.end() :]
+                break
+
+        # 2. El resto se parte por conectores.
+        pos = 0
+        for parte in _CONECTORES_KW.split(texto):
+            limpio = parte.strip()
+            if len(limpio) > 3 and limpio not in KEYWORDS_GENERICAS:
+                piezas.append((texto.find(parte, pos), limpio))
+            pos += len(parte)
+
+        salida.extend(t for _, t in sorted(piezas))
+
+    return list(dict.fromkeys(salida))
+
+
 def expandir_sinonimos(keywords, synonyms):
     """Suma los sinónimos curados de SINONIMOS_CURADOS a los que devolvió el LLM.
 
@@ -2999,7 +3061,12 @@ async def procesar_consulta_gen(
     intencion = analisis.get("intencion", "RECOMMENDATION")
 
     # Extraer datos del análisis para los caminos posteriores
-    keywords = analisis.get("keywords", [])
+    # `atomizar_keywords` es una red de seguridad sobre el router: el prompt YA le pide un
+    # término por concepto, con ejemplos explícitos, y aun así devuelve la consulta pegada en
+    # 5 de cada 6 consultas multiconcepto. Un blob no matchea nada (medido: 0 lugares para
+    # "pizza sin tacc", contra 19 que son pizza Y sin tacc por separado), así que todos los
+    # candidatos empataban en 0 conceptos y el orden caía íntegro a popularidad.
+    keywords = atomizar_keywords(analisis.get("keywords", []))
     # Los sinónimos del LLM varían mucho según el proveedor (gpt-4o-mini devuelve [] siempre),
     # así que se completan con los curados: el ranking no debe depender del modelo.
     synonyms = expandir_sinonimos(keywords, analisis.get("synonyms", []))
