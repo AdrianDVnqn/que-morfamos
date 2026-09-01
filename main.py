@@ -56,6 +56,10 @@ def _normalizar_busqueda(texto):
 
 NEGATION_RE = re.compile(r"\b(no|ni|sin|carece|falta|ausencia)\b")
 
+# Features cuyo NOMBRE empieza con "sin": ahi el "sin" no niega, forma parte del termino. Para
+# cualquier otra ("sin pelotero", "sin estacionamiento"), el "sin" si es una negacion.
+FEATURES_CON_SIN = {"gluten", "tacc", "lactosa", "azucar", "alcohol", "conservantes", "sal"}
+
 # Keywords que describen el CONTENEDOR, no el contenido: matchean cientos de resúmenes y no
 # aportan señal para la inyección por texto ("restaurante" matchea 400 de 930 lugares). Sin este
 # filtro, una query sin respuesta posible como "comida marciana" igual traía 10 candidatos por el
@@ -340,9 +344,14 @@ def _mencion_positiva(texto, termino, ventana=70):
             ventana_texto = ventana_texto[corte + 1:]
         # "sin" forma parte de varias features POSITIVAS ("sin gluten", "sin TACC", "sin lactosa"):
         # en "opciones veganas y sin gluten", buscar "gluten" encontraba ese "sin" en la ventana y
-        # devolvía False, justo al revés de lo que corresponde. Si el término va inmediatamente
-        # precedido por "sin", ese "sin" es parte de la feature, no una negación de ella.
-        if re.search(r"\bsin\s+$", ventana_texto):
+        # devolvía False, justo al revés de lo que corresponde.
+        # PERO la excepción vale SÓLO para las features que efectivamente se llaman "sin algo".
+        # Aplicada a todas —como estaba— convertía cada negación en una afirmación: "sin pelotero",
+        # "sin estacionamiento" y "sin wifi" devolvían True, o sea que un resumen diciendo que el
+        # lugar NO tiene la característica lo hacía contar como que SÍ la tiene. Y los resúmenes v1
+        # de producción enumeran características en negativo para casi todos los lugares, así que
+        # la fuga era sistemática, no un caso de borde.
+        if re.search(r"\bsin\s+$", ventana_texto) and termino_lower.split()[0] in FEATURES_CON_SIN:
             return True
         if not NEGATION_RE.search(ventana_texto):
             return True
