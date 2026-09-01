@@ -60,6 +60,18 @@ NEGATION_RE = re.compile(r"\b(no|ni|sin|carece|falta|ausencia)\b")
 # cualquier otra ("sin pelotero", "sin estacionamiento"), el "sin" si es una negacion.
 FEATURES_CON_SIN = {"gluten", "tacc", "lactosa", "azucar", "alcohol", "conservantes", "sal"}
 
+
+def _contiene_palabra(texto, fragmento):
+    """True si `fragmento` aparece en `texto` como palabra completa, no como pedazo de otra.
+
+    El substring desnudo hacía que "tio" matcheara "pa-TIO", "PATIO JUEZ" y hasta "Bakery and
+    Confec-TIO-nery Curri": la consulta "el tío" tenía 11 candidatos y resolvía al primero del
+    abecedario. Los límites de palabra dejan 2.
+    """
+    if not texto or not fragmento:
+        return False
+    return re.search(r"(?<!\w)" + re.escape(fragmento) + r"(?!\w)", texto) is not None
+
 # Keywords que describen el CONTENEDOR, no el contenido: matchean cientos de resúmenes y no
 # aportan señal para la inyección por texto ("restaurante" matchea 400 de 930 lugares). Sin este
 # filtro, una query sin respuesta posible como "comida marciana" igual traía 10 candidatos por el
@@ -2217,12 +2229,31 @@ def detectar_mencion_exacta(query, df):
     nombres = df["restaurante"].unique().tolist()
     nombres.sort(key=len, reverse=True)
 
-    # Priorizar el nombre completo cuando la query lo contiene. Esto evita que
-    # un nombre parcial como "Encuentro" gane frente a "827 Punto de encuentro".
+    # 0. Igualdad exacta, ANTES que cualquier containment. Este chequeo ya existía pero vivía en
+    # el segundo loop, inalcanzable porque el primero siempre devolvía antes: para "el tío" el
+    # primer loop devolvía "PERNILES Del Tío Rudy" y el match exacto nunca se evaluaba.
+    for nombre_real in nombres:
+        if _normalizar_busqueda(nombre_real) == q_norm:
+            return nombre_real
+
+    # 1. El nombre COMPLETO aparece dentro de la consulta ("qué tal es el tío" -> "El Tío").
+    # Acá el orden largo-primero es el correcto: entre dos nombres contenidos en la consulta gana
+    # el más específico, que es lo que hace ganar a "827 Punto de Encuentro" sobre "Encuentro".
+    # Se exigen límites de palabra: sin eso "tio" matcheaba "pa-TIO" y "confec-TIO-nery", y la
+    # consulta "el tío" terminaba resolviendo a "Antü RestoBar - Patio de Encuentro".
     for nombre_real in nombres:
         nombre_lower = _normalizar_busqueda(nombre_real)
-        if nombre_lower and (nombre_lower in q_norm or q_norm in nombre_lower):
+        if nombre_lower and _contiene_palabra(q_norm, nombre_lower):
             return nombre_real
+
+    # 2. La consulta aparece dentro del nombre ("growler" -> "Growler Bar"). Acá el orden
+    # largo-primero está AL REVÉS de lo que corresponde: entre los nombres que contienen a la
+    # consulta hay que quedarse con el MÁS CORTO, que es el match más ajustado. Con el orden
+    # anterior, "el tío" se resolvía a "PERNILES Del Tío Rudy" —que lo contiene y es más largo—
+    # en vez de a "El Tío", que existe y tiene 3980 reseñas.
+    candidatos = [n for n in nombres if _contiene_palabra(_normalizar_busqueda(n), q_norm)]
+    if candidatos:
+        return min(candidatos, key=len)
 
     for nombre_real in nombres:
         nombre_lower = _normalizar_busqueda(nombre_real)
@@ -2383,20 +2414,25 @@ async def resumir_opiniones_local_gen(
             if mask_exact.any():
                 encontrados = [metadata_df[mask_exact].iloc[0]["restaurante"]]
         else:
+            # Límites de palabra, no substring desnudo: con `contains` plano, "tio" matcheaba
+            # "pa-TIO" y "Confec-TIO-nery", así que "el tío" daba 11 candidatos en vez de 2.
             mask = (
                 metadata_df["restaurante"]
                 .fillna("")
                 .str.lower()
                 .map(_normalizar_busqueda)
-                .str.contains(q_clean, na=False, regex=False)
+                .map(lambda n: _contiene_palabra(n, q_clean))
             )
             candidatos = metadata_df[mask]["restaurante"].unique().tolist()
 
             if len(candidatos) == 1:
                 encontrados = candidatos
             elif len(candidatos) > 1:
-                encontrados = candidatos
-                encontrados.sort()
+                # Por longitud y no alfabético: entre varios nombres que contienen la consulta, el
+                # más corto es el match más ajustado. El orden alfabético ponía primero al que
+                # empezaba con "A" —por eso "el tío" resolvía a "Antü RestoBar"—, que no tiene
+                # ninguna relación con cuál es el que el usuario nombró.
+                encontrados = sorted(candidatos, key=lambda n: (len(n), n))
                 # Menú de opciones
                 labels = []
                 for r in encontrados:

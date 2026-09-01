@@ -215,12 +215,14 @@
     "expected_intent": "SPECIFIC",
     "expected_mode": "resumen",
     "expected_restaurants": [
+      "Growler Bar",
       "Growler's Fulano Birras"
     ],
     "expected_zones": [],
     "min_results": 1,
     "judge_eligible": true,
-    "notes": "nombre parcial/informal, sin 'Bar'. HALLAZGO DE CURACIÓN: la resolución difusa matchea con 'Growler's Fulano Birras' (otro local homónimo), no con 'Growler Bar'. Se acepta como ground truth porque es una resolución razonable dado el nombre parcial ambiguo, no un bug — pero documenta un caso límite real de desambiguación."
+    "notes": "nombre parcial/informal, sin 'Bar'. Hay DOS locales homónimos en la base: 'Growler Bar' y \"Growler's Fulano Birras\", así que la consulta es genuinamente ambigua y cualquiera de los dos es una resolución válida. AMPLIADO el 01-sep-2026: antes esperaba sólo \"Growler's Fulano Birras\", elegido porque era lo que devolvía la resolución difusa al momento de curar — las notas originales ya aclaraban que se aceptaba 'porque es una resolución razonable, no un bug'. Al arreglar la búsqueda por nombre (que usaba substring sin límites de palabra y desempataba por el nombre MÁS LARGO) el desempate pasó a dar 'Growler Bar', igual de válido. Fijar uno de los dos convierte un empate arbitrario en un criterio de correctitud. PENDIENTE de producto: para un nombre parcial ambiguo lo ideal sería mostrar el MENÚ de opciones —el código ya lo soporta en resumir_opiniones_local_gen— pero detectar_mencion_exacta resuelve antes y devuelve uno solo.",
+    "open_ended": true
   },
   {
     "id": "typo_sin_acentos_pizza",
