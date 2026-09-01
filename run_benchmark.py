@@ -221,7 +221,14 @@ def run_benchmark():
               f"Recall@5={fmt(summary['avg_recall'])} | Precision@5={fmt(summary['avg_precision'])} | "
               f"MRR={fmt(summary['avg_mrr'])} | Intent Accuracy={summary['intent_accuracy']:.2f}")
         print(f"   ↳ Retrieval medido sobre {summary['n_retrieval']}/{summary['n_cases']} casos "
-              f"(los demás son de ruteo puro y no aportan al promedio).")
+              f"(los demás son de ruteo puro o se juzgan por evidencia, y no aportan al promedio).")
+        # Las consultas de concepto no se miden contra nombres: se reportan aparte, con cuántos
+        # de los lugares devueltos cumplen de verdad lo que la consulta pedía.
+        if summary.get("n_evidencia"):
+            ratio = summary.get("ev_ratio")
+            print(f"   ↳ Evidencia: {summary['ev_cumplen']}/{summary['ev_total']} lugares devueltos "
+                  f"cumplen los conceptos pedidos ({ratio:.2f}) sobre {summary['n_evidencia']} "
+                  f"consultas de concepto.")
 
         if summary["by_type"]:
             print("\n📋 Breakdown por intención:")

@@ -150,7 +150,11 @@ def evaluate_case(case: dict, actual_mode: str, actual_names: list, k: int = 5, 
 
     # Un caso mide retrieval solo si tiene ground truth que comparar. Los demás (stats, block,
     # followup) miden ruteo: mezclarlos en el promedio de recall regala 1.0 y infla el titular.
-    mide_retrieval = bool(expected_restaurants) or expected_empty
+    # Un caso juzgado por evidencia NO mide retrieval contra nombres: su `expected_restaurants`
+    # quedo como referencia informativa y promediarlo ensucia el titular con una medicion que ya
+    # no gatea nada. Se lo saca del scoreboard de recall/precision y se lo reporta aparte.
+    mide_evidencia = bool(case.get("expected_evidence"))
+    mide_retrieval = (bool(expected_restaurants) or expected_empty) and not mide_evidencia
 
     result = {
         "id": case["id"],
@@ -162,6 +166,7 @@ def evaluate_case(case: dict, actual_mode: str, actual_names: list, k: int = 5, 
         "intent_ok": intent_match(expected_mode, actual_mode),
         "min_results_ok": len(actual_names) >= case.get("min_results", 1),
         "mide_retrieval": mide_retrieval,
+        "mide_evidencia": mide_evidencia,
         "expected_empty": expected_empty,
         "open_ended": bool(case.get("open_ended")),
     }
@@ -214,9 +219,10 @@ def evaluate_case(case: dict, actual_mode: str, actual_names: list, k: int = 5, 
     passed = result["intent_ok"] and retrieval_ok and zona_ok
 
     result.update({
-        "recall": recall,
-        "precision": precision,
-        "mrr": score_mrr,
+        "recall": None if mide_evidencia else recall,
+        "precision": None if mide_evidencia else precision,
+        "mrr": None if mide_evidencia else score_mrr,
+        "recall_informativo": recall,
         "retrieval_ok": retrieval_ok,
         "zona_ok": zona_ok,
         "zona_matched": zona_matched,
@@ -258,6 +264,9 @@ def aggregate(results: list) -> dict:
         }
 
     retrieval = [r for r in scored if r.get("mide_retrieval")]
+    evidencia = [r for r in scored if r.get("mide_evidencia")]
+    ev_cumplen = sum(r.get("ev_cumplen") or 0 for r in evidencia)
+    ev_total = sum(r.get("ev_total") or 0 for r in evidencia)
 
     intent_accuracy = sum(1 for r in scored if r["intent_ok"]) / n_cases
     min_results_pass_rate = sum(1 for r in scored if r["min_results_ok"]) / n_cases
@@ -276,6 +285,10 @@ def aggregate(results: list) -> dict:
         }
 
     return {
+        "n_evidencia": len(evidencia),
+        "ev_cumplen": ev_cumplen,
+        "ev_total": ev_total,
+        "ev_ratio": (ev_cumplen / ev_total) if ev_total else None,
         "n_cases": n_cases,
         "n_skipped": n_skipped,
         "n_retrieval": len(retrieval),
