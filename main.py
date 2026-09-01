@@ -92,6 +92,27 @@ SINONIMOS_CURADOS = {
 }
 
 
+# Conceptos donde mencionar MAS sinonimos significa de verdad que el lugar contempla esa
+# necesidad, y no solo que su resumen sea mas largo. Es la distincion que le faltaba a
+# `evidencia` como desempate del ranking:
+#   - "parrilla" es un TIPO DE COMIDA: un resumen que dice "parrilla, asado, parrillada" no
+#     describe un lugar mas apto, solo uno descrito con mas palabras. Ahi `evidencia` premia
+#     verbosidad y la señal correcta es la popularidad (medido: MRR 1.00 -> 0.33 al usar
+#     `evidencia`).
+#   - "sin tacc" es un REQUISITO EXCLUYENTE: un resumen que dice "sin tacc, sin gluten, apto
+#     celiaco" SI describe un lugar que contempla la necesidad de verdad. Lucciana Pasteleria
+#     Sin Gluten matchea 4 terminos y Antares 1, y esa diferencia es real.
+# Se deja afuera "estacionamiento" a proposito: aparece en 747 de los 929 resumenes (80%), asi
+# que no discrimina nada y solo agregaria ruido.
+CONCEPTOS_EXCLUYENTES = {
+    "sin tacc", "sin gluten", "libre de gluten", "celiaco", "celiaca", "apto celiaco",
+    "sin harina", "vegano", "vegana", "vegetariano", "vegetariana", "plant based",
+    "sin lactosa", "pet friendly", "apto mascotas",
+    "pelotero", "juegos infantiles", "area de juegos", "juegos para chicos",
+    "accesible", "silla de ruedas",
+}
+
+
 def _emparenta(a, b):
     """Prefijo en cualquier dirección: cubre 'veganas'<->'vegano', 'juegos'<->'juegos infantiles'."""
     a, b = _normalizar_busqueda(a), _normalizar_busqueda(b)
@@ -119,6 +140,16 @@ def variantes_de_concepto(keyword):
     #     lugares sin aportar nada.
     # dict.fromkeys preserva el orden, que importa porque el corte en 6 es por posicion.
     return list(dict.fromkeys(variantes))
+
+
+def es_concepto_excluyente(keywords):
+    """True si alguna keyword de la consulta es un requisito excluyente y no un tipo de comida.
+
+    Decide si `evidencia` sirve como desempate del ranking (ver CONCEPTOS_EXCLUYENTES).
+    """
+    return any(
+        _emparenta(k, c) for k in (keywords or []) for c in CONCEPTOS_EXCLUYENTES
+    )
 
 
 def expandir_sinonimos(keywords, synonyms):
@@ -3354,6 +3385,12 @@ async def procesar_consulta_gen(
                 if len(k) > 3 and k.lower().strip() not in KEYWORDS_GENERICAS
             ]
             multi_concepto = len(keywords_core_call) > 1
+            # Un solo concepto NO implica que la popularidad sea la señal correcta: depende de
+            # QUE concepto. Para "parrilla" si; para "sin tacc" no, y ese era el caso que quedaba
+            # mal ordenado (Antares 4.2/5027 antes que Lucciana Pasteleria Sin Gluten 4.7/60,
+            # cuando Lucciana matchea 4 terminos de gluten y Antares 1).
+            excluyente = es_concepto_excluyente(keywords_core_call)
+            usar_relevancia = multi_concepto or excluyente
 
             def rango_relevancia(n):
                 return orden_relevancia.get(n, 10**6)
@@ -3361,7 +3398,7 @@ async def procesar_consulta_gen(
             # El orden en que se MUESTRAN. Para queries de un solo concepto se mantiene la
             # popularidad (era el comportamiento previo y está medido como el mejor); sólo las
             # multi-concepto se muestran por cobertura de conceptos.
-            rango = rango_relevancia if multi_concepto else (lambda n: -get_score(n))
+            rango = rango_relevancia if usar_relevancia else (lambda n: -get_score(n))
 
             # SELECCIÓN. Sólo se reordena por relevancia en queries multi-concepto: es lo que
             # arregla "parrillas con juegos para niños", donde las parrillas con pelotero quedaban
@@ -3369,7 +3406,7 @@ async def procesar_consulta_gen(
             # Juez devolvió los aprobados (comportamiento previo): tocarlo ahí no aporta —todos
             # empatan en cobertura— y está medido que empeora, porque cambia qué 3 entran
             # (`no_falso_bloqueo_queja` bajaba de MRR 1.00 a 0.33).
-            exactos = (sorted(locales_verificados, key=rango_relevancia) if multi_concepto
+            exactos = (sorted(locales_verificados, key=rango_relevancia) if usar_relevancia
                        else locales_verificados)[:3]
 
             relacionados = [
