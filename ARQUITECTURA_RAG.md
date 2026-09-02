@@ -249,25 +249,44 @@ propósito**: fijaría el resultado de un fallo transitorio para todas las consu
 
 ## Cómo se mide todo esto
 
-`python run_benchmark.py` sobre `golden_dataset.json` (33 casos). Hay **dos scoreboards separados**,
+`python run_benchmark.py` sobre `golden_dataset.json` (33 casos). Hay **tres scoreboards separados**,
 y confundirlos lleva a conclusiones falsas:
 
-- **Por nombre** (`Recall@5`, `Precision@5`, `MRR`) — para consultas con ground truth de nombres.
-- **Por evidencia** — para consultas de concepto: en vez de *"¿devolvió estos nombres?"* pregunta
-  *"¿lo que devolvió cumple lo que se pidió?"*, verificando contra el resumen de cada lugar con el
-  mismo `_mencion_positiva` del backend.
+| métrica | qué evalúa | contra qué |
+|---|---|---|
+| `Recall@5` / `Precision@5` / `MRR` | recuperación | lista de nombres curada |
+| **Evidencia** | el **ranking** | las **reseñas** (≥2 menciones positivas) |
+| **Cobertura del resumen** | la capa de **resumen** | cuánto de lo que las reseñas confirman llegó al resumen |
 
-El segundo existe porque una lista de nombres es el instrumento equivocado para consultas de
-concepto, y se comprobó **en los dos sentidos**: con frases contiguas el dataset dejaba afuera
-lugares que sí corresponden, y con co-ocurrencia laxa metía una heladería en "cervecería con patio".
+**Por qué la evidencia se verifica contra las reseñas y no contra el resumen:** el resumen es lo que
+se está evaluando, así que no puede ser también el juez. Medido el 01-sep, la columna v3 daba
+evidencia **0.77 verificada contra sí misma y 0.57 contra una vara fija** — la métrica se inflaba
+sola con sólo agregar texto al campo, y cualquier experimento de prompt salía con una mejora falsa.
+Con las reseñas como vara, la evidencia es invariante a qué resumen se use.
 
-Línea base al 01-sep-2026:
+La evidencia igual varía un poco entre columnas (0.51–0.58), pero **por el motivo correcto**: cada
+resumen hace que el ranking devuelva lugares distintos. Se nota en que cambia el denominador.
+
+Y la cobertura es la que evalúa un prompt nuevo, separada de la que evalúa al ranking:
+
+```
+columna         pasan   Recall  Precision  MRR    Evidencia   Cobertura
+v1 (producción) 27/33    0.80     0.84     0.97     0.51        0.88
+v5.1            28/33    0.74     0.73     0.96     0.58        0.90
+v3 (v1+v5.1)    30/33    0.79     0.80     0.97     0.57        0.97
+```
+
+Línea base al 01-sep-2026, sobre producción:
 
 ```
 27/33 | Recall@5=0.80 | Precision@5=0.84 | MRR=0.97
-Evidencia: 25/47 lugares devueltos cumplen los conceptos pedidos (0.53)
+Evidencia: 0.51   ·   Cobertura del resumen: 0.88
 ```
 
-**El número a mover es el de evidencia.** Y el cuello de botella ya no es el ranking: los resúmenes
-se comen entre un tercio y la mitad de las características que las reseñas confirman, y el resumen
-es la única evidencia que el ranking lee. Eso es el pendiente #1 del DEV_LOG.
+> ⚠️ Los números de evidencia **anteriores al 01-sep no son comparables**: la vara cambió de "el
+> resumen" a "las reseñas". El 0.53 viejo y el 0.51 nuevo miden cosas distintas.
+
+**Limitación conocida:** `_mencion_positiva` está afinado para resúmenes, y las reseñas son
+informales. Chequeado a mano, cuenta alguna mención como positiva cuando la oración termina
+negándola (*"vinimos porque tenían menú sin tacc… en la carta NO hay"*). El umbral de 2 amortigua
+esos casos sueltos, pero el conteo no es exacto.

@@ -710,7 +710,7 @@ async def lifespan(app: FastAPI):
             # `resumen_reviews_v2`) sin promoverlos: se corre el benchmark apuntando ahí y recién
             # si mejora se promueve. Producción usa el default. Ver DEV_LOG 26-ago-2026.
             col_resumen = os.getenv("RESUMEN_COLUMN", "resumen_reviews")
-            if col_resumen not in ("resumen_reviews", "resumen_reviews_v2"):
+            if col_resumen not in ("resumen_reviews", "resumen_reviews_v2", "resumen_reviews_v3"):
                 raise ValueError(f"RESUMEN_COLUMN inválida: {col_resumen}")
             logger.info(f"📄 Columna de resúmenes: {col_resumen}")
             query_lugares = f"""
@@ -3172,7 +3172,12 @@ async def procesar_consulta_gen(
         """Vector search con caché Redis de 7 días."""
         if not vectorstore:
             return []
-        cache_key = _normalizar_busqueda(query_text)[:100]  # normalizar key
+        # La colección va en la clave. Sin esto, un A/B de embeddings sale silenciosamente
+        # INVÁLIDO: al cambiar COLLECTION_NAME el caché seguía sirviendo los resultados de la
+        # colección anterior, así que la corrida "nueva" medía la recuperación de la vieja.
+        # Pasó el 01-sep evaluando los resúmenes v5.1 y dio dos comparaciones idénticas antes de
+        # que el empate delatara el problema.
+        cache_key = f"{COLLECTION_NAME}:{_normalizar_busqueda(query_text)[:100]}"
         cached = await cache.get_json("vsearch", cache_key)
         if cached:
             print(f"[TIMING] Vector Search HIT (Redis cache)", flush=True)
@@ -3676,7 +3681,9 @@ async def procesar_consulta_gen(
                     resumen_ia = safe_str(row_l.get("resumen_reviews"))
                     texto_final = resumen_ia[:600].replace("\n", " ") if resumen_ia and len(resumen_ia) > 30 else "Restaurante popular en Neuquén."
 
-                    contexto += f"- {nom} ({rat}⭐, {revs} res): {texto_final}...\n"
+                    # El formato de esta línea es el que el LLM copia tal cual en su respuesta, así
+                    # que el "res" terminaba visible para el usuario. El 💬 se entiende sin leerlo.
+                    contexto += f"- {nom} ({rat}⭐, 💬 {revs}): {texto_final}...\n"
                 return contexto
 
             detalles_exactos = construir_contexto_rapido(exactos, df_lugares)
@@ -3693,7 +3700,7 @@ async def procesar_consulta_gen(
                     "1. Recomienda los EXACTOS primero.\n"
                     "2. Menciona los RELACIONADOS como alternativa.\n"
                     "3. Usa la info provista para describir qué tienen de bueno.\n"
-                    "4. IMPORTANTE: Inicia cada recomendación con el formato estricto: '**Nombre del Lugar** - (⭐ Rating, N reseñas):' seguido de tu descripción."
+                    "4. IMPORTANTE: Inicia cada recomendación con el formato estricto: '**Nombre del Lugar** - (⭐ Rating, 💬 N):' seguido de tu descripción. El 💬 va tal cual: es el ícono de reseñas."
                 )
             elif exactos:
                 prompt_rag = (
@@ -3703,7 +3710,7 @@ async def procesar_consulta_gen(
                     f"INSTRUCCIONES:\n"
                     "1. Confirma que encontraste lo que buscaba.\n"
                     "2. Describelos usando la info provista.\n"
-                    "3. IMPORTANTE: Inicia cada recomendación con el formato estricto: '**Nombre del Lugar** - (⭐ Rating, N reseñas):' seguido de tu descripción."
+                    "3. IMPORTANTE: Inicia cada recomendación con el formato estricto: '**Nombre del Lugar** - (⭐ Rating, 💬 N):' seguido de tu descripción. El 💬 va tal cual: es el ícono de reseñas."
                 )
             else:
                 prompt_rag = (
@@ -3713,7 +3720,7 @@ async def procesar_consulta_gen(
                     f"INSTRUCCIONES:\n"
                     "1. Aclara que no encontraste match exacto.\n"
                     "2. Ofrece estos relacionados.\n"
-                    "3. IMPORTANTE: Inicia cada recomendación con el formato estricto: '**Nombre del Lugar** - (⭐ Rating, N reseñas):' seguido de tu descripción."
+                    "3. IMPORTANTE: Inicia cada recomendación con el formato estricto: '**Nombre del Lugar** - (⭐ Rating, 💬 N):' seguido de tu descripción. El 💬 va tal cual: es el ícono de reseñas."
                 )
 
             t_stream_start = time.time()

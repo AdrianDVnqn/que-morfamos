@@ -7,7 +7,7 @@ from colorama import Fore, Style, init
 
 from fastapi.testclient import TestClient
 
-from eval_metrics import evaluate_case, aggregate, PLACEHOLDER
+from eval_metrics import evaluate_case, aggregate, PLACEHOLDER, UMBRAL_RESENAS
 from judge import judge_answer_quality
 
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -36,26 +36,102 @@ FALLBACK_ERROR_TEXT = "Tuve un problema técnico"
 
 _CACHE_EVIDENCIA = {}
 
+# Los casos cargados, para que `_evidencia_del_backend` sepa que terminos indexar. Se llena en
+# `run_benchmark()`; queda a nivel modulo porque la evaluacion de cada caso corre en otra funcion.
+CASOS_CARGADOS = []
 
-def _evidencia_del_backend():
-    """Mapa {nombre: resumen_reviews} y el matcher negacion-aware, tomados del modulo bajo test.
 
-    Se cachea porque se llama una vez por caso y df_lugares no cambia durante la corrida.
+def _terminos_del_dataset(casos):
+    """Todos los terminos que aparecen en algun `expected_evidence`, sin repetir."""
+    terminos = set()
+    for c in casos:
+        for grupo in (c.get("expected_evidence") or []):
+            terminos.update(grupo)
+    return sorted(terminos)
+
+
+def _indice_de_evidencia(casos):
+    """Cuantas resenas confirman cada concepto, por lugar. Es la VARA de la metrica.
+
+    Se verifica contra las RESENAS y no contra el resumen, por dos motivos:
+
+    1. El resumen es lo que estamos evaluando; no puede ser tambien el juez. Medido el 01-sep:
+       la columna v3 (v1 + v5.1 concatenados) daba evidencia 0.77 verificada contra si misma y
+       0.57 contra una vara fija. La metrica se inflaba sola con solo agregar texto al campo.
+    2. El resumen es lossy y esta medido cuanto: se come entre un tercio y la mitad de las
+       caracteristicas que las resenas SI confirman (pet friendly 54%, wifi 43%, musica en vivo
+       44%). Verificar contra el castiga al ranking por errores de la capa de resumen.
+
+    Una sola consulta al arrancar: 50 terminos distintos, ~22.300 resenas, ~5s. El conteo usa
+    `_mencion_positiva` del backend, asi que un "no aceptan mascotas" no cuenta a favor.
+
+    Devuelve {(nombre, indice_del_grupo): n_menciones_positivas}.
+    """
+    modulo = importlib.import_module(MODULE_NAME)
+    mencion = getattr(modulo, "_mencion_positiva", None)
+    terminos = _terminos_del_dataset(casos)
+    if not terminos or mencion is None:
+        return {}, {}
+
+    from sqlalchemy import text as _sql
+    print(f"📚 Indexando evidencia desde resenas ({len(terminos)} terminos)...")
+    t0 = time.time()
+    por_lugar = {}
+    with modulo.db_engine.connect() as conn:
+        filas = conn.execute(_sql("""
+            SELECT l.nombre, r.texto
+            FROM reviews r
+            JOIN lugares l ON l.id = r.lugar_id
+            WHERE length(r.texto) > 30 AND r.texto ILIKE ANY(:pats)
+        """), {"pats": [f"%{t}%" for t in terminos]})
+        for nombre, texto in filas:
+            por_lugar.setdefault(str(nombre), []).append(texto or "")
+
+    # Se cuenta por GRUPO de concepto y no por termino suelto: los terminos de un grupo son
+    # sinonimos entre si ("musica"/"banda"/"show"), asi que una resena que menciona dos no es
+    # doble evidencia.
+    grupos = []
+    for c in casos:
+        for g in (c.get("expected_evidence") or []):
+            if g not in grupos:
+                grupos.append(g)
+
+    indice = {}
+    for nombre, textos in por_lugar.items():
+        for gi, grupo in enumerate(grupos):
+            n = sum(1 for t in textos if any(mencion(t, term) for term in grupo))
+            if n:
+                indice[(nombre, gi)] = n
+    print(f"   {len(por_lugar)} lugares con resenas relevantes, {len(indice)} pares "
+          f"lugar/concepto con evidencia ({time.time() - t0:.1f}s)")
+    return indice, {tuple(g): i for i, g in enumerate(grupos)}
+
+
+def _evidencia_del_backend(casos=None):
+    """(indice_de_resenas, mapa_de_grupos, resumenes, mencion). Se calcula una sola vez.
+
+    `resumenes` ya NO es la vara: se conserva sólo para la segunda métrica —cobertura del
+    resumen—, que mide cuánto de lo que las resenas confirman llegó efectivamente al resumen.
+    Esa es la que evalúa un prompt nuevo; la evidencia evalúa al ranking.
     """
     if not _CACHE_EVIDENCIA:
         try:
             modulo = importlib.import_module(MODULE_NAME)
             df = getattr(modulo, "df_lugares", None)
-            mapa = {}
+            resumenes = {}
             if df is not None and not df.empty and "resumen_reviews" in df.columns:
-                mapa = {str(i): str(v or "") for i, v in df["resumen_reviews"].items()}
-            _CACHE_EVIDENCIA["resumenes"] = mapa
-            _CACHE_EVIDENCIA["mencion"] = getattr(modulo, "_mencion_positiva", None)
+                resumenes = {str(i): str(v or "") for i, v in df["resumen_reviews"].items()}
+            indice, grupos = _indice_de_evidencia(casos or [])
+            _CACHE_EVIDENCIA.update({
+                "indice": indice, "grupos": grupos,
+                "resumenes": resumenes,
+                "mencion": getattr(modulo, "_mencion_positiva", None),
+            })
         except Exception as e:
-            print(f"⚠️  No se pudo cargar la evidencia para las aserciones: {e}")
-            _CACHE_EVIDENCIA["resumenes"] = {}
-            _CACHE_EVIDENCIA["mencion"] = None
-    return _CACHE_EVIDENCIA["resumenes"], _CACHE_EVIDENCIA["mencion"]
+            print(f"⚠️  No se pudo construir el indice de evidencia: {e}")
+            _CACHE_EVIDENCIA.update({"indice": {}, "grupos": {}, "resumenes": {}, "mencion": None})
+    return (_CACHE_EVIDENCIA["indice"], _CACHE_EVIDENCIA["grupos"],
+            _CACHE_EVIDENCIA["resumenes"], _CACHE_EVIDENCIA["mencion"])
 
 
 def run_single_case(client, case):
@@ -83,12 +159,13 @@ def run_single_case(client, case):
     reply = data.get("response", "")
     actual_mode = data.get("mode", "")
 
-    # Los resumenes y el matcher con conciencia de negacion salen del backend, para que la
-    # asercion por evidencia use exactamente el mismo criterio que el ranking (un resumen que
-    # dice "NO tienen opciones veganas" no cuenta como evidencia a favor).
-    resumenes, mencion = _evidencia_del_backend()
+    # La evidencia se verifica contra las RESENAS (indice/grupos) y el resumen queda solo para la
+    # segunda metrica, la cobertura. Se pasa el matcher del backend para que el conteo use el
+    # mismo criterio de negacion que el ranking.
+    indice, grupos, resumenes, mencion = _evidencia_del_backend(CASOS_CARGADOS)
     result = evaluate_case(case, actual_mode, card_names, k=5, cards=cards,
-                           resumenes=resumenes, mencion=mencion)
+                           resumenes=resumenes, mencion=mencion,
+                           indice=indice, grupos=grupos)
     # El backend atrapa los errores de LLM y responde 200 con un texto de fallback, así que un
     # corte de la API (ej. saldo agotado en DeepSeek) se vería como si TODOS los casos fallaran
     # a la vez. Sin esta marca, el modo estabilidad reporta eso como "±19 casos inestables"
@@ -170,12 +247,16 @@ def print_flakiness(historial, n_corridas):
 
 
 def run_benchmark():
+    global CASOS_CARGADOS
     try:
         with open(GOLDEN_FILE, "r", encoding="utf-8") as f:
             cases = json.load(f)
     except FileNotFoundError:
         print(f"❌ No encontré {GOLDEN_FILE}")
         return
+    # El indice de evidencia necesita saber que terminos busca el dataset, y se arma una sola vez
+    # en el primer caso evaluado.
+    CASOS_CARGADOS = cases
 
     print(f"\n🚀 Iniciando Golden Dataset Eval ({len(cases)} casos)"
           f"{' | Judge de calidad ACTIVADO' if WITH_JUDGE else ''}"
@@ -228,7 +309,14 @@ def run_benchmark():
             ratio = summary.get("ev_ratio")
             print(f"   ↳ Evidencia: {summary['ev_cumplen']}/{summary['ev_total']} lugares devueltos "
                   f"cumplen los conceptos pedidos ({ratio:.2f}) sobre {summary['n_evidencia']} "
-                  f"consultas de concepto.")
+                  f"consultas de concepto. [vara: reseñas, ≥{UMBRAL_RESENAS} menciones positivas]")
+            # Segunda métrica, la que evalúa la capa de RESUMEN y no el ranking: de lo que las
+            # reseñas confirman, cuánto llegó al resumen. Es la que hay que mirar para decidir si
+            # un prompt nuevo sirve.
+            if summary.get("cob_total"):
+                print(f"   ↳ Cobertura del resumen: {summary['cob_cubiertos']}/{summary['cob_total']} "
+                      f"({summary['cob_ratio']:.2f}) de lo que las reseñas confirman aparece también "
+                      f"en el resumen.")
 
         if summary["by_type"]:
             print("\n📋 Breakdown por intención:")

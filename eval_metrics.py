@@ -102,41 +102,74 @@ def category_match(expected_categories: list, cards: list, k: int = 5, min_ratio
     return (matched / len(top_k)) >= min_ratio, matched, len(top_k)
 
 
-def evidence_match(expected_evidence, actual_names, resumenes, k=5, mencion=None):
-    """Chequea que cada lugar devuelto TENGA la evidencia que la consulta pedia.
+UMBRAL_RESENAS = 2
+"""Cuantas resenas distintas tienen que confirmar un concepto para darlo por cumplido.
 
-    `expected_evidence` es una lista de conceptos, y cada concepto una lista de terminos
-    aceptables: un lugar cumple si su resumen menciona al menos UNO de cada concepto.
+Dos y no una: una mencion suelta puede ser ironica, equivocada o vieja. Es el mismo criterio con
+el que se derivo el ground truth el 01-sep.
+"""
 
-    Existe porque una lista de nombres exactos es el instrumento equivocado para consultas de
-    concepto, y eso se comprobo el 01-sep: derivar el ground truth con frases contiguas
-    ("musica en vivo") deja afuera lugares que SI corresponden —los 5 que el sistema devolvia
-    para esa consulta mencionaban musica y vivo en su resumen, o sea que el equivocado era el
-    dataset—, y derivarlo con co-ocurrencia laxa mete lugares que no corresponden (una heladeria
-    entraba en "cerveceria con patio" porque su resumen nombraba cerveza y patio en frases
-    distintas). Preguntar por la evidencia en vez de por los nombres saca la curacion subjetiva
-    del medio: la pregunta pasa a ser "¿lo que devolvio cumple lo que se pidio?", que es
-    verificable contra los datos.
 
-    `mencion` permite inyectar el matcher con conciencia de negacion del backend
-    (`_mencion_positiva`), para no contar como evidencia un "NO tienen opciones veganas".
+def evidence_match(expected_evidence, actual_names, indice, grupos, k=5, umbral=UMBRAL_RESENAS):
+    """De los lugares devueltos, cuantos cumplen DE VERDAD lo que la consulta pidio.
+
+    La vara son las RESENAS, no el resumen. `indice` es {(nombre, i_grupo): n_menciones} y
+    `grupos` mapea cada grupo de terminos a su indice; los arma `run_benchmark` con una consulta.
+
+    Por que no el resumen: es lo que estamos evaluando, asi que no puede ser tambien el juez.
+    Medido el 01-sep, la columna v3 daba 0.77 verificada contra si misma y 0.57 contra una vara
+    fija — la metrica se inflaba con solo agregar texto al campo. Con las resenas como vara, la
+    evidencia es invariante a que resumen se use y sirve para comparar variantes entre si.
+
+    Un lugar cumple si TODOS los conceptos de la consulta tienen >= `umbral` resenas que los
+    confirmen.
     """
     if not expected_evidence:
-        return True, 0, 0
-    check = mencion or (lambda texto, termino: termino.lower() in (texto or "").lower())
+        return 0, 0, 0
     considerados = actual_names[:k]
     if not considerados:
-        return False, 0, 0
+        return 0, 0, 0
     cumplen = 0
     for nombre in considerados:
-        resumen = (resumenes or {}).get(nombre, "")
-        if all(any(check(resumen, t) for t in grupo) for grupo in expected_evidence):
-            cumplen += 1
+        ok = True
+        for grupo in expected_evidence:
+            gi = (grupos or {}).get(tuple(grupo))
+            if gi is None or (indice or {}).get((nombre, gi), 0) < umbral:
+                ok = False
+                break
+        cumplen += 1 if ok else 0
     return cumplen, cumplen, len(considerados)
 
 
+def summary_coverage(expected_evidence, actual_names, indice, grupos, resumenes, k=5,
+                     mencion=None, umbral=UMBRAL_RESENAS):
+    """De los lugares que las RESENAS confirman, en cuantos el RESUMEN tambien lo dice.
+
+    Es la metrica que evalua la capa de resumen, separada de la que evalua al ranking. Sale casi
+    gratis porque el indice de resenas ya esta armado.
+
+    Medido a mano el 01-sep sobre una muestra dirigida, el resumen de produccion captura el 33%
+    de las features que las resenas confirman, y el prompt v5.1 el 51%. Tener el numero adentro
+    del benchmark es lo que permite evaluar un prompt nuevo sin tocar la metrica del ranking.
+    """
+    if not expected_evidence or not resumenes:
+        return 0, 0
+    check = mencion or (lambda t, term: term.lower() in (t or "").lower())
+    confirmados = cubiertos = 0
+    for nombre in actual_names[:k]:
+        for grupo in expected_evidence:
+            gi = (grupos or {}).get(tuple(grupo))
+            if gi is None or (indice or {}).get((nombre, gi), 0) < umbral:
+                continue  # las resenas no lo confirman: no hay nada que el resumen deba reflejar
+            confirmados += 1
+            if any(check(resumenes.get(nombre, ""), t) for t in grupo):
+                cubiertos += 1
+    return cubiertos, confirmados
+
+
 def evaluate_case(case: dict, actual_mode: str, actual_names: list, k: int = 5, cards: list = None,
-                  resumenes: dict = None, mencion=None) -> dict:
+                  resumenes: dict = None, mencion=None, indice: dict = None,
+                  grupos: dict = None) -> dict:
     """
     Evalúa un único caso del golden dataset contra la respuesta real del backend.
     actual_names: lista de nombres de restaurantes devueltos (ya extraídos de restaurant_cards).
@@ -180,9 +213,12 @@ def evaluate_case(case: dict, actual_mode: str, actual_names: list, k: int = 5, 
     score_mrr = mrr(expected_restaurants, actual_names)
     cat_ok, cat_matched, cat_total = category_match(case.get("expected_category", []), cards or [], k)
     ev_cumplen, _, ev_total = evidence_match(
-        case.get("expected_evidence", []), actual_names, resumenes, k, mencion
+        case.get("expected_evidence", []), actual_names, indice, grupos, k
     )
     ev_ratio = (ev_cumplen / ev_total) if ev_total else None
+    cob_cubiertos, cob_total = summary_coverage(
+        case.get("expected_evidence", []), actual_names, indice, grupos, resumenes, k, mencion
+    )
 
     if expected_empty:
         # Caso que debe NO devolver resultados. Antes esto era un pass automático (la condición
@@ -233,6 +269,8 @@ def evaluate_case(case: dict, actual_mode: str, actual_names: list, k: int = 5, 
         "ev_cumplen": ev_cumplen,
         "ev_total": ev_total,
         "ev_ratio": ev_ratio,
+        "cob_cubiertos": cob_cubiertos,
+        "cob_total": cob_total,
         "passed": passed,
     })
     return result
@@ -267,6 +305,8 @@ def aggregate(results: list) -> dict:
     evidencia = [r for r in scored if r.get("mide_evidencia")]
     ev_cumplen = sum(r.get("ev_cumplen") or 0 for r in evidencia)
     ev_total = sum(r.get("ev_total") or 0 for r in evidencia)
+    cob_cubiertos = sum(r.get("cob_cubiertos") or 0 for r in evidencia)
+    cob_total = sum(r.get("cob_total") or 0 for r in evidencia)
 
     intent_accuracy = sum(1 for r in scored if r["intent_ok"]) / n_cases
     min_results_pass_rate = sum(1 for r in scored if r["min_results_ok"]) / n_cases
@@ -289,6 +329,9 @@ def aggregate(results: list) -> dict:
         "ev_cumplen": ev_cumplen,
         "ev_total": ev_total,
         "ev_ratio": (ev_cumplen / ev_total) if ev_total else None,
+        "cob_cubiertos": cob_cubiertos,
+        "cob_total": cob_total,
+        "cob_ratio": (cob_cubiertos / cob_total) if cob_total else None,
         "n_cases": n_cases,
         "n_skipped": n_skipped,
         "n_retrieval": len(retrieval),
