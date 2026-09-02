@@ -163,6 +163,14 @@ SINONIMOS_CURADOS = {
     "terraza": ["patio", "al aire libre", "deck", "mesas afuera", "aire libre"],
     "pet friendly": ["mascota", "mascotas", "perro", "perros", "apto mascotas"],
     "wifi": ["wi-fi", "conexion a internet", "internet"],
+    # Estilo de pizza. Se cura a mano porque el generador no puede inferir las variantes
+    # ortográficas —"napoletano" con E es la grafía italiana y casi no aparece en las reseñas,
+    # aunque sí en las consultas— y porque el corpus sólo tiene la forma femenina plural.
+    # OJO al interpretarlo: "napolitana" significa TRES cosas distintas en este corpus (la
+    # milanesa a la napolitana, la pizza argentina con tomate en rodajas, y el estilo de masa
+    # italiano). Funciona igual porque se rescata como SEGUNDO concepto junto a "pizza", y exigir
+    # los dos deja afuera a los bodegones de milanesas.
+    "napolitano": ["napolitana", "napolitanas", "napoletano", "napoletana", "estilo napolitano"],
 }
 
 
@@ -244,6 +252,82 @@ def variantes_de_concepto(keyword):
     #     lugares sin aportar nada.
     # dict.fromkeys preserva el orden, que importa porque el corte en 6 es por posicion.
     return list(dict.fromkeys(variantes))
+
+
+def rescatar_conceptos_de_la_query(query, keywords):
+    """Recupera conceptos que están en la consulta y el router NO devolvió.
+
+    `atomizar_keywords` parte lo que el router manda pegado, pero no puede recuperar lo que el
+    router directamente descartó. Y descarta bastante: medido, para "pizzas estilo napoletano"
+    devuelve `['pizza']` a secas — el modificador de estilo desaparece antes de llegar al ranking,
+    así que la consulta termina resolviendo igual que "mejores pizzas".
+
+    Insistirle al prompt ya se probó y no alcanza (tiene ejemplos explícitos y los ignora), así
+    que se rescata por código: se buscan en la consulta los términos del vocabulario de conceptos
+    que ninguna keyword ya cubre, y se agregan.
+
+    Conservador a propósito: sólo rescata términos que YA están en el vocabulario derivado del
+    corpus. No inventa conceptos nuevos ni parte palabras — si el término no existe en los
+    resúmenes, agregarlo no ayudaría a nadie y sólo ensuciaría el ranking.
+    """
+    q = _normalizar_busqueda(query)
+    if not q:
+        return keywords
+
+    ya_cubierto = {_normalizar_busqueda(k) for k in (keywords or [])}
+    rescatados = []
+    # Del más largo al más corto: si la consulta dice "pizzas napolitanas" se rescata ese término
+    # completo y no "napolitanas" suelto.
+    for termino in sorted(_conceptos_del_vocabulario(), key=len, reverse=True):
+        t = _normalizar_busqueda(termino)
+        if not t or len(t) < 4 or t in ya_cubierto:
+            continue
+        if any(t in c or c in t for c in ya_cubierto | set(rescatados)):
+            continue
+        if _contiene_palabra(q, t):
+            rescatados.append(t)
+
+    if rescatados:
+        print(f"[DEBUG] 🔎 Conceptos rescatados de la consulta (el router los descartó): "
+              f"{rescatados}", flush=True)
+    return list(keywords or []) + rescatados
+
+
+# Conceptos que son un TIPO DE COMIDA y no un modificador. El rescate no los toca.
+#
+# La distinción es la que hace que el rescate sea seguro: el router se encarga de identificar QUÉ
+# quiere el usuario; el rescate sólo agrega CÓMO o CON QUÉ lo quiere. Sin este filtro, para
+# "la milanesa que comí ayer estaba una mierda, recomendame otra parrilla buena" se rescataba
+# "milanesa" —justo lo que el usuario está DESCARTANDO— y la consulta se arruinaba. Medido: ese
+# caso del golden dataset pasaba de PASÓ a FALLÓ.
+PRODUCTOS_NO_RESCATABLES = {
+    "milanesa", "sushi", "pizza", "parrilla", "hamburguesa", "pastas", "helado",
+    "pasteleria", "empanadas", "cerveza artesanal", "vinos", "cocteles",
+    "cafe de especialidad", "desayuno", "merienda", "brunch",
+}
+
+
+def _conceptos_del_vocabulario():
+    """Términos de concepto que el rescate PUEDE agregar: modificadores, no tipos de comida.
+
+    Se excluyen los productos (ver PRODUCTOS_NO_RESCATABLES) y las claves de
+    `KEYWORD_TO_CATEGORIES`, que son categorías de negocio y ya las maneja el Modo Genérico.
+    """
+    universo = set(SINONIMOS)
+    for extras in SINONIMOS.values():
+        universo.update(extras)
+    universo.update(CONCEPTOS_EXCLUYENTES)
+
+    prohibidos = set()
+    for p in PRODUCTOS_NO_RESCATABLES | set(KEYWORD_TO_CATEGORIES):
+        pn = _normalizar_busqueda(p)
+        prohibidos.add(pn)
+        # También sus sinónimos: rescatar "hamburguesas gourmet" es lo mismo que rescatar
+        # "hamburguesa" para el caso que esto viene a evitar.
+        for extra in SINONIMOS.get(p, []):
+            prohibidos.add(_normalizar_busqueda(extra))
+
+    return {t for t in universo if _normalizar_busqueda(t) not in prohibidos}
 
 
 def es_concepto_excluyente(keywords):
@@ -3215,6 +3299,9 @@ async def procesar_consulta_gen(
     # "pizza sin tacc", contra 19 que son pizza Y sin tacc por separado), así que todos los
     # candidatos empataban en 0 conceptos y el orden caía íntegro a popularidad.
     keywords = atomizar_keywords(analisis.get("keywords", []))
+    # Segunda red sobre el router: `atomizar_keywords` parte lo que vino pegado, pero no recupera
+    # lo que el router descartó. Para "pizzas estilo napoletano" devuelve ['pizza'] a secas.
+    keywords = rescatar_conceptos_de_la_query(query, keywords)
     # Los sinónimos del LLM varían mucho según el proveedor (gpt-4o-mini devuelve [] siempre),
     # así que se completan con los curados: el ranking no debe depender del modelo.
     synonyms = expandir_sinonimos(keywords, analisis.get("synonyms", []))
