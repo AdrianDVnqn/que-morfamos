@@ -60,6 +60,14 @@ NEGATION_RE = re.compile(r"\b(no|ni|sin|carece|falta|ausencia)\b")
 # cualquier otra ("sin pelotero", "sin estacionamiento"), el "sin" si es una negacion.
 FEATURES_CON_SIN = {"gluten", "tacc", "lactosa", "azucar", "alcohol", "conservantes", "sal"}
 
+# Parametros del promedio bayesiano que ordena por calidad (ver `calc_score`).
+# MEDIA_RATING_GLOBAL: medido sobre los lugares con mas de 50 resenas, que son los que tienen un
+# rating creible. PESO_CREDIBILIDAD: cuantas resenas hacen falta para que el rating propio pese
+# tanto como esa media. 150 cae en el rango donde se vuelve sospechosa la manipulacion y esta
+# cerca de la mediana del catalogo (103 resenas).
+MEDIA_RATING_GLOBAL = float(os.getenv("MEDIA_RATING_GLOBAL", "4.21"))
+PESO_CREDIBILIDAD = int(os.getenv("PESO_CREDIBILIDAD", "150"))
+
 
 # Ocasiones que exigen ESTAR en el lugar: no alcanza con que la comida sea buena, hay que poder
 # sentarse. Es una lista de marcadores de la consulta, deliberadamente conservadora — ante la
@@ -328,6 +336,45 @@ def _conceptos_del_vocabulario():
             prohibidos.add(_normalizar_busqueda(extra))
 
     return {t for t in universo if _normalizar_busqueda(t) not in prohibidos}
+
+
+def categorias_pedidas(keywords):
+    """Categorías oficiales de Google para las keywords que son TIPO DE NEGOCIO.
+
+    Se excluyen los conceptos de requisito excluyente (`CONCEPTOS_EXCLUYENTES`: vegano, sin tacc,
+    pet friendly…) aunque estén en `KEYWORD_TO_CATEGORIES`, porque para ellos la categoría MIENTE.
+    El caso está documentado en el propio código: BIO ZEN figura como "Restaurant" en Google pese
+    a ser vegetariano. Premiar la categoría ahí hunde a los lugares que sí cumplen y no fueron
+    catalogados como tales.
+
+    Para un tipo de negocio la categoría es confiable —una pizzería está catalogada como
+    pizzería— y es la señal que distingue a Cabildo (Pizza restaurant, 4.2/4542) de Antares
+    (Brewpub, 4.2/5027) cuando alguien pide "mejores pizzas".
+    """
+    cats = set()
+    for k in (keywords or []):
+        kn = _normalizar_busqueda(k)
+        if es_concepto_excluyente([kn]):
+            continue
+        cats.update(KEYWORD_TO_CATEGORIES.get(kn, []))
+    return cats
+
+
+def coincide_categoria(categoria, cats_pedidas):
+    """1 si el local ES del rubro que se pidió, 0 si sólo lo menciona.
+
+    Reportado con "mejores pizzas": de los cinco resultados, DOS eran brewpubs (Antares y OGHAM,
+    4.2 con ~4.700 reseñas cada uno) que venden pizza además de cerveza. Competían de igual a
+    igual con Cabildo Pizzería, que es `Pizza restaurant` con 4.2 y 4.542 reseñas — pero cuyo
+    rating habla de sus pizzas y no de su cerveza.
+
+    Es una señal distinta del rating y del volumen, y por eso no se arregla tocando `calc_score`:
+    cambiar esa fórmula a un promedio bayesiano se probó y el benchmark la rechazó (29/33 -> 23/33).
+    Lo que faltaba no era pesar distinto el rating, era mirar `categoria`.
+    """
+    if not cats_pedidas:
+        return 0
+    return 1 if safe_str(categoria) in cats_pedidas else 0
 
 
 def es_concepto_excluyente(keywords):
@@ -3040,6 +3087,24 @@ def procesar_recomendacion_pesado(
     candidatos_confiables = set(candidatos_crudos)
 
     def calc_score(nombre):
+        """Popularidad: rating mas el volumen de resenas, en escala logaritmica.
+
+        PROBADO Y REVERTIDO (02-sep): se cambio por un promedio bayesiano
+        `(v/(v+m))*rating + (m/(v+m))*media_global` con m=150, para que un 5.0 con 20 resenas no
+        ganara por default y para que el volumen dejara de dominar sobre el rating. Conceptualmente
+        respondia mejor a "mejores X", pero el benchmark lo rechazo sin ambiguedad:
+
+            pasan 29/33 -> 23/33 | Recall 0.80 -> 0.56 | Precision 0.82 -> 0.58
+
+        La razon, que la aporto el usuario mirando los resultados: el volumen de resenas NO es solo
+        popularidad, es tambien una senal de que el lugar es relevante y esta establecido. Cabildo
+        Pizzeria con 4.2 y 4542 resenas es una referencia de pizza en Neuquen; sacarlo del top para
+        meter lugares de 250 resenas empeora la respuesta aunque el rating diga otra cosa.
+
+        Lo que el usuario si detecto como problema real es OTRA cosa, y no se arregla con esta
+        formula: que un rating alto pesa igual venga de una PIZZERIA o de una cerveceria que ademas
+        vende pizza. Eso es especificidad de categoria y necesita mirar `categoria`, no el rating.
+        """
         if nombre not in df_lugares_ref.index: return 0
         r = df_lugares_ref.loc[nombre]
         if isinstance(r, pd.DataFrame): r = r.iloc[0]
@@ -3150,11 +3215,25 @@ def procesar_recomendacion_pesado(
         evidencia = sum(1 for t in filtro_terms if _mencion_positiva(resumen, t))
         return (conceptos, evidencia, calc_score(nombre))
 
+    # La categoría pesa MÁS que la popularidad: un local del rubro pedido le gana a uno que sólo
+    # lo menciona, aunque tenga más reseñas. Va como primer elemento de la tupla, así que sólo
+    # desempata entre iguales y no altera nada más del orden.
+    _cats = categorias_pedidas(keywords)
+
+    def calidad(nombre):
+        cat = ""
+        if nombre in df_lugares_ref.index:
+            fila = df_lugares_ref.loc[nombre]
+            if isinstance(fila, pd.DataFrame):
+                fila = fila.iloc[0]
+            cat = fila.get("categoria", "")
+        return (coincide_categoria(cat, _cats), calc_score(nombre))
+
     if usa_match_count:
         grupo_alta.sort(key=relevancia, reverse=True)
     else:
-        grupo_alta.sort(key=calc_score, reverse=True)
-    grupo_baja.sort(key=calc_score, reverse=True)
+        grupo_alta.sort(key=calidad, reverse=True)
+    grupo_baja.sort(key=calidad, reverse=True)
 
     candidatos_verif = (grupo_alta[:12] + grupo_baja[:12])[:12]
     return candidatos_verif, grupo_alta, candidatos_confiables
@@ -3674,11 +3753,17 @@ async def procesar_consulta_gen(
             # al final.
             orden_relevancia = {n: i for i, n in enumerate(grupo_alta_relevancia)}
 
+            # Mismo criterio que el orden de candidatos: la categoría manda sobre la
+            # popularidad. Si sólo se aplicara aguas arriba, el orden FINAL volvería a mezclar
+            # cervecerías con pizzerías justo en lo que ve el usuario.
+            _cats_final = categorias_pedidas(keywords)
+
             def get_score(n):
-                if n not in df_lugares.index: return 0
+                if n not in df_lugares.index: return (0, 0)
                 r = df_lugares.loc[n]
                 if isinstance(r, pd.DataFrame): r = r.iloc[0]
-                return safe_float(r.get("rating_gral")) + (math.log10(safe_int(r.get("total_reviews_google")) + 1) * 2.7)
+                popularidad = safe_float(r.get("rating_gral")) + (math.log10(safe_int(r.get("total_reviews_google")) + 1) * 2.7)
+                return (coincide_categoria(r.get("categoria", ""), _cats_final), popularidad)
 
             # La cobertura de conceptos sólo discrimina si hay MÁS DE UN concepto que cubrir. En una
             # query de un solo concepto ("parrilla") todos los candidatos empatan en conceptos=1 y
@@ -3705,7 +3790,10 @@ async def procesar_consulta_gen(
             # El orden en que se MUESTRAN. Para queries de un solo concepto se mantiene la
             # popularidad (era el comportamiento previo y está medido como el mejor); sólo las
             # multi-concepto se muestran por cobertura de conceptos.
-            rango = rango_relevancia if usar_relevancia else (lambda n: -get_score(n))
+            # `get_score` devuelve (coincide_categoria, popularidad) y el orden es ascendente,
+            # asi que se niegan los DOS componentes para que ambos queden descendentes. Negar solo
+            # el primero invertiria la popularidad.
+            rango = rango_relevancia if usar_relevancia else (lambda n: tuple(-x for x in get_score(n)))
 
             # SELECCIÓN. Sólo se reordena por relevancia en queries multi-concepto: es lo que
             # arregla "parrillas con juegos para niños", donde las parrillas con pelotero quedaban
