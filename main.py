@@ -68,6 +68,29 @@ FEATURES_CON_SIN = {"gluten", "tacc", "lactosa", "azucar", "alcohol", "conservan
 MEDIA_RATING_GLOBAL = float(os.getenv("MEDIA_RATING_GLOBAL", "4.21"))
 PESO_CREDIBILIDAD = int(os.getenv("PESO_CREDIBILIDAD", "150"))
 
+# Techo TEORICO del QM bruto: un 5.0 perfecto con ~20.000 resenas. Se usa para llevar el score a
+# una escala de 0 a 5 y poder mostrarlo al lado de las estrellas de Google.
+#
+# Es fijo a proposito, y NO el maximo observado: si se normalizara contra el maximo real, el QM de
+# un local cambiaria porque OTRO local crecio, que es justo lo que no se quiere en un numero que
+# el usuario compara entre tarjetas. Con 16.6, hoy el mejor del catalogo llega a 4.6 y queda techo.
+QM_TECHO_TEORICO = 16.6
+
+
+def qm_bruto(rating, total_reviews):
+    """Valoracion propia del motor, en su escala nativa (~2.3 a ~15.4).
+
+    Vive aca, a nivel de modulo, para que `calc_score` (el ranking) y las tarjetas que se le
+    muestran al usuario usen LA MISMA formula. Duplicarla garantizaba que un dia el numero que
+    ve la gente dejara de ser el que ordena.
+    """
+    return safe_float(rating) + (math.log10(safe_int(total_reviews) + 1) * 2.7)
+
+
+def qm_en_estrellas(rating, total_reviews):
+    """El QM bruto llevado a 0-5, para poder compararlo con el rating de Google."""
+    return round(min(qm_bruto(rating, total_reviews) / QM_TECHO_TEORICO * 5, 5.0), 1)
+
 
 # Ocasiones que exigen ESTAR en el lugar: no alcanza con que la comida sea buena, hay que poder
 # sentarse. Es una lista de marcadores de la consulta, deliberadamente conservadora — ante la
@@ -1136,6 +1159,13 @@ class RestaurantCard(BaseModel):
     descripcion: str = ""
     frase_destacada: str = ""
     autor_reseña: str = ""
+    # Transparencia del ranking: que el usuario pueda ver POR QUE aparece este lugar.
+    # `qm_score` es la valoracion propia en escala 0-5 (comparable con las estrellas de Google) y
+    # `conceptos_cubiertos` son los terminos de SU consulta que las resenas de este local
+    # confirman. La segunda explica el orden mucho mejor que la primera: el ranking es una
+    # cascada (conceptos, evidencia, QM) y el QM es solo el ultimo desempate.
+    qm_score: float = 0
+    conceptos_cubiertos: List[str] = []
 
 
 class ReviewDetail(BaseModel):
@@ -2084,6 +2114,17 @@ async def obtener_restaurant_cards(
             gen_idx += 1
             asyncio.create_task(cache.set_json("desc", item["cache_key"], descripcion))
 
+        # Qué conceptos de la consulta confirma este local. Se usa EXACTAMENTE el mismo criterio
+        # que la cascada de ranking (`relevancia`): la keyword cuenta si el resumen la menciona
+        # de forma positiva, o cualquiera de sus variantes curadas. Reusarlo importa: si acá se
+        # midiera distinto, la tarjeta explicaría un orden que no es el que se aplicó.
+        resumen_local = safe_str(item["row"].get("resumen_reviews", ""))
+        conceptos_cubiertos = [
+            k for k in (keywords_list or [])
+            if safe_str(k).lower() not in KEYWORDS_GENERICAS
+            and any(_mencion_positiva(resumen_local, v) for v in variantes_de_concepto(k))
+        ]
+
         cards.append(
             RestaurantCard(
                 nombre=item["nombre_real"],
@@ -2096,6 +2137,10 @@ async def obtener_restaurant_cards(
                 descripcion=safe_str(descripcion),
                 frase_destacada=safe_str(item["frase"]),
                 autor_reseña=safe_str(item["autor"]),
+                qm_score=qm_en_estrellas(
+                    item["row"].get("rating_gral"), item["row"].get("total_reviews_google")
+                ),
+                conceptos_cubiertos=conceptos_cubiertos,
             )
         )
 
@@ -2134,6 +2179,12 @@ def obtener_restaurant_cards_simple(nombres_restaurantes, df):
                     rating=safe_float(row.get("rating_gral")),
                     total_reviews=safe_int(row.get("total_reviews_google")),
                     categoria=safe_str(row.get("categoria")),
+                    # Sin `conceptos_cubiertos`: este camino no tiene la consulta del usuario a
+                    # mano, así que no hay conceptos que verificar. El QM sí, porque depende sólo
+                    # del local.
+                    qm_score=qm_en_estrellas(
+                        row.get("rating_gral"), row.get("total_reviews_google")
+                    ),
                 )
             )
     cards.sort(key=lambda x: x.rating, reverse=True)
@@ -3108,7 +3159,9 @@ def procesar_recomendacion_pesado(
         if nombre not in df_lugares_ref.index: return 0
         r = df_lugares_ref.loc[nombre]
         if isinstance(r, pd.DataFrame): r = r.iloc[0]
-        return safe_float(r.get("rating_gral")) + (math.log10(safe_int(r.get("total_reviews_google")) + 1) * 2.7)
+        # La formula vive en `qm_bruto` (nivel de modulo) para que el numero que ORDENA sea el
+        # mismo que la tarjeta le muestra al usuario como "QM Score".
+        return qm_bruto(r.get("rating_gral"), r.get("total_reviews_google"))
 
     # 2. HYBRID INJECTION (ahora sobre resumen_reviews de df_lugares — 936 filas, negation-aware).
     # Corre siempre, incluso en Modo Genérico: los candidatos que agrega acá quedan FUERA de
