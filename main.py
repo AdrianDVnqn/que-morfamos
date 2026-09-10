@@ -1053,6 +1053,18 @@ def _fetch_reviews_sync(nombres: list, limit_per_local: int = 15, terminos: list
                    ) as rn
             FROM reviews
             WHERE restaurante IN ({placeholders})
+              -- Sin texto no sirven para nada aguas abajo (ni cita, ni resumen, ni detalle) y
+              -- TODOS los consumidores las descartan después por longitud. Filtrarlas acá hace
+              -- que las `limit_per_local` que se traen sean útiles de verdad.
+              --
+              -- Importa sobre todo cuando NO hay términos: cerca de un tercio de las reseñas
+              -- de Google son sólo estrellas, así que "las 15 más recientes" podían ser 13
+              -- vacías y 2 con texto. Con términos el problema quedaba tapado, porque para
+              -- matchear un término hay que tener texto.
+              --
+              -- (Sin el símbolo de porcentaje a propósito: psycopg lo lee como marcador de
+              -- parámetro incluso dentro de un comentario SQL, y la consulta falla entera.)
+              AND length(btrim(coalesce(texto, ''))) >= 10
         ) t
         WHERE rn <= {limit_per_local}
     """
@@ -1782,7 +1794,22 @@ def check_keyword_ban(query):
     return False
 
 
-def get_keywords_from_topic(topic):
+def get_keywords_from_topic(topic, nombre_lugar=None):
+    """Términos del tema por el que se pregunta, para priorizar reseñas que lo mencionen.
+
+    `nombre_lugar` descarta las palabras del NOMBRE del local, y no es un detalle menor: cuando
+    alguien escribe "qué tal es Growler", el nombre sobrevivía a las stopwords y quedaba como si
+    fuera el tema. Resultado: las reseñas que se le mostraban eran sólo las que decían "growler"
+    —la gente nombrando el lugar— en vez de las más recientes, que es lo que corresponde a una
+    pregunta general.
+
+    Contamina de dos formas, y las dos se arreglan acá porque `rankear_reviews_por_topico`
+    también llama a esta función: el nombre entraba en la consulta SQL (qué reseñas se traen de
+    la base) y en el ranking (en qué orden se muestran).
+
+    Preguntar por un tema sobre un lugar puntual sigue funcionando: de "growler tiene opciones
+    veganas" queda "vegana", que es de lo que la persona quiere leer.
+    """
     if not topic:
         return []
     stopwords = {
@@ -1811,9 +1838,43 @@ def get_keywords_from_topic(topic):
         "qué",
         "tal",
         "como",
+        # Verbos y adjetivos de relleno con los que se formula una pregunta general
+        # ("antares está bueno", "cabildo tiene estacionamiento"). Como término de búsqueda son
+        # inservibles —"esta" aparece en casi cualquier reseña— y ensucian el filtro sin aportar.
+        "es",
+        "esta",
+        "está",
+        "estan",
+        "están",
+        "tiene",
+        "tienen",
+        "bueno",
+        "buena",
+        "buenos",
+        "buenas",
+        "muy",
+        "mas",
+        "más",
     }
-    words = safe_str(topic).lower().split()
-    clean_words = [w for w in words if w not in stopwords and len(w) > 2]
+    # Las palabras del nombre del local no son un tema: quien pregunta "qué tal es Growler" no
+    # está pidiendo las reseñas que dicen "growler". Se comparan normalizadas (sin acentos ni
+    # mayúsculas) para que "Pizzería" del nombre tape "pizzeria" de la consulta.
+    palabras_del_nombre = set()
+    if nombre_lugar:
+        palabras_del_nombre = {
+            p for p in re.split(r"[^\w]+", _normalizar_busqueda(nombre_lugar)) if len(p) > 2
+        }
+
+    # Se saca la puntuación pegada a la palabra: "estacionamiento?" no matchea ninguna reseña
+    # que diga "estacionamiento", así que el filtro quedaba vacío justo cuando el usuario sí
+    # había preguntado por un tema concreto.
+    words = [w.strip(".,;:!?¿¡()\"'") for w in safe_str(topic).lower().split()]
+    clean_words = [
+        w for w in words
+        if w not in stopwords
+        and len(w) > 2
+        and _normalizar_busqueda(w) not in palabras_del_nombre
+    ]
     stemmed_words = []
     for w in clean_words:
         if w.endswith("es") and len(w) > 4:
@@ -1834,7 +1895,7 @@ def get_keywords_from_topic(topic):
     return utiles
 
 
-def rankear_reviews_por_topico(df_reviews, topic=None):
+def rankear_reviews_por_topico(df_reviews, topic=None, nombre_lugar=None):
     df_local = df_reviews.copy()
     df_local.loc[:, "orden_fecha"] = df_local["fecha"].apply(fecha_a_orden)
     if "rating_user" in df_local.columns:
@@ -1851,7 +1912,7 @@ def rankear_reviews_por_topico(df_reviews, topic=None):
             ["orden_fecha", "rating_user"], ascending=[True, False]
         )
 
-    keywords = get_keywords_from_topic(topic)
+    keywords = get_keywords_from_topic(topic, nombre_lugar)
     if not keywords:
         return df_local.sort_values("orden_fecha")
 
@@ -2737,7 +2798,7 @@ async def resumir_opiniones_local_gen(
         sorted_reviews = reviews_df
     else:
         sorted_reviews = rankear_reviews_por_topico(
-            reviews_df[reviews_df["restaurante"] == restaurante], topic
+            reviews_df[reviews_df["restaurante"] == restaurante], topic, restaurante
         )
     reviews_txt = "\n".join(
         [safe_str(r.get("texto"))[:200] for _, r in sorted_reviews.head(10).iterrows()]
@@ -2844,7 +2905,9 @@ async def responder_followup_gen(restaurante, query, df, llm, tone="cordial"):
         return
 
     # reusing logic from rankear_reviews_por_topico
-    sorted_reviews = rankear_reviews_por_topico(reviews_df[reviews_df["restaurante"] == restaurante], query)
+    sorted_reviews = rankear_reviews_por_topico(
+        reviews_df[reviews_df["restaurante"] == restaurante], query, restaurante
+    )
 
     # Take top 15 reviews to have enough context
     reviews_txt = "\n".join(
@@ -4297,12 +4360,12 @@ async def get_restaurant_detail(
     t1 = time.time()
     terminos_tema = []
     if topic and topic not in ["undefined", "null"]:
-        for kw in get_keywords_from_topic(topic):
+        for kw in get_keywords_from_topic(topic, nombre_exacto):
             terminos_tema.extend(variantes_de_concepto(kw))
     reviews_df = await obtener_reviews_por_local([nombre_exacto], terminos=terminos_tema or None)
     reviews_list = []
     if not reviews_df.empty:
-        sorted_reviews = rankear_reviews_por_topico(reviews_df, topic)
+        sorted_reviews = rankear_reviews_por_topico(reviews_df, topic, nombre_exacto)
         for _, r in sorted_reviews.head(8).iterrows():
             if len(safe_str(r.get("texto"))) > 10:
                 reviews_list.append(
